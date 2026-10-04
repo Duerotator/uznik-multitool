@@ -7,6 +7,9 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "app"))
+
 from core.models import AccountRecord
 from core.storage import write_json_atomic
 from core.telegram_client import session_lock

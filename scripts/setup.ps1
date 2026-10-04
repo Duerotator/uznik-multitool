@@ -34,12 +34,12 @@ if (-not (Test-Path -LiteralPath $venvPython)) {
 }
 
 Invoke-Checked $venvPython @('-m', 'pip', 'install', '--upgrade', 'pip')
-Invoke-Checked $venvPython @('-m', 'pip', 'install', '-r', (Join-Path $projectRoot 'requirements.txt'))
+Invoke-Checked $venvPython @('-m', 'pip', 'install', '-r', (Join-Path $projectRoot 'config\requirements.txt'))
 Invoke-Checked $venvPython @('-m', 'playwright', 'install', 'chromium')
 
 $envFile = Join-Path $projectRoot '.env'
 if (-not (Test-Path -LiteralPath $envFile)) {
-    Copy-Item -LiteralPath (Join-Path $projectRoot '.env.example') -Destination $envFile
+    Copy-Item -LiteralPath (Join-Path $projectRoot 'config\.env.example') -Destination $envFile
     Write-Host 'Fill TELEGRAM_API_ID and TELEGRAM_API_HASH in .env before connecting accounts.'
     if (-not $NoOpenConfig) { Start-Process notepad.exe -ArgumentList ('"{0}"' -f $envFile) }
 }

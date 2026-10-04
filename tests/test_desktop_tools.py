@@ -12,6 +12,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
+
 from core.project_layout import DATA_FOLDERS, IMPORT_FOLDERS, RESOURCE_FOLDERS, EMPTY_TEMPLATES, ensure_project_layout
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -71,7 +73,7 @@ class FolderTests(unittest.TestCase):
                 "data/sessions/pyrogram/.gitkeep", "data/README.md",
                 "imports/auth_input/README.md", "imports/auth_input/processed/.gitkeep",
                 "assets/avatar_packs/male/.gitkeep", "assets/branding/uznik-multitool.ico",
-                ".env.example",
+                "config/.env.example",
             ]
             for path in allowed:
                 result = subprocess.run(["git", "check-ignore", "--no-index", path], cwd=root, capture_output=True)

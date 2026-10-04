@@ -135,7 +135,7 @@ class LLMClient:
         try:
             import httpx
         except ImportError as exc:  # pragma: no cover - depends on runtime environment
-            raise RuntimeError("Install httpx to use AI companion: pip install -r requirements.txt") from exc
+            raise RuntimeError("Install httpx to use AI companion: pip install -r config/requirements.txt") from exc
         return httpx
 
     def _raise_for_status(self, response, provider_name: str) -> None:

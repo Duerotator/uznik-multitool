@@ -25,11 +25,22 @@ Telegram-ботов, HTTP API, серверного деплоя и автома
 
 `setup.bat` можно запускать повторно: существующий `.env` и пользовательские
 данные сохраняются. После перемещения папки пересоздайте ярлык через
-`create_shortcut.bat`. Для запуска с видимым логом используйте `start_debug.bat`.
+`scripts/windows/create_shortcut.bat`. Для запуска с видимым логом используйте
+`scripts/windows/start_debug.bat`.
 
 Ярлык и окно приложения имеют собственную иконку Uznik. Вспомогательные
 утилиты доступны двойным кликом по **`toolbox.bat`**; описание и команды —
 [scripts/README.md](scripts/README.md).
+
+В корне оставлены только пользовательские точки входа: ярлык **Uznik MultiTool**,
+`start_gui.bat`, `setup.bat`, **`create_sessions.bat`**, `toolbox.bat`, `.env`
+и эта инструкция. Git-файлы и `AGENTS.md` — служебные метаданные проекта.
+Код приложения находится в `app/`, шаблон конфигурации и зависимости — в
+`config/`, вспомогательные команды — в `scripts/`. Данные остаются в прежних
+`data/` и `imports/`, фотографии и шаблоны — в `assets/` и `templates/`.
+
+**`create_sessions.bat`** открывает меню: вход по номеру, создание новых
+авторизаций из `auth_input`, пакетный вход по списку номеров и открытие папок.
 
 ## Первые аккаунты и прокси
 
@@ -131,7 +142,7 @@ VPN-конфигураций или логов. Локальное состоя�
 - Нет Python: установите Python с launcher, повторите `setup.bat`.
 - Не установилась зависимость: посмотрите ошибку в окне установки; для OCR
   попробуйте Python 3.12 в отдельном окружении. Не удаляйте свою базу.
-- Окно не открылось: запустите `start_debug.bat`; логи находятся в
+- Окно не открылось: запустите `scripts/windows/start_debug.bat`; логи находятся в
   `data/logs/launcher.log`, `current_session.log`, `multitool.log` и `crash.log`.
 - Telegram Web сообщает об отсутствии browser executable: повторите
   `setup.bat` или выполните `.venv\Scripts\python.exe -m playwright install chromium`.

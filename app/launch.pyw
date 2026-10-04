@@ -15,7 +15,7 @@ def show_error(message: str) -> None:
 
 
 def main() -> int:
-    root = Path(__file__).resolve().parent
+    root = Path(__file__).resolve().parent.parent
     executable = root / ".venv" / "Scripts" / "pythonw.exe"
     if not executable.is_file():
         show_error("Сначала запустите setup.bat в папке Uznik MultiTool.\nОн установит зависимости и создаст ярлык.")
@@ -26,7 +26,7 @@ def main() -> int:
     try:
         with log_path.open("a", encoding="utf-8") as output:
             result = subprocess.run(
-                [str(executable), str(root / "main.py")],
+                [str(executable), str(root / "app/main.py")],
                 cwd=root,
                 stdout=output,
                 stderr=subprocess.STDOUT,
@@ -34,7 +34,7 @@ def main() -> int:
                 check=False,
             )
         if result.returncode:
-            show_error(f"Приложение завершилось с ошибкой.\nПодробности: {log_path}\nПопробуйте start_debug.bat.")
+            show_error(f"Приложение завершилось с ошибкой.\nПодробности: {log_path}\nПопробуйте scripts/windows/start_debug.bat.")
         return result.returncode
     except OSError as exc:
         show_error(f"Не удалось запустить приложение: {exc}")

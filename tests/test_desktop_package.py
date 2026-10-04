@@ -4,6 +4,7 @@ import ast
 import asyncio
 import base64
 import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -11,22 +12,25 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parent.parent
+APP = ROOT / "app"
+sys.path.insert(0, str(APP))
 
 
 class DesktopPackageTests(unittest.TestCase):
     def test_desktop_has_no_server_imports_or_density_control(self):
-        source = (ROOT / "ui/qt_app.py").read_text(encoding="utf-8")
+        source = (APP / "ui/qt_app.py").read_text(encoding="utf-8")
         self.assertIn('QSettings("UznikMultiTool", "Desktop")', source)
         self.assertIn('setWindowTitle("Uznik MultiTool")', source)
         for marker in ("density_combo", "change_density", "session_sync", "mobile_web", "ui.bot"):
             self.assertNotIn(marker, source)
-        self.assertFalse((ROOT / "modules/session_sync.py").exists())
-        self.assertEqual({"__init__.py", "qt_app.py"}, {p.name for p in (ROOT / "ui").glob("*.py")})
+        self.assertFalse((APP / "modules/session_sync.py").exists())
+        self.assertEqual({"__init__.py", "qt_app.py"}, {p.name for p in (APP / "ui").glob("*.py")})
 
     def test_first_party_imports_are_complete(self):
         # Include lazy imports so optional desktop actions do not break later.
         for folder in ("core", "modules", "ui", "utils", "scripts"):
-            for path in (ROOT / folder).rglob("*.py"):
+            base = ROOT if folder == "scripts" else APP
+            for path in (base / folder).rglob("*.py"):
                 tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
                 for node in ast.walk(tree):
                     names = []
@@ -37,7 +41,8 @@ class DesktopPackageTests(unittest.TestCase):
                     for name in names:
                         if name.split(".")[0] not in {"core", "modules", "ui", "utils", "scripts"}:
                             continue
-                        target = ROOT.joinpath(*name.split("."))
+                        target_base = ROOT if name.split(".")[0] == "scripts" else APP
+                        target = target_base.joinpath(*name.split("."))
                         self.assertTrue(target.with_suffix(".py").is_file() or (target / "__init__.py").is_file(),
                                         f"Missing {name}, imported by {path.name}")
 
@@ -59,7 +64,7 @@ class DesktopPackageTests(unittest.TestCase):
                 config.require_telegram_api()
 
     def test_launchers_are_portable(self):
-        launcher = (ROOT / "launch.pyw").read_text(encoding="utf-8")
+        launcher = (APP / "launch.pyw").read_text(encoding="utf-8")
         shortcut = (ROOT / "scripts/create_shortcut.ps1").read_text(encoding="utf-8")
         self.assertIn("Path(__file__).resolve().parent", launcher)
         self.assertIn("$PSScriptRoot", shortcut)
@@ -72,7 +77,7 @@ class DesktopPackageTests(unittest.TestCase):
         ignore = (ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
         for pattern in ("data/**", "imports/**", ".env", "*.session*", "*.db*", "*.lnk", "templates/*"):
             self.assertIn(pattern, ignore)
-        self.assertIn("!.env.example", ignore)
+        self.assertIn("!config/.env.example", ignore)
 
     def test_gateway_never_discovers_personal_subscription(self):
         from modules.vpn_gateway import _subscription_url, fetch_vless_nodes

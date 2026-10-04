@@ -269,7 +269,7 @@ class QtDesktopApp(QMainWindow):
         self.profile_plan_file = Path("templates/profile_plan.json")
 
         self.setWindowTitle("Uznik MultiTool")
-        self.setWindowIcon(QIcon(str(Path(__file__).resolve().parent.parent / "assets/branding/uznik-multitool.ico")))
+        self.setWindowIcon(QIcon(str(Path(__file__).resolve().parents[2] / "assets/branding/uznik-multitool.ico")))
         self.resize(1460, 860)
         self.setMinimumSize(1080, 680)
         self.setAcceptDrops(True)

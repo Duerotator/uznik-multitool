@@ -1,7 +1,7 @@
 # All personal configuration and runtime state stay local.
 .env
 .env.*
-!.env.example
+!config/.env.example
 .vpn-gateway.env
 data/**
 !data/**/

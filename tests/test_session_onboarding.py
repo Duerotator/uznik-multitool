@@ -10,6 +10,9 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
+
 from core.config import AppConfig
 from core.session_manager import SessionManager
 from modules.auth_controller import AuthManager, AuthSession

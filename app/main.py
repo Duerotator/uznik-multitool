@@ -2,11 +2,14 @@
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 
 
 def main() -> int:
-    root = Path(__file__).resolve().parent
+    app_dir = Path(__file__).resolve().parent
+    root = app_dir.parent
+    sys.path.insert(0, str(app_dir))
     os.chdir(root)
     from core.config import AppConfig
     from core.diagnostics import install_global_exception_handler
