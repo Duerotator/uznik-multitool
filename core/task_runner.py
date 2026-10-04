@@ -1,0 +1,105 @@
+from __future__ import annotations
+
+import asyncio
+import logging
+import uuid
+from collections.abc import Awaitable, Callable
+from typing import Any
+
+from core.config import AppConfig
+from core.models import TaskSnapshot, utc_now_iso
+from core.storage import read_json, write_json_atomic
+
+
+class TaskRunner:
+    def __init__(self, config: AppConfig):
+        self.config = config
+        self.tasks: dict[str, asyncio.Task] = {}
+        self.stop_events: dict[str, asyncio.Event] = {}
+        self.log = logging.getLogger("tasks")
+
+    def start(self, name: str, coro_factory: Callable[[asyncio.Event], Awaitable[Any]]) -> str:
+        task_id = uuid.uuid4().hex[:12]
+        stop_event = asyncio.Event()
+        self.stop_events[task_id] = stop_event
+        self._save_snapshot(TaskSnapshot(id=task_id, name=name, status="running"))
+
+        async def wrapper() -> Any:
+            try:
+                result = await coro_factory(stop_event)
+            except asyncio.CancelledError:
+                self._save_snapshot(
+                    TaskSnapshot(id=task_id, name=name, status="stopped", detail="Cancelled")
+                )
+                raise
+            except Exception as exc:
+                self.log.exception("Task %s failed", task_id)
+                self._save_snapshot(
+                    TaskSnapshot(id=task_id, name=name, status="failed", detail=str(exc))
+                )
+                raise
+            else:
+                self._save_snapshot(TaskSnapshot(id=task_id, name=name, status="done"))
+                return result
+
+        self.tasks[task_id] = asyncio.create_task(wrapper(), name=name)
+        return task_id
+
+    async def stop(self, task_id: str) -> bool:
+        stop_event = self.stop_events.get(task_id)
+        task = self.tasks.get(task_id)
+        if not task:
+            return False
+        if task.done():
+            return False
+        if stop_event:
+            stop_event.set()
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=8)
+        except asyncio.TimeoutError:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        finally:
+            self._save_snapshot(
+                TaskSnapshot(id=task_id, name=task.get_name(), status="stopped", detail="Stopped by user")
+            )
+        return True
+
+    async def stop_by_name_prefix(self, prefix: str) -> int:
+        stopped = 0
+        for task_id, task in list(self.tasks.items()):
+            if task.done() or not task.get_name().startswith(prefix):
+                continue
+            if await self.stop(task_id):
+                stopped += 1
+        return stopped
+
+    async def stop_all(self) -> int:
+        stopped = 0
+        for task_id, task in list(self.tasks.items()):
+            if task.done():
+                continue
+            if await self.stop(task_id):
+                stopped += 1
+        return stopped
+
+    def snapshots(self) -> list[TaskSnapshot]:
+        raw = read_json(self.config.tasks_file, {"tasks": []})
+        return [TaskSnapshot(**item) for item in raw.get("tasks", [])]
+
+    def _save_snapshot(self, snapshot: TaskSnapshot) -> None:
+        raw = read_json(self.config.tasks_file, {"tasks": []})
+        tasks = raw.get("tasks", [])
+        snapshot.updated_at = utc_now_iso()
+        replaced = False
+        for index, item in enumerate(tasks):
+            if item["id"] == snapshot.id:
+                tasks[index] = snapshot.to_dict()
+                replaced = True
+                break
+        if not replaced:
+            tasks.append(snapshot.to_dict())
+        write_json_atomic(self.config.tasks_file, {"tasks": tasks[-200:]})
