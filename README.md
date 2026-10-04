@@ -175,10 +175,3 @@ Telegram и подключённых сервисов.
 `scripts/windows/start_debug.bat`.
 
 Навигация по коду: [карта проекта](docs/PROJECT_MAP.md).
-Автономные проверки, не подключающие Telegram-аккаунты:
-
-```powershell
-.\.venv\Scripts\python.exe .\tests\run_checks.py fast
-```
-
-Подробнее о проверках: [tests/TEST_MAP.md](tests/TEST_MAP.md).
