@@ -11,6 +11,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "app"))
+from scripts.sessions.session_logging import log_session_error, run_session_command
 
 
 async def process_queue(config, paths) -> int:
@@ -31,9 +32,13 @@ async def process_queue(config, paths) -> int:
             if result.status != "authorized":
                 failures += 1
                 print(result.error)
+                log_session_error(ROOT, f"External session item {index}/{len(paths)} failed", result.error)
         except Exception as exc:
             failures += 1
             print(f"[{index}/{len(paths)}] {source.name}: failed — {exc}")
+            path = log_session_error(ROOT, f"External session item {index}/{len(paths)} raised an exception", exc)
+            if path:
+                print(f"Full traceback saved to: {path}")
     return 1 if failures else 0
 
 
@@ -57,8 +62,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    try:
-        raise SystemExit(main())
-    except KeyboardInterrupt:
-        print("\nCancelled. Unfinished sources stay in auth_input.")
-        raise SystemExit(130)
+    raise SystemExit(run_session_command(ROOT, main, "External session processing failed"))

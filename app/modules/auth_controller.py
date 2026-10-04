@@ -60,7 +60,11 @@ class AuthManager:
         pool = ProxyPool(self.config.proxy_pool_db)
         entry = await pool.acquire(protocol="socks5") or await pool.acquire(protocol=None)
         if entry is None:
-            raise RuntimeError("No MTProto-verified proxy available; direct connection is forbidden")
+            raise RuntimeError(
+                "No MTProto-verified proxy available; direct connection is forbidden. "
+                f"Set TELEGRAM_GLOBAL_PROXY in {self.config.env_file or '.env'} "
+                "or add and verify a proxy in the desktop Proxy section."
+            )
         return entry.url
 
     async def send_code(self, phone: str, proxy_url: str | None = None) -> dict[str, Any]:

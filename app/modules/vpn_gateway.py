@@ -23,13 +23,18 @@ logger = logging.getLogger("vpn-gateway")
 
 
 def xray_executable() -> str:
-    """Resolve an explicitly configured Xray executable or one on PATH."""
+    """Resolve configured Xray, PATH or WinGet's per-user executable alias."""
     configured = os.getenv("XRAY_EXECUTABLE", "").strip()
     if configured:
         return configured
     discovered = shutil.which("xray") or shutil.which("xray-core")
     if discovered:
         return discovered
+    local = os.getenv("LOCALAPPDATA")
+    if os.name == "nt" and local:
+        candidate = Path(local) / "Microsoft/WinGet/Links/xray.exe"
+        if candidate.is_file():
+            return str(candidate)
     raise RuntimeError(
         "Xray was not found. Set XRAY_EXECUTABLE or install xray on this host."
     )

@@ -16,8 +16,10 @@ RESOURCE_FOLDERS = (
 EMPTY_TEMPLATES = ("first_names.txt", "last_names.txt", "usernames.txt", "bios.txt", "genders.txt")
 
 
-def ensure_project_layout(root: Path, data_dir: Path, import_dir: Path) -> None:
-    for base, folders in ((data_dir, DATA_FOLDERS), (import_dir, IMPORT_FOLDERS), (root, RESOURCE_FOLDERS)):
+def ensure_project_layout(root: Path, data_dir: Path, import_dir: Path,
+                          batch_phones_file: Path | None = None) -> None:
+    for base, folders in ((data_dir, DATA_FOLDERS), (import_dir, IMPORT_FOLDERS),
+                          (root, (*RESOURCE_FOLDERS, "sessions"))):
         for folder in folders:
             (base / folder).mkdir(parents=True, exist_ok=True)
     # Exclusive creation preserves every existing user template.
@@ -26,8 +28,18 @@ def ensure_project_layout(root: Path, data_dir: Path, import_dir: Path) -> None:
             (root / "templates" / name).touch(exist_ok=False)
         except FileExistsError:
             pass
-    phone_list = import_dir / "batch_phones.txt"
+    # Keep all session input and launchers together in the visible project-root
+    # folder. Migrate the previous import-folder location without overwriting.
+    phone_list = batch_phones_file or root / "sessions" / "batch_phones.txt"
+    phone_list.parent.mkdir(parents=True, exist_ok=True)
+    old_phone_lists = (import_dir / "sessions" / "batch_phones.txt", import_dir / "batch_phones.txt")
     if not phone_list.exists():
+        for old_phone_list in old_phone_lists:
+            if old_phone_list.exists():
+                old_phone_list.rename(phone_list)
+                break
+    if not phone_list.exists():
+        phone_list.parent.mkdir(parents=True, exist_ok=True)
         try:
             with phone_list.open("x", encoding="utf-8") as file:
                 file.write("# Your own phone numbers, one per line in international format.\n")

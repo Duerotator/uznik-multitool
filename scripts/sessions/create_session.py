@@ -11,6 +11,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "app"))
+from scripts.sessions.session_logging import log_session_error, run_session_command
 
 
 async def login_phone(config, phone: str) -> dict:
@@ -45,13 +46,14 @@ def main() -> int:
         return 1
     result = asyncio.run(login_phone(config, phone))
     if not result.get("ok"):
-        print(f"Login failed: {result.get('error', 'unknown error')}")
+        error = result.get("error", "unknown error")
+        print(f"Login failed: {error}")
+        path = log_session_error(ROOT, "Single session login failed", str(error))
+        if path:
+            print(f"Error details saved to: {path}")
         return 1
     return 0
 
 
 if __name__ == "__main__":
-    try:
-        raise SystemExit(main())
-    except KeyboardInterrupt:
-        print("\nCancelled; existing sessions were not deleted.")
+    raise SystemExit(run_session_command(ROOT, main, "Session creation failed"))

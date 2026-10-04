@@ -41,7 +41,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/windows/install_nati
 Активация виртуального окружения не обязательна: команды явно используют его Python.
 
 Скопируйте `config/.env.example` в `.env`, **только если `.env` ещё нет**,
-заполните свои Telegram API-ключи. Завершите настройку:
+заполните свои Telegram API-ключи и `TELEGRAM_GLOBAL_PROXY` своим рабочим
+прокси. Вместо глобального прокси можно добавить и проверить прокси в
+интерфейсе приложения. Завершите настройку:
 
 ```powershell
 .\.venv\Scripts\python.exe scripts/prepare_layout.py

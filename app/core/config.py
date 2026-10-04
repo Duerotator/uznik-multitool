@@ -5,8 +5,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 try:
-    from dotenv import load_dotenv
+    from dotenv import dotenv_values, load_dotenv
 except ImportError:  # pragma: no cover - fallback for bootstrap commands
+    dotenv_values = None
+
     def load_dotenv(*_args, **_kwargs) -> bool:
         return False
 
@@ -68,23 +70,52 @@ class AppConfig:
     email_mailbox_folder: str = "INBOX"
     email_mailbox_socket_timeout: float = 15.0
     email_mailbox_poll_interval: float = 4.0
+    batch_phones_file: Path | None = None
+    env_file: Path | None = None
 
     @classmethod
     def load(cls, env_path: Path | str = ".env") -> "AppConfig":
-        load_dotenv(env_path)
-        data_dir = Path(os.getenv("TELEGRAM_DATA_DIR", "data")).resolve()
+        env_path = Path(env_path).resolve()
+        project_root = env_path.parent
+        if dotenv_values is None and env_path.is_file():
+            raise RuntimeError("python-dotenv is missing. Run setup.bat to install the dependencies.")
+        load_dotenv(env_path, encoding="utf-8-sig")
+        file_env = dotenv_values(env_path, encoding="utf-8-sig") if dotenv_values is not None else {}
+
+        # An empty Windows/user environment variable must not mask a populated
+        # value in the project's .env file. Non-empty environment variables
+        # remain the preferred override, matching python-dotenv's default.
+        api_id_raw = os.getenv("TELEGRAM_API_ID")
+        if not api_id_raw or not api_id_raw.strip():
+            api_id_raw = file_env.get("TELEGRAM_API_ID") or "0"
+        api_hash = os.getenv("TELEGRAM_API_HASH")
+        if not api_hash or not api_hash.strip():
+            api_hash = file_env.get("TELEGRAM_API_HASH") or ""
+        try:
+            api_id = int(api_id_raw)
+        except ValueError:
+            raise RuntimeError(f"TELEGRAM_API_ID must be a positive integer in {env_path}") from None
+
+        def project_path(value: str | Path) -> Path:
+            path = Path(value)
+            return (path if path.is_absolute() else project_root / path).resolve()
+
+        data_dir = project_path(os.getenv("TELEGRAM_DATA_DIR") or "data")
         sessions_dir = data_dir / "sessions"
         logs_dir = data_dir / "logs"
         groups_dir = data_dir / "groups"
-        import_dir = Path(os.getenv("TELEGRAM_IMPORT_DIR", "imports")).resolve()
+        import_dir = project_path(os.getenv("TELEGRAM_IMPORT_DIR") or "imports")
         data_dir.mkdir(parents=True, exist_ok=True)
         sessions_dir.mkdir(parents=True, exist_ok=True)
         logs_dir.mkdir(parents=True, exist_ok=True)
         groups_dir.mkdir(parents=True, exist_ok=True)
         import_dir.mkdir(parents=True, exist_ok=True)
 
+        batch_phones_file = project_path(os.getenv("TELEGRAM_BATCH_PHONES_FILE") or
+                                        "sessions/batch_phones.txt")
+
         from core.project_layout import ensure_project_layout
-        ensure_project_layout(Path(env_path).resolve().parent, data_dir, import_dir)
+        ensure_project_layout(project_root, data_dir, import_dir, batch_phones_file)
 
         allowed = frozenset(
             item.strip()
@@ -93,8 +124,8 @@ class AppConfig:
         )
 
         return cls(
-            api_id=_env_int("TELEGRAM_API_ID", 0),
-            api_hash=os.getenv("TELEGRAM_API_HASH", ""),
+            api_id=api_id,
+            api_hash=api_hash.strip(),
             default_backend=os.getenv("TELEGRAM_DEFAULT_BACKEND", "pyrogram").lower(),
             data_dir=data_dir,
             accounts_file=data_dir / "accounts.json",
@@ -116,12 +147,14 @@ class AppConfig:
             email_inbox_api_url=os.getenv("EMAIL_INBOX_API_URL", "").rstrip("/"),
             email_inbox_token=os.getenv("EMAIL_INBOX_TOKEN", ""),
             email_inbox_backend=os.getenv("EMAIL_INBOX_BACKEND", "http").strip().lower(),
-            email_mailboxes_file=Path(os.getenv("EMAIL_MAILBOXES_FILE") or (import_dir / "emails/accounts.txt")).resolve(),
+            email_mailboxes_file=project_path(os.getenv("EMAIL_MAILBOXES_FILE") or (import_dir / "emails/accounts.txt")),
             email_mailbox_host=os.getenv("EMAIL_MAILBOX_HOST", "").strip(),
             email_mailbox_port=_env_int("EMAIL_MAILBOX_PORT", 0),
             email_mailbox_folder=os.getenv("EMAIL_MAILBOX_FOLDER", "INBOX"),
             email_mailbox_socket_timeout=_env_float("EMAIL_MAILBOX_SOCKET_TIMEOUT", 15.0),
             email_mailbox_poll_interval=_env_float("EMAIL_MAILBOX_POLL_INTERVAL", 4.0),
+            batch_phones_file=batch_phones_file,
+            env_file=env_path,
             proxy_pool_db=data_dir / os.getenv("PROXY_POOL_DB", "proxy_pool.db"),
             proxy_max_concurrency=_env_int("PROXY_MAX_CONCURRENCY", 50),
             proxy_interval_minutes=_env_int("PROXY_INTERVAL_MINUTES", 30),
@@ -130,7 +163,12 @@ class AppConfig:
         )
 
     def require_telegram_api(self) -> None:
-        if not self.api_id or not self.api_hash:
+        missing = []
+        if self.api_id <= 0:
+            missing.append("TELEGRAM_API_ID")
+        if not self.api_hash:
+            missing.append("TELEGRAM_API_HASH")
+        if missing:
             raise RuntimeError(
-                "Set TELEGRAM_API_ID and TELEGRAM_API_HASH in .env before connecting accounts."
+                f"Set {', '.join(missing)} in {self.env_file or '.env'} before connecting accounts."
             )

@@ -6,6 +6,8 @@
 
 - `sessions/pyrogram`, `sessions/telethon` — рабочие авторизации.
 - `sessions/archive` — резервные старые сессии.
+- Входной список номеров находится в `sessions/batch_phones.txt`;
+  готовые сессии хранятся в этих подпапках `data/sessions/`.
 - `passkeys` — приватные ключи восстановления (как пароль).
 - `profiles_archive`, `profile_snapshots` — сохранённые профили и снимки.
 - `browser_profiles` — постоянные данные Telegram Web.

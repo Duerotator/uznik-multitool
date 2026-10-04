@@ -10,7 +10,9 @@
   фиксированный Comfortable, собственные QSettings.
 - `toolbox.bat`, `scripts/toolbox.py` — меню вспомогательных desktop-утилит;
   `scripts/{sessions,accounts,profiles,network}/`, `scripts/README.md` — команды.
-- `create_sessions.bat`, `scripts/sessions/menu.py` — меню создания сессий.
+- `sessions/` — пользовательские входы, запускатели, список телефонов и памятка;
+  `scripts/sessions/` — меню и вход; `session_logging.py` сохраняет ошибки всех
+  команд в `data/logs/session_creation.log`.
 - `config/requirements.txt`, `config/.env.example` — зависимости и пустой шаблон;
   пользовательский `.env` остаётся в корне.
 - `app/core/project_layout.py`, `scripts/prepare_layout.py` — пустая структура данных;

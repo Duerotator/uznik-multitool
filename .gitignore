@@ -11,6 +11,7 @@ imports/**
 !imports/**/
 !imports/**/.gitkeep
 !imports/**/README.md
+sessions/batch_phones.txt
 .venv/
 venv/
 templates/*

@@ -2,7 +2,8 @@
 
 Двойной клик по **toolbox.bat** открывает меню. Все утилиты используют
 собственные настройки проекта из `.env`, запускаются из любой рабочей папки.
-Меню создания сессий открывается через **create_sessions.bat** в корне.
+Все пользовательские входы сессий находятся в папке **sessions/** в корне;
+там есть меню, запуск одиночного/пакетного входа и `batch_phones.txt`.
 Диагностика и пересоздание ярлыка — `windows/start_debug.bat` и
 `windows/create_shortcut.bat`. Код backend расположен в `app/`, зависимости —
 `config/requirements.txt`.
@@ -11,8 +12,8 @@
 | Папка / утилита | Назначение |
 | --- | --- |
 | sessions/create_session.py | Ручной вход по своему номеру, новый локальный клиент с fingerprint и проверенным прокси |
-| sessions/menu.py | Меню создания сессий и открытия очереди / списка номеров |
-| sessions/batch_create_sessions.py | Последовательный вход по списку номеров из imports/batch_phones.txt; коды/2FA вводятся вручную |
+| sessions/menu.py | Меню создания сессий и открытия папок `imports/auth_input/` и `sessions/` |
+| sessions/batch_create_sessions.py | Последовательный вход по списку номеров из `sessions/batch_phones.txt`; коды/2FA вводятся вручную |
 | sessions/process_auth_input.py | Новая авторизация из очереди .session; пробует автоматически прочитать свежий код через исходную сессию |
 | accounts/cleanup.py | Предпросмотр или очистка чатов/контактов с явным выбором аккаунтов |
 | accounts/dedupe.py | Предпросмотр дубликатов, удаление записей только с --execute; сессии сохраняются, база резервируется |
@@ -31,7 +32,7 @@
 .\.venv\Scripts\python.exe scripts/sessions/create_session.py --phone YOUR_PHONE
 .\.venv\Scripts\python.exe scripts/sessions/process_auth_input.py
 .\.venv\Scripts\python.exe scripts/sessions/process_auth_input.py --execute
-.\.venv\Scripts\python.exe scripts/sessions/batch_create_sessions.py --phones imports/batch_phones.txt
+.\.venv\Scripts\python.exe scripts/sessions/batch_create_sessions.py --phones sessions/batch_phones.txt
 .\.venv\Scripts\python.exe scripts/accounts/cleanup.py --accounts YOUR_ACCOUNT_ID
 .\.venv\Scripts\python.exe scripts/accounts/security.py register-passkey --accounts YOUR_ACCOUNT_ID
 .\.venv\Scripts\python.exe scripts/profiles/download_avatar_pack.py --organize-only

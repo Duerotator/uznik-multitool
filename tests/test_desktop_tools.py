@@ -36,7 +36,7 @@ class FolderTests(unittest.TestCase):
             for name in EMPTY_TEMPLATES:
                 self.assertEqual("", (root / "templates" / name).read_text())
             template = root / "templates" / "bios.txt"
-            phones = imports / "batch_phones.txt"
+            phones = root / "sessions/batch_phones.txt"
             mailboxes = imports / "emails/accounts.txt"
             template.write_text("user template fixture", encoding="utf-8")
             phones.write_text("user phone-list fixture", encoding="utf-8")
@@ -49,7 +49,8 @@ class FolderTests(unittest.TestCase):
     def test_git_contains_scaffolds_for_all_runtime_folders(self):
         for name in DATA_FOLDERS:
             self.assertTrue((ROOT / "data" / name / ".gitkeep").is_file(), name)
-        for name in ("imports/auth_input/processed", "imports/emails", "assets/avatar_packs/male", "assets/avatar_packs/female",
+        for name in ("imports/auth_input/processed", "imports/emails", "sessions",
+                     "assets/avatar_packs/male", "assets/avatar_packs/female",
                      "assets/avatar_packs/unknown", "assets/avatar_packs_raw"):
             self.assertTrue((ROOT / name / ".gitkeep").is_file(), name)
         self.assertTrue((ROOT / "imports/auth_input/README.md").is_file())
@@ -65,7 +66,7 @@ class FolderTests(unittest.TestCase):
                 "data/passkeys/key.json", "data/browser_profiles/example/Local State",
                 "imports/source.session", "imports/auth_input/source.json",
                 "imports/auth_input/processed/source.session",
-                "imports/batch_phones.txt", "templates/profile_plan.json",
+                "sessions/batch_phones.txt", "templates/profile_plan.json",
                 "imports/emails/accounts.txt", "data/email_mailbox_bindings.json",
                 "templates/bios.txt", "assets/avatar_packs/female/user.jpg",
                 "assets/avatar_packs_raw/user.jpg", ".env",
@@ -77,6 +78,8 @@ class FolderTests(unittest.TestCase):
                 "data/sessions/pyrogram/.gitkeep", "data/README.md",
                 "imports/auth_input/README.md", "imports/auth_input/processed/.gitkeep",
                 "imports/emails/README.md", "imports/emails/.gitkeep",
+                "sessions/README.md", "sessions/.gitkeep", "sessions/create_session.bat",
+                "sessions/create_sessions.bat", "sessions/batch_create_sessions.bat",
                 "assets/avatar_packs/male/.gitkeep", "assets/branding/uznik-multitool.ico",
                 "config/.env.example",
             ]
@@ -86,6 +89,16 @@ class FolderTests(unittest.TestCase):
 
 
 class HelperTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "nt", "WinGet executable aliases are Windows-specific")
+    def test_xray_winget_alias_is_found_before_path_refresh(self):
+        from modules.vpn_gateway import xray_executable
+        with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {"LOCALAPPDATA": temp}, clear=True):
+            executable = Path(temp) / "Microsoft/WinGet/Links/xray.exe"
+            executable.parent.mkdir(parents=True)
+            executable.touch()
+            with patch("modules.vpn_gateway.shutil.which", return_value=None):
+                self.assertEqual(str(executable), xray_executable())
+
     def test_cli_help_works_from_an_unrelated_directory(self):
         with tempfile.TemporaryDirectory() as temp:
             for helper in HELPERS:
@@ -101,16 +114,19 @@ class HelperTests(unittest.TestCase):
         from scripts.sessions.batch_create_sessions import load_phones
         with tempfile.TemporaryDirectory() as temp:
             source = Path(temp) / "phones.txt"
-            source.write_text("# fixture\n10000000000\n\n10000000000\n10000000001\n", encoding="utf-8")
+            source.write_text("# fixture\n10000000000\n\n10000000000\n10000000001\n", encoding="utf-8-sig")
             self.assertEqual(["10000000000", "10000000001"], load_phones(source))
 
     def test_batch_continues_after_one_failed_login(self):
         from scripts.sessions.batch_create_sessions import run
         mock_login = AsyncMock(side_effect=[RuntimeError("fixture"), {"ok": True}])
         with patch("scripts.sessions.batch_create_sessions.login_phone", mock_login), \
+             patch("scripts.sessions.batch_create_sessions.log_session_error", return_value=None) as log_error, \
              patch("scripts.sessions.batch_create_sessions.asyncio.sleep", new=AsyncMock()):
             self.assertEqual(1, asyncio.run(run(SimpleNamespace(), ["first", "second"], 0)))
         self.assertEqual(2, mock_login.await_count)
+        self.assertEqual(1, log_error.call_count)
+        self.assertIsInstance(log_error.call_args.args[2], RuntimeError)
 
     def test_dedupe_preview_uses_backend_identity_and_keeps_unknowns(self):
         from scripts.accounts.dedupe import duplicate_ids

@@ -16,12 +16,66 @@ sys.path.insert(0, str(ROOT / "app"))
 
 
 class AppLayoutTests(unittest.TestCase):
+    def test_config_reads_bom_and_resolves_paths_from_env_directory(self):
+        from core.config import AppConfig
+        previous_dir = Path.cwd()
+        with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {
+            "TELEGRAM_API_ID": "", "TELEGRAM_API_HASH": "",
+        }, clear=True):
+            project = Path(temp) / "project"
+            project.mkdir()
+            env_file = project / ".env"
+            env_file.write_text(
+                "TELEGRAM_API_ID=123\nTELEGRAM_API_HASH=fixture\n"
+                "TELEGRAM_DATA_DIR=state\nTELEGRAM_IMPORT_DIR=input\n"
+                "TELEGRAM_BATCH_PHONES_FILE=custom/phones.txt\n",
+                encoding="utf-8-sig",
+            )
+            try:
+                os.chdir(temp)
+                config = AppConfig.load(env_file)
+                config.require_telegram_api()
+                self.assertEqual(123, config.api_id)
+                self.assertEqual("fixture", config.api_hash)
+                self.assertEqual(project / "state", config.data_dir)
+                self.assertEqual(project / "input", config.import_dir)
+                self.assertEqual(project / "custom/phones.txt", config.batch_phones_file)
+                self.assertTrue(config.batch_phones_file.is_file())
+            finally:
+                os.chdir(previous_dir)
+
+    def test_missing_api_error_names_the_actual_configuration_file(self):
+        from core.config import AppConfig
+        with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {}, clear=True):
+            env_file = Path(temp) / ".env"
+            config = AppConfig.load(env_file)
+            with self.assertRaises(RuntimeError) as error:
+                config.require_telegram_api()
+            self.assertIn(str(env_file), str(error.exception))
+            self.assertIn("TELEGRAM_API_ID", str(error.exception))
+            self.assertIn("TELEGRAM_API_HASH", str(error.exception))
+
+    def test_session_command_logs_unhandled_failures_with_traceback(self):
+        from scripts.sessions.session_logging import run_session_command
+
+        def failing_command():
+            raise RuntimeError("fixture failure")
+
+        with tempfile.TemporaryDirectory() as temp, patch("builtins.print"):
+            root = Path(temp)
+            self.assertEqual(1, run_session_command(root, failing_command, "Login failed"))
+            log_text = (root / "data/logs/session_creation.log").read_text(encoding="utf-8")
+            self.assertIn("Traceback", log_text)
+            self.assertIn("failing_command", log_text)
+            self.assertIn("fixture failure", log_text)
+
     def test_technical_files_are_nested_and_root_keeps_user_launchers(self):
         for name in ("main.py", "launch.pyw", "requirements.txt", ".env.example", "start_debug.bat", "create_shortcut.bat"):
             self.assertFalse((ROOT / name).exists(), name)
         for name in ("app/main.py", "app/launch.pyw", "config/requirements.txt", "config/.env.example",
                      "scripts/windows/start_debug.bat", "scripts/windows/create_shortcut.bat",
-                     "start_gui.bat", "setup.bat", "create_sessions.bat", "toolbox.bat"):
+                     "start_gui.bat", "setup.bat", "sessions/create_sessions.bat",
+                     "sessions/create_session.bat", "sessions/batch_create_sessions.bat", "toolbox.bat"):
             self.assertTrue((ROOT / name).is_file(), name)
         setup = (ROOT / "scripts/setup.ps1").read_text(encoding="utf-8")
         self.assertIn("config\\requirements.txt", setup)
@@ -70,14 +124,15 @@ class AppLayoutTests(unittest.TestCase):
         previous_dir = Path.cwd()
         with tempfile.TemporaryDirectory() as temp:
             imports = Path(temp) / "imports"
-            config = SimpleNamespace(import_dir=imports)
+            config = SimpleNamespace(import_dir=imports, batch_phones_file=Path(temp) / "sessions/batch_phones.txt")
             try:
                 with patch("core.config.AppConfig.load", return_value=config), \
-                     patch("builtins.input", side_effect=["4", "5", "0"]), \
+                     patch("builtins.input", side_effect=["4", "5", "6", "0"]), \
                      patch("builtins.print"), patch("os.startfile", create=True) as open_file, \
                      patch("subprocess.run") as run:
                     main()
-                self.assertEqual([str(imports / "auth_input"), str(imports / "batch_phones.txt")],
+                self.assertEqual([str(imports / "auth_input"), str(Path(temp) / "sessions"),
+                                  str(Path(temp) / "sessions" / "batch_phones.txt")],
                                  [call.args[0] for call in open_file.call_args_list])
                 run.assert_not_called()
             finally:
