@@ -103,7 +103,7 @@
 | Прокси | `TELEGRAM_GLOBAL_PROXY` либо пул в интерфейсе; `PROXY_SOURCE_URLS` для своих источников |
 | Xray gateway | `PROXY_MODE=vpn_gateway`, своя VLESS/Xray-подписка или файл; при необходимости `XRAY_EXECUTABLE` |
 | AI-диалоги | `LLM_API_KEY`, `LLM_BASE_URL`, `LLM_MODEL`, `AI_ALLOWED_CHATS` |
-| Почтовые коды | `EMAIL_DOMAIN`, `EMAIL_INBOX_API_URL`, `EMAIL_INBOX_TOKEN` для собственного inbox API |
+| Почтовые коды | HTTP inbox API либо IMAP / POP3 со списком ящиков; выбор в Security, см. [памятку](imports/emails/README.md) |
 | Внешний OCR-сервис | `SOLVECAPTCHA_KEY`, если он нужен выбранному механизму; сервис может быть платным |
 | Telegram Web / 2FA | Пароль аккаунта в его настройках либо `TELEGRAM_DIRECT_ACCESS_2FA_PASSWORD`; без него — ручной ввод |
 

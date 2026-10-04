@@ -8,7 +8,7 @@ DATA_FOLDERS = (
     "logs", "groups", "scenarios", "profile_snapshots", "profiles_archive",
     "browser_profiles", "vpn_gateway", "backups",
 )
-IMPORT_FOLDERS = ("auth_input", "auth_input/processed")
+IMPORT_FOLDERS = ("auth_input", "auth_input/processed", "emails")
 RESOURCE_FOLDERS = (
     "templates", "assets/avatar_packs/male", "assets/avatar_packs/female",
     "assets/avatar_packs/unknown", "assets/avatar_packs_raw",
@@ -33,3 +33,9 @@ def ensure_project_layout(root: Path, data_dir: Path, import_dir: Path) -> None:
                 file.write("# Your own phone numbers, one per line in international format.\n")
         except FileExistsError:
             pass
+    mail_list = import_dir / "emails/accounts.txt"
+    try:
+        with mail_list.open("x", encoding="utf-8") as file:
+            file.write("# Your own mailboxes: email:password;host;port (one per line).\n")
+    except FileExistsError:
+        pass

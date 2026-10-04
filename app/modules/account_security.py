@@ -12,7 +12,7 @@ from core.storage import update_json
 from core.telegram_client import create_client
 from core.ui_progress import OperationProgress
 from modules.accounts import AccountService
-from modules.email_inbox import EmailInboxClient, generate_recovery_email
+from modules.email_inbox import create_email_inbox
 from utils.rate_limit import human_delay
 from utils.telegram_errors import is_invalid_auth_error, short_error
 
@@ -77,6 +77,17 @@ class AccountSecurityService:
         self.config = config
         self.accounts = AccountService(config)
         self.log = logging.getLogger("security")
+
+    def _email_inbox(self, domain: str, api_url: str, token: str, timeout: float):
+        owners: dict[str, set[str]] = {}
+        if getattr(self.config, "email_inbox_backend", "http") != "http":
+            for account in self.accounts.list_accounts():
+                for key in ("login_email", "recovery_email"):
+                    address = str(account.metadata.get(key) or "").strip().lower()
+                    if address:
+                        owners.setdefault(address, set()).add(account.id)
+        return create_email_inbox(self.config, domain=domain, api_url=api_url,
+                                  token=token, timeout=timeout, owners=owners)
 
     async def terminate_other_sessions(
         self,
@@ -354,11 +365,7 @@ class AccountSecurityService:
         code_timeout: float = 90.0,
         progress: OperationProgress | None = None,
     ) -> ActionResult:
-        if not domain:
-            raise RuntimeError("Email domain is required.")
-        if not inbox_api_url:
-            raise RuntimeError("Inbox API URL is required.")
-        inbox = EmailInboxClient(inbox_api_url, inbox_token, timeout=code_timeout)
+        inbox = self._email_inbox(domain, inbox_api_url, inbox_token, code_timeout)
         await inbox.healthcheck()
         semaphore = asyncio.Semaphore(max(1, self.config.max_concurrency))
         result = ActionResult()
@@ -366,20 +373,21 @@ class AccountSecurityService:
         async def worker(account: AccountRecord) -> None:
             async with semaphore:
                 await human_delay(self.config.min_action_delay, self.config.max_action_delay)
-                email = generate_recovery_email(domain, account.id)
+                email = ""
                 started_at = int(time.time())
 
                 async def code_provider(target_email: str, length: int | None) -> str:
-                    # The generated address is unique for this attempt.  A
-                    # small overlap is therefore safe and avoids losing a
-                    # just-arrived code when the Inbox worker clock trails
-                    # the desktop clock by a few seconds.
-                    return await inbox.wait_code(target_email, after=max(0, started_at - 60), length=length)
+                    # HTTP uses unique aliases and a clock-skew allowance;
+                    # IMAP/POP3 exclude old mail using a pre-request snapshot.
+                    overlap = 60 if getattr(self.config, "email_inbox_backend", "http") == "http" else 0
+                    return await inbox.wait_code(target_email, after=max(0, started_at - overlap), length=length)
 
                 try:
+                    email = inbox.address_for(account.id)
                     self.log.info("Binding recovery email for %s: %s", account.id, email)
 
                     async def operation() -> None:
+                        await inbox.prepare(email)
                         async with create_client(self.config, account) as client:
                             await client.set_recovery_email(
                                 email=email,
@@ -420,11 +428,7 @@ class AccountSecurityService:
         code_timeout: float = 90.0,
         progress: OperationProgress | None = None,
     ) -> ActionResult:
-        if not domain:
-            raise RuntimeError("Email domain is required.")
-        if not inbox_api_url:
-            raise RuntimeError("Inbox API URL is required.")
-        inbox = EmailInboxClient(inbox_api_url, inbox_token, timeout=code_timeout)
+        inbox = self._email_inbox(domain, inbox_api_url, inbox_token, code_timeout)
         await inbox.healthcheck()
         semaphore = asyncio.Semaphore(max(1, self.config.max_concurrency))
         result = ActionResult()
@@ -432,19 +436,21 @@ class AccountSecurityService:
         async def worker(account: AccountRecord) -> None:
             async with semaphore:
                 await human_delay(self.config.min_action_delay, self.config.max_action_delay)
-                email = generate_recovery_email(domain, account.id)
+                email = ""
                 started_at = int(time.time())
 
                 async def code_provider(target_email: str, length: int | None) -> str:
-                    # Every generated address is unique for this attempt, so a
-                    # small overlap is safe and absorbs clock skew between the
-                    # desktop and Cloudflare Worker.
-                    return await inbox.wait_code(target_email, after=max(0, started_at - 60), length=length)
+                    # HTTP uses unique aliases and a clock-skew allowance;
+                    # IMAP/POP3 exclude old mail using a pre-request snapshot.
+                    overlap = 60 if getattr(self.config, "email_inbox_backend", "http") == "http" else 0
+                    return await inbox.wait_code(target_email, after=max(0, started_at - overlap), length=length)
 
                 try:
+                    email = inbox.address_for(account.id)
                     self.log.info("Changing login email for %s: %s", account.id, email)
 
                     async def operation() -> None:
+                        await inbox.prepare(email)
                         async with create_client(self.config, account) as client:
                             await client.set_login_email(email=email, code_provider=code_provider)
 

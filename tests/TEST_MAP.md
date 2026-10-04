@@ -19,6 +19,17 @@ Runner запускает `unittest`: границы desktop-пакета, от�
 
 Перед коммитом выполните `fast` и smoke, если изменился GUI или запуск.
 
+`test_sidebar_layout.py` проверяет перенос кнопок и сохранность обработчиков;
+smoke проверяет полные подписи всех секций при обычной и минимальной ширине окна.
+
+Почтовые коды: `test_email_mailbox.py` — форматы списка, уникальные закрепления,
+свежие UID/UIDL, MIME/HTML, TLS, read-only IMAP/POP3, таймауты и порядок операций
+в login/recovery email. Только fake-серверы, без настоящих ящиков и Telegram.
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest discover -s tests -p test_email_mailbox.py -v
+```
+
 Пути после реорганизации: исходники в `app/`, настройки установки в `config/`.
 `test_desktop_package.py` проверяет импортный граф и переносимость запуска;
 `smoke_desktop.py` загружает GUI из `app/` с временными данными.

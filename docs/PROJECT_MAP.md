@@ -19,6 +19,8 @@
 - `app/core/` — конфигурация, клиенты MTProto, сессии, хранение, задачи и UI-контракты.
 - `app/modules/accounts.py`, `session_*.py`, `account_security.py`, `direct_access.py`
   — аккаунты, импорт, проверка, безопасность и Telegram Web.
+- `app/modules/email_inbox.py`, `email_mailbox.py`, `imports/emails/README.md`
+  — HTTP / TLS IMAP / POP3, список ящиков и локальные привязки без паролей.
 - `app/modules/profile_*.py`, `scrape_cache.py`, `app/utils/profile_generator.py`
   — парсинг, архив, применение, истории и генерация профилей.
 - `app/modules/giveaway_service.py`, `raffle_*.py` — desktop-участие в розыгрышах.

@@ -37,16 +37,19 @@ class FolderTests(unittest.TestCase):
                 self.assertEqual("", (root / "templates" / name).read_text())
             template = root / "templates" / "bios.txt"
             phones = imports / "batch_phones.txt"
+            mailboxes = imports / "emails/accounts.txt"
             template.write_text("user template fixture", encoding="utf-8")
             phones.write_text("user phone-list fixture", encoding="utf-8")
+            mailboxes.write_text("private mailbox fixture", encoding="utf-8")
             ensure_project_layout(root, data, imports)
             self.assertEqual("user template fixture", template.read_text())
             self.assertEqual("user phone-list fixture", phones.read_text())
+            self.assertEqual("private mailbox fixture", mailboxes.read_text())
 
     def test_git_contains_scaffolds_for_all_runtime_folders(self):
         for name in DATA_FOLDERS:
             self.assertTrue((ROOT / "data" / name / ".gitkeep").is_file(), name)
-        for name in ("imports/auth_input/processed", "assets/avatar_packs/male", "assets/avatar_packs/female",
+        for name in ("imports/auth_input/processed", "imports/emails", "assets/avatar_packs/male", "assets/avatar_packs/female",
                      "assets/avatar_packs/unknown", "assets/avatar_packs_raw"):
             self.assertTrue((ROOT / name / ".gitkeep").is_file(), name)
         self.assertTrue((ROOT / "imports/auth_input/README.md").is_file())
@@ -63,6 +66,7 @@ class FolderTests(unittest.TestCase):
                 "imports/source.session", "imports/auth_input/source.json",
                 "imports/auth_input/processed/source.session",
                 "imports/batch_phones.txt", "templates/profile_plan.json",
+                "imports/emails/accounts.txt", "data/email_mailbox_bindings.json",
                 "templates/bios.txt", "assets/avatar_packs/female/user.jpg",
                 "assets/avatar_packs_raw/user.jpg", ".env",
             ]
@@ -72,6 +76,7 @@ class FolderTests(unittest.TestCase):
             allowed = [
                 "data/sessions/pyrogram/.gitkeep", "data/README.md",
                 "imports/auth_input/README.md", "imports/auth_input/processed/.gitkeep",
+                "imports/emails/README.md", "imports/emails/.gitkeep",
                 "assets/avatar_packs/male/.gitkeep", "assets/branding/uznik-multitool.ico",
                 "config/.env.example",
             ]

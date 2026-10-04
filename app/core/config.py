@@ -61,6 +61,13 @@ class AppConfig:
     proxy_interval_minutes: int
     giveaway_browser_max_concurrency: int = 1
     giveaway_referral_batch_size: int = 1
+    email_inbox_backend: str = "http"
+    email_mailboxes_file: Path | None = None
+    email_mailbox_host: str = ""
+    email_mailbox_port: int = 0
+    email_mailbox_folder: str = "INBOX"
+    email_mailbox_socket_timeout: float = 15.0
+    email_mailbox_poll_interval: float = 4.0
 
     @classmethod
     def load(cls, env_path: Path | str = ".env") -> "AppConfig":
@@ -108,6 +115,13 @@ class AppConfig:
             email_domain=os.getenv("EMAIL_DOMAIN", ""),
             email_inbox_api_url=os.getenv("EMAIL_INBOX_API_URL", "").rstrip("/"),
             email_inbox_token=os.getenv("EMAIL_INBOX_TOKEN", ""),
+            email_inbox_backend=os.getenv("EMAIL_INBOX_BACKEND", "http").strip().lower(),
+            email_mailboxes_file=Path(os.getenv("EMAIL_MAILBOXES_FILE") or (import_dir / "emails/accounts.txt")).resolve(),
+            email_mailbox_host=os.getenv("EMAIL_MAILBOX_HOST", "").strip(),
+            email_mailbox_port=_env_int("EMAIL_MAILBOX_PORT", 0),
+            email_mailbox_folder=os.getenv("EMAIL_MAILBOX_FOLDER", "INBOX"),
+            email_mailbox_socket_timeout=_env_float("EMAIL_MAILBOX_SOCKET_TIMEOUT", 15.0),
+            email_mailbox_poll_interval=_env_float("EMAIL_MAILBOX_POLL_INTERVAL", 4.0),
             proxy_pool_db=data_dir / os.getenv("PROXY_POOL_DB", "proxy_pool.db"),
             proxy_max_concurrency=_env_int("PROXY_MAX_CONCURRENCY", 50),
             proxy_interval_minutes=_env_int("PROXY_INTERVAL_MINUTES", 30),

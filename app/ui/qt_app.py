@@ -9,10 +9,11 @@ import threading
 import traceback
 from collections.abc import Awaitable, Callable
 from concurrent.futures import CancelledError as FutureCancelledError
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from PySide6.QtCore import QAbstractTableModel, QModelIndex, QObject, Qt, QSettings, QTimer, QUrl, Signal
+from PySide6.QtCore import QAbstractTableModel, QModelIndex, QObject, Qt, QSettings, QSize, QTimer, QUrl, Signal
 from PySide6.QtGui import QColor, QCloseEvent, QDesktopServices, QIcon, QPalette
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -20,10 +21,12 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QFrame,
+    QFileDialog,
     QGridLayout,
     QHBoxLayout,
     QHeaderView,
     QInputDialog,
+    QLayout,
     QLabel,
     QLineEdit,
     QMainWindow,
@@ -32,6 +35,7 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QTableView,
     QVBoxLayout,
     QWidget,
@@ -55,6 +59,7 @@ from modules.accounts import AccountService
 from modules.ai_companion import AICompanion, AIConversationConfig
 from modules.chat_actions import ChatActionService
 from modules.direct_access import DirectAccessResult, DirectAccessService
+from modules.email_inbox import email_setup_description
 from modules.giveaway_service import GiveawayInspection, GiveawayService, PROVIDER_LABELS
 from modules.profile_scraper import ProfileScraperService, _norm_ch
 from modules.online_mode import OnlineModeService
@@ -134,6 +139,68 @@ class UiSignals(QObject):
     proxy_count_ready = Signal(int, int)
     progress_updated = Signal(object)
     auth_code_requested = Signal(object)
+
+
+class ButtonRow(QWidget):
+    """Keep captions readable; wrap only when a row's labels cannot fit."""
+
+    def __init__(self, buttons: list[QPushButton]) -> None:
+        super().__init__()
+        self.buttons = buttons
+        self.columns = 0
+        self.grid = QGridLayout(self)
+        self.grid.setContentsMargins(0, 0, 0, 0)
+        self.grid.setSpacing(8)
+        self.grid.setSizeConstraint(QLayout.SetNoConstraint)
+        policy = QSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        policy.setHeightForWidth(True)
+        self.setSizePolicy(policy)
+        self._reflow()
+
+    def _column_count(self, width: int) -> int:
+        for columns in range(len(self.buttons), 1, -1):
+            widths = [0] * columns
+            for index, button in enumerate(self.buttons):
+                # A lone button on the last row spans the whole row.
+                if index == len(self.buttons) - 1 and index % columns == 0:
+                    continue
+                widths[index % columns] = max(widths[index % columns], button.sizeHint().width())
+            required = max(sum(widths) + self.grid.spacing() * (columns - 1),
+                           max(button.sizeHint().width() for button in self.buttons))
+            if required <= width:
+                return columns
+        return 1
+
+    def minimumSizeHint(self) -> QSize:
+        return QSize(max(button.sizeHint().width() for button in self.buttons),
+                     max(button.sizeHint().height() for button in self.buttons))
+
+    def sizeHint(self) -> QSize:
+        return QSize(self.minimumSizeHint().width(), self.heightForWidth(self.width()))
+
+    def heightForWidth(self, width: int) -> int:
+        columns = self._column_count(width)
+        heights = [max(button.sizeHint().height() for button in self.buttons[start:start + columns])
+                   for start in range(0, len(self.buttons), columns)]
+        return sum(heights) + self.grid.spacing() * (len(heights) - 1)
+
+    def _reflow(self) -> None:
+        columns = self._column_count(self.width())
+        if columns == self.columns:
+            return
+        while self.grid.count():
+            self.grid.takeAt(0)
+        for column in range(max(columns, self.columns)):
+            self.grid.setColumnStretch(column, 1 if column < columns else 0)
+        for index, button in enumerate(self.buttons):
+            span = columns if index == len(self.buttons) - 1 and index % columns == 0 else 1
+            self.grid.addWidget(button, index // columns, index % columns, 1, span)
+        self.columns = columns
+        self.updateGeometry()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._reflow()
 
 
 class Section(QWidget):
@@ -882,6 +949,26 @@ class QtDesktopApp(QMainWindow):
             "2FA password if same for accounts",
             password=True,
         )
+        self._add_label(layout, "Email code source")
+        self.email_backend_combo = QComboBox()
+        for label, backend in (("HTTP Inbox API", "http"), ("IMAP mailboxes", "imap"), ("POP3 mailboxes", "pop3")):
+            self.email_backend_combo.addItem(label, backend)
+        self.email_backend_combo.setCurrentIndex(max(0, self.email_backend_combo.findData(self.config.email_inbox_backend)))
+        layout.addWidget(self.email_backend_combo)
+        self.mailbox_file_row = QWidget()
+        file_layout = QHBoxLayout(self.mailbox_file_row)
+        file_layout.setContentsMargins(0, 0, 0, 0)
+        file_layout.setSpacing(8)
+        self.mailbox_file_entry = QLineEdit(str(self.config.email_mailboxes_file or ""))
+        self.mailbox_file_entry.setPlaceholderText("Mailbox list (UTF-8)")
+        self.mailbox_file_entry.setToolTip("email:password;host;port — one mailbox per line. Passwords stay in your file.")
+        file_layout.addWidget(self.mailbox_file_entry, 1)
+        browse = QPushButton("Browse")
+        browse.clicked.connect(self.choose_mailbox_file)
+        file_layout.addWidget(browse)
+        layout.addWidget(self.mailbox_file_row)
+        self.email_backend_combo.currentIndexChanged.connect(self.sync_mailbox_options)
+        self.sync_mailbox_options()
         self._add_button_row(layout, [("Terminate other sessions", self.terminate_other_sessions, "secondary")])
         self._add_button_row(
             layout,
@@ -991,16 +1078,13 @@ class QtDesktopApp(QMainWindow):
         return entry
 
     def _add_button_row(self, layout: QVBoxLayout, buttons: list[tuple[str, Callable[[], None], str]]) -> None:
-        row_widget = QWidget()
-        row = QHBoxLayout(row_widget)
-        row.setContentsMargins(0, 0, 0, 0)
-        row.setSpacing(8)
+        widgets = []
         for text, command, kind in buttons:
             button = QPushButton(text)
             button.setProperty("class", kind)
             button.clicked.connect(command)
-            row.addWidget(button)
-        layout.addWidget(row_widget)
+            widgets.append(button)
+        layout.addWidget(ButtonRow(widgets))
 
     def _clear_layout(self, layout: QVBoxLayout | QHBoxLayout) -> None:
         while layout.count():
@@ -3716,17 +3800,37 @@ class QtDesktopApp(QMainWindow):
 
         self.start_managed_task("restore-passkeys", runner)
 
+    def sync_mailbox_options(self) -> None:
+        self.mailbox_file_row.setVisible(self.email_backend_combo.currentData() in {"imap", "pop3"})
+
+    def choose_mailbox_file(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "Choose mailbox list", str(self.config.import_dir / "emails"),
+                                             "Mailbox lists (*.txt *.jsonl);;All files (*)")
+        if path:
+            self.mailbox_file_entry.setText(path)
+
+    def email_task_config(self) -> AppConfig | None:
+        path = self.mailbox_file_entry.text().strip()
+        config = replace(self.config, email_inbox_backend=str(self.email_backend_combo.currentData()),
+                         email_mailboxes_file=Path(path).resolve() if path else None)
+        try:
+            email_setup_description(config)
+        except RuntimeError as exc:
+            self.log(str(exc))
+            return None
+        return config
+
     def bind_recovery_email(self) -> None:
         accounts = self.group_accounts()
         if not accounts:
             self.log("No enabled accounts in selected group.")
             return
-        domain = self.config.email_domain.strip()
-        inbox_api = self.config.email_inbox_api_url.strip()
-        inbox_token = self.config.email_inbox_token.strip()
-        if not domain or not inbox_api:
-            self.log("Set EMAIL_DOMAIN and EMAIL_INBOX_API_URL in .env first.")
+        email_config = self.email_task_config()
+        if email_config is None:
             return
+        domain = email_config.email_domain.strip()
+        inbox_api = email_config.email_inbox_api_url.strip()
+        inbox_token = email_config.email_inbox_token.strip()
         new_password = self.ask_text(
             "Cloud password",
             "New cloud password if account has no 2FA, or new password if you want to change it.",
@@ -3740,11 +3844,11 @@ class QtDesktopApp(QMainWindow):
         if not self.confirm_bulk_operation(
             "Bind recovery emails",
             accounts,
-            detail=f"Generates recovery emails on {domain} and waits for Telegram codes through Inbox API.",
+            detail=email_setup_description(email_config),
         ):
             return
         self.scenario_not_recorded("recovery-email binding may require 2FA secrets.")
-        service = AccountSecurityService(self.config)
+        service = AccountSecurityService(email_config)
         progress = self.begin_operation_progress("Bind recovery emails", accounts)
         self.start_managed_task(
             "bind-recovery-email",
@@ -3766,22 +3870,22 @@ class QtDesktopApp(QMainWindow):
         if not accounts:
             self.log("No enabled accounts in selected group.")
             return
-        domain = self.config.email_domain.strip()
-        inbox_api = self.config.email_inbox_api_url.strip()
-        inbox_token = self.config.email_inbox_token.strip()
-        if not domain or not inbox_api:
-            self.log("Set EMAIL_DOMAIN and EMAIL_INBOX_API_URL in .env first.")
+        email_config = self.email_task_config()
+        if email_config is None:
             return
+        domain = email_config.email_domain.strip()
+        inbox_api = email_config.email_inbox_api_url.strip()
+        inbox_token = email_config.email_inbox_token.strip()
         if not self.confirm_bulk_operation(
             "Change login emails",
             accounts,
             detail=(
-                f"Generates new login emails on {domain}; accounts without one can fail with EMAIL_NOT_SETUP."
+                email_setup_description(email_config) + " Accounts without a login email can fail with EMAIL_NOT_SETUP."
             ),
         ):
             return
         self.scenario_not_recorded("login-email changes are kept manual for safety.")
-        service = AccountSecurityService(self.config)
+        service = AccountSecurityService(email_config)
         progress = self.begin_operation_progress("Change login emails", accounts)
         self.start_managed_task(
             "change-login-email",
@@ -3888,7 +3992,7 @@ class QtDesktopApp(QMainWindow):
 
     def apply_density(self) -> None:
         """Use the Comfortable layout for every desktop session."""
-        self.sidebar_scroll.setFixedWidth(350)
+        self.sidebar_scroll.setFixedWidth(420)
         self.table.verticalHeader().setDefaultSectionSize(46)
         self.table.verticalHeader().setMinimumSectionSize(46)
         self.log_box.setMaximumHeight(16_777_215)
