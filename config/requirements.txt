@@ -1,6 +1,13 @@
-# Desktop UI and Telegram MTProto clients (Kurigram imports as pyrogram).
-kurigram>=2.2.24
+# CPython 3.12-3.14 x64. Native programs/browser are installed by setup.bat.
+# Do NOT add Pyrogram or kurigram[fast]: both conflict with these providers.
+--only-binary=TgCrypto-pyrofork
+
+# Telegram: maintained fork (imports as pyrogram) + wheel-based crypto.
+Kurigram==2.2.26
+TgCrypto-pyrofork==1.2.8
 telethon>=1.36.0
+
+# Desktop, configuration, networking, downloads and diagnostics.
 PySide6>=6.7.0
 python-dotenv>=1.0.1
 httpx>=0.27.2
@@ -8,10 +15,19 @@ pysocks>=1.7.1
 socksio>=1.0.0
 gdown>=5.2.0
 psutil>=5.9.0
+
+# Telegram Web / browser-based actions. Chromium is a separate download.
 playwright>=1.45.0
+
+# Images, QR decoding and CPU OCR. No GPU/CUDA or web API extra required.
 Pillow>=10.0.0
-numpy>=1.26.0
+numpy>=1.26.0,<3
 zxing-cpp>=3.1.1
-ddddocr>=1.5.6
+ddddocr>=1.6.1,<2
+onnxruntime>=1.23.0,<2
+opencv-python>=4.10.0,<5; sys_platform == "win32" or sys_platform == "darwin"
+opencv-python-headless>=4.10.0,<5; sys_platform == "linux"
+
+# Passkey (CBOR, cryptographic keys).
 cbor2>=5.6.0
 cryptography>=43.0.0

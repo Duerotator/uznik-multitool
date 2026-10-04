@@ -1,6 +1,8 @@
 # Карта Uznik MultiTool
 
-- `setup.bat`, `scripts/setup.ps1` — установка Windows-окружения и Chromium.
+- `setup.bat`, `scripts/setup.ps1` — полная Windows-установка;
+  `scripts/windows/install_native_tools.ps1` — FFmpeg, Tesseract, Xray через WinGet;
+  `scripts/check_install.py` — автономная проверка; `docs/INSTALLATION.md` — руководство.
 - `start_gui.bat`, `app/launch.pyw` — запуск desktop; `scripts/windows/create_shortcut.bat`
   и `scripts/create_shortcut.ps1` — ярлыки в корне и на рабочем столе;
   `scripts/windows/start_debug.bat` — диагностика.

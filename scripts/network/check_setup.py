@@ -3,13 +3,14 @@ from __future__ import annotations
 
 import argparse
 import os
-import shutil
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "app"))
+
+from scripts.check_install import find_native_tool, installed_version
 
 
 def main() -> int:
@@ -22,8 +23,11 @@ def main() -> int:
     print(f"Proxy mode: {os.getenv('PROXY_MODE', 'manual')}")
     print(f"auth_input folder: {(config.import_dir / 'auth_input').is_dir()}")
     print(f"Window icon: {(ROOT / 'assets/branding/uznik-multitool.ico').is_file()}")
-    for name in ("ffmpeg", "tesseract"):
-        print(f"{name}: {'available' if shutil.which(name) else 'not in PATH (optional)'}")
+    print(f"Telegram client: Kurigram {installed_version('Kurigram') or 'not installed'} (module: pyrogram)")
+    print(f"MTProto acceleration: TgCrypto-pyrofork {installed_version('TgCrypto-pyrofork') or 'not installed'}")
+    for name in ("ffmpeg", "tesseract", "xray"):
+        print(f"{name}: {'found' if find_native_tool(name) else 'not found; run setup.bat'}")
+    print("Full installation check: .venv\\Scripts\\python.exe scripts/check_install.py --require-native")
     print("No network requests made.")
     return 0
 
