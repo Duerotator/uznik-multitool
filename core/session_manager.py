@@ -244,7 +244,8 @@ class SessionManager:
             seen.add(normalized)
         return merged
 
-    def _is_stable_file(self, path: Path) -> bool:
+    @staticmethod
+    def _is_stable_file(path: Path) -> bool:
         try:
             stat = path.stat()
         except FileNotFoundError:

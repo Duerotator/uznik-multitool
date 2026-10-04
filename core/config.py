@@ -76,6 +76,9 @@ class AppConfig:
         groups_dir.mkdir(parents=True, exist_ok=True)
         import_dir.mkdir(parents=True, exist_ok=True)
 
+        from core.project_layout import ensure_project_layout
+        ensure_project_layout(Path(env_path).resolve().parent, data_dir, import_dir)
+
         allowed = frozenset(
             item.strip()
             for item in os.getenv("AI_ALLOWED_CHATS", "").split(",")

@@ -25,8 +25,8 @@ class DesktopPackageTests(unittest.TestCase):
 
     def test_first_party_imports_are_complete(self):
         # Include lazy imports so optional desktop actions do not break later.
-        for folder in ("core", "modules", "ui", "utils"):
-            for path in (ROOT / folder).glob("*.py"):
+        for folder in ("core", "modules", "ui", "utils", "scripts"):
+            for path in (ROOT / folder).rglob("*.py"):
                 tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
                 for node in ast.walk(tree):
                     names = []
@@ -35,7 +35,7 @@ class DesktopPackageTests(unittest.TestCase):
                     elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
                         names = [node.module]
                     for name in names:
-                        if name.split(".")[0] not in {"core", "modules", "ui", "utils"}:
+                        if name.split(".")[0] not in {"core", "modules", "ui", "utils", "scripts"}:
                             continue
                         target = ROOT.joinpath(*name.split("."))
                         self.assertTrue(target.with_suffix(".py").is_file() or (target / "__init__.py").is_file(),
@@ -70,7 +70,7 @@ class DesktopPackageTests(unittest.TestCase):
 
     def test_sensitive_paths_are_ignored(self):
         ignore = (ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
-        for pattern in ("data/", "imports/", ".env", "*.session*", "*.db*", "*.lnk", "templates/*"):
+        for pattern in ("data/**", "imports/**", ".env", "*.session*", "*.db*", "*.lnk", "templates/*"):
             self.assertIn(pattern, ignore)
         self.assertIn("!.env.example", ignore)
 

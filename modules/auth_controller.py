@@ -2,9 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import re
 import time
-from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -21,11 +19,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("auth-controller")
 
-IMPORT_WATCH_DIR = Path("imports/auth_input")
-MAX_RETRIES = 5
-RETRY_COOLDOWN = 30
-PROCESSED_MEMORY = 2000
-
 
 @dataclass
 class AuthSession:
@@ -33,6 +26,7 @@ class AuthSession:
     client: Client
     phone_code_hash: str
     fingerprint: dict[str, str]
+    proxy_url: str | None = None
     created_at: float = field(default_factory=time.time)
     attempts: int = 0
 
@@ -43,15 +37,16 @@ class AuthManager:
         self.sessions: dict[str, AuthSession] = {}
         self.accounts = AccountService(config)
         self.session_mgr = SessionManager(config)
-        self.fingerprints = FingerprintGenerator()
+        self.fingerprints = FingerprintGenerator(str(config.data_dir / "fingerprints.json"))
         self._lock = asyncio.Lock()
-        IMPORT_WATCH_DIR.mkdir(parents=True, exist_ok=True)
+        (config.import_dir / "auth_input").mkdir(parents=True, exist_ok=True)
 
     async def verified_proxy_url(self, proxy_url: str | None = None) -> str:
         """Return an MTProto-verified proxy; never permit direct Telegram I/O."""
         from core.models import ProxyConfig
         from modules.proxy_manager import ProxyPool, validate_proxy
 
+        proxy_url = proxy_url or self.config.global_proxy
         if proxy_url:
             cfg = ProxyConfig.from_url(proxy_url)
             if cfg is not None:
@@ -69,6 +64,7 @@ class AuthManager:
         return entry.url
 
     async def send_code(self, phone: str, proxy_url: str | None = None) -> dict[str, Any]:
+        self.config.require_telegram_api()
         from pyrogram import Client
         from pyrogram.types import SentCode
 
@@ -76,7 +72,7 @@ class AuthManager:
             existing = self.sessions.get(phone)
             if existing:
                 try:
-                    await existing.client.stop()
+                    await existing.client.disconnect()
                 except Exception:
                     pass
             self.sessions.pop(phone, None)
@@ -114,6 +110,7 @@ class AuthManager:
                     client=client,
                     phone_code_hash=phone_code_hash,
                     fingerprint=fp,
+                    proxy_url=proxy_url,
                 )
 
             return {
@@ -123,11 +120,13 @@ class AuthManager:
                 "timeout": getattr(sent, "timeout", 120),
                 "fingerprint": {"device": fp["device_model"], "os": fp["system_version"]},
             }
-        except Exception as exc:
+        except BaseException as exc:
             try:
-                await client.stop()
+                await client.disconnect()
             except Exception:
                 pass
+            if not isinstance(exc, Exception):
+                raise
             err = short_error(exc)
             logger.error("send_code failed for %s: %s", phone, err)
             return {"ok": False, "error": err}
@@ -177,19 +176,21 @@ class AuthManager:
         # The client is in-memory, so nothing is ever written to disk: export the
         # session string and hand SessionManager a json_dump, which it supports.
         dump_path = self.config.sessions_dir / "pyrogram" / f"{session_filename}.json"
+        if dump_path.exists():
+            dump_path = dump_path.with_name(f"{session_filename}_{time.time_ns()}.json")
         dump_path.parent.mkdir(parents=True, exist_ok=True)
 
         try:
             session_string = await auth.client.export_session_string()
         except Exception as exc:
             try:
-                await auth.client.stop()
+                await auth.client.disconnect()
             except Exception:
                 pass
             return {"ok": False, "error": f"Failed to export session: {short_error(exc)}"}
 
         try:
-            await auth.client.stop()
+            await auth.client.disconnect()
         except Exception:
             pass
 
@@ -197,6 +198,15 @@ class AuthManager:
 
         try:
             imported = self.session_mgr.import_path(dump_path, group="inbox", backend_hint="pyrogram")
+            for account in imported:
+                account.user_id = user_id
+                account.phone = phone
+                account.username = username or None
+                account.first_name = first_name
+                account.last_name = last_name
+                account.proxy = auth.proxy_url
+                account.metadata["fingerprint"] = dict(auth.fingerprint)
+                self.session_mgr._upsert_account(account)
         except Exception as exc:
             logger.warning("Auto-import failed for %s: %s", dump_path, exc)
             imported = []
@@ -205,7 +215,7 @@ class AuthManager:
             self.sessions.pop(phone, None)
 
         return {
-            "ok": True,
+            "ok": bool(imported),
             "status": "authorized",
             "user_id": user_id,
             "first_name": first_name,
@@ -213,6 +223,7 @@ class AuthManager:
             "username": username,
             "session_path": str(dump_path),
             "imported": len(imported) > 0,
+            "error": "" if imported else "New authorization was saved, but account import failed; source was kept.",
         }
 
     async def cleanup_expired(self, max_age_seconds: int = 300) -> int:
@@ -223,121 +234,19 @@ class AuthManager:
                 auth = self.sessions[phone]
                 if now - auth.created_at > max_age_seconds:
                     try:
-                        await auth.client.stop()
+                        await auth.client.disconnect()
                     except Exception:
                         pass
                     del self.sessions[phone]
                     removed += 1
         return removed
 
-
-class AuthImportWatcher:
-    def __init__(self, config: AppConfig, auth_mgr: AuthManager):
-        self.config = config
-        self.auth = auth_mgr
-        self.log = logging.getLogger("auth-import")
-        IMPORT_WATCH_DIR.mkdir(parents=True, exist_ok=True)
-        self._processed: deque[str] = deque(maxlen=PROCESSED_MEMORY)
-        self._processed_set: set[str] = set()
-        self._attempts: dict[str, tuple[int, float]] = {}
-
-    def _remember(self, key: str) -> None:
-        """Bounded memory of handled files — the watcher runs for the process lifetime."""
-        if key in self._processed_set:
-            return
-        if len(self._processed) == self._processed.maxlen:
-            self._processed_set.discard(self._processed[0])
-        self._processed.append(key)
-        self._processed_set.add(key)
-        self._attempts.pop(key, None)
-
-    async def watch(self, stop_event: asyncio.Event) -> None:
-        self.log.info("Auth import watcher started on %s", IMPORT_WATCH_DIR)
-        while not stop_event.is_set():
-            for item in sorted(IMPORT_WATCH_DIR.glob("*.session")):
-                key = str(item.resolve())
-                if key in self._processed_set:
-                    continue
-                attempts, last_try = self._attempts.get(key, (0, 0))
-                now = time.time()
-                if attempts >= MAX_RETRIES:
-                    self.log.warning("Max retries for %s, deleting.", item.name)
-                    item.unlink(missing_ok=True)
-                    self._remember(key)
-                    continue
-                if now - last_try < RETRY_COOLDOWN:
-                    continue
-
-                self._attempts[key] = (attempts + 1, now)
-                try:
-                    result = await self._recreate_session(item)
-                    if result.get("ok"):
-                        self.log.info("Session recreated from %s => %s", item.name, result.get("session_path"))
-                        item.unlink(missing_ok=True)
-                        self._remember(key)
-                    else:
-                        self.log.warning("Attempt %d failed for %s: %s", attempts + 1, item.name, result.get("error"))
-                except Exception as exc:
-                    self.log.error("Recreate error for %s: %s", item.name, exc)
-
-            await asyncio.sleep(5)
-
-    async def _recreate_session(self, session_path: Path) -> dict[str, Any]:
-        from pyrogram import Client
-
-        try:
-            proxy_url = await self.auth.verified_proxy_url()
-            from core.models import ProxyConfig
-            proxy_cfg = ProxyConfig.from_url(proxy_url)
-        except Exception as exc:
-            return {"ok": False, "error": short_error(exc)}
-
-        # A .session file is a SQLite database, not a session string — open it as
-        # the on-disk session Pyrogram expects.
-        client = Client(
-            name=session_path.stem,
-            api_id=self.config.api_id,
-            api_hash=self.config.api_hash,
-            workdir=str(session_path.parent),
-            in_memory=False,
-            no_updates=True,
-            proxy=proxy_cfg.to_pyrogram() if proxy_cfg else None,
-        )
-        await client.connect()
-
-        try:
-            me = await client.get_me()
-            phone = getattr(me, "phone_number", "") or ""
-            if not phone:
-                await client.stop()
-                return {"ok": False, "error": "No phone in session."}
-
-            result = await self.auth.send_code(phone, proxy_url=proxy_url)
-            if not result.get("ok"):
-                await client.stop()
-                return result
-
-            phone_code_hash = result["phone_code_hash"]
-
-            service_msgs = await client.get_messages(777000, limit=5)
-            code = ""
-            for msg in service_msgs:
-                text = str(getattr(msg, "text", ""))
-                codes = re.findall(r"\b(\d{5,6})\b", text)
-                if codes:
-                    code = codes[0]
-                    break
-
-            if not code:
-                await client.stop()
-                return {"ok": False, "error": "No login code found in service messages."}
-
-            sign_result = await self.auth.sign_in(phone, phone_code_hash, code)
-            await client.stop()
-            return sign_result
-        except Exception as exc:
+    async def close_session(self, phone: str) -> None:
+        """Release a cancelled/failed login without expiring other queued logins."""
+        async with self._lock:
+            auth = self.sessions.pop(phone, None)
+        if auth is not None:
             try:
-                await client.stop()
+                await auth.client.disconnect()
             except Exception:
-                pass
-            return {"ok": False, "error": short_error(exc)}
+                logger.debug("Login client was already disconnected", exc_info=True)

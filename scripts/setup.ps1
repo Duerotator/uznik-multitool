@@ -43,4 +43,5 @@ if (-not (Test-Path -LiteralPath $envFile)) {
     Write-Host 'Fill TELEGRAM_API_ID and TELEGRAM_API_HASH in .env before connecting accounts.'
     if (-not $NoOpenConfig) { Start-Process notepad.exe -ArgumentList ('"{0}"' -f $envFile) }
 }
+Invoke-Checked $venvPython @((Join-Path $PSScriptRoot 'prepare_layout.py'))
 & (Join-Path $PSScriptRoot 'create_shortcut.ps1')

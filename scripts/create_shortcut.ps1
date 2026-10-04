@@ -10,7 +10,9 @@ $shortcut.TargetPath = $pythonWindowless
 $shortcut.Arguments = '"{0}"' -f (Join-Path $projectRoot 'launch.pyw')
 $shortcut.WorkingDirectory = $projectRoot
 $shortcut.Description = 'Uznik MultiTool - desktop Telegram toolkit'
-$shortcut.IconLocation = "$pythonWindowless,0"
+$iconPath = Join-Path $projectRoot 'assets\branding\uznik-multitool.ico'
+if (Test-Path -LiteralPath $iconPath) { $shortcut.IconLocation = "$iconPath,0" }
+else { $shortcut.IconLocation = "$pythonWindowless,0" }
 $shortcut.WindowStyle = 1
 $shortcut.Save()
 Write-Host "Shortcut: $shortcutPath"

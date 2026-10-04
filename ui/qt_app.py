@@ -12,8 +12,8 @@ from concurrent.futures import CancelledError as FutureCancelledError
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from PySide6.QtCore import QAbstractTableModel, QModelIndex, QObject, Qt, QSettings, QTimer, Signal
-from PySide6.QtGui import QColor, QCloseEvent, QPalette
+from PySide6.QtCore import QAbstractTableModel, QModelIndex, QObject, Qt, QSettings, QTimer, QUrl, Signal
+from PySide6.QtGui import QColor, QCloseEvent, QDesktopServices, QIcon, QPalette
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -255,6 +255,8 @@ class QtDesktopApp(QMainWindow):
         self.proxy_total_count = 0
         self.current_progress: OperationProgress | None = None
         self.direct_access = DirectAccessService(config)
+        self.external_sessions_running = False
+        self._announced_external_sources: set[str] = set()
         self.settings = QSettings("UznikMultiTool", "Desktop")
         self.group_name = str(self.settings.value("active_group", "inbox"))
 
@@ -267,6 +269,7 @@ class QtDesktopApp(QMainWindow):
         self.profile_plan_file = Path("templates/profile_plan.json")
 
         self.setWindowTitle("Uznik MultiTool")
+        self.setWindowIcon(QIcon(str(Path(__file__).resolve().parent.parent / "assets/branding/uznik-multitool.ico")))
         self.resize(1460, 860)
         self.setMinimumSize(1080, 680)
         self.setAcceptDrops(True)
@@ -276,6 +279,7 @@ class QtDesktopApp(QMainWindow):
         self.restore_ui_settings()
         self.refresh_accounts()
         self.log(f"Import folder: {self.config.import_dir}")
+        self.log(f"New local session queue: {self.config.import_dir / 'auth_input'}")
         self.log("Use the left sections. Active group controls which accounts are used.")
         self.start_local_vpn_gateway()
 
@@ -286,6 +290,7 @@ class QtDesktopApp(QMainWindow):
         self.proxy_dashboard_timer.timeout.connect(self.refresh_proxy_dashboard)
         self.proxy_dashboard_timer.start(5000)
         self.refresh_proxy_dashboard()
+        self.refresh_external_session_queue()
         QTimer.singleShot(1200, lambda: self.import_now(verbose=False))
 
     def start_local_vpn_gateway(self) -> None:
@@ -672,10 +677,22 @@ class QtDesktopApp(QMainWindow):
         self._add_button_row(layout, [("Check spamblock", self.check_spamblock, "secondary")])
 
         self._add_title(layout, "External sessions")
+        self.external_queue_label = QLabel()
+        self.external_queue_label.setWordWrap(True)
+        self.external_queue_label.setToolTip(str(self.config.import_dir / "auth_input"))
+        layout.addWidget(self.external_queue_label)
         self._add_button_row(
             layout,
-            [("Process dropped sessions", lambda: self.process_external_sessions(), "primary")],
+            [
+                ("Process dropped sessions", lambda: self.process_external_sessions(), "primary"),
+                ("Open auth_input", self.open_external_session_folder, "secondary"),
+            ],
         )
+        self.external_auto_check = QCheckBox("Auto-process new auth_input files")
+        self.external_auto_check.setToolTip("Creates new Telegram authorizations through your verified proxy. Codes are read from the supplied session; 2FA may be requested.")
+        self.external_auto_check.setChecked(False)
+        layout.addWidget(self.external_auto_check)
+        self.external_queue_label.setText("auth_input: drop your .session files here")
 
         self._add_title(layout, "VPN exits")
         self._add_button_row(
@@ -2088,15 +2105,29 @@ class QtDesktopApp(QMainWindow):
             event.ignore()
 
     def dropEvent(self, event) -> None:
-        from modules.session_onboarding import queue_external_sessions
+        from modules.session_onboarding import queue_external_sessions, session_sources
 
         paths = [Path(url.toLocalFile()) for url in event.mimeData().urls() if url.isLocalFile()]
+        sources = session_sources(paths)
+        imported = 0
+        for source in sources:
+            if source.suffix.lower() != ".json":
+                continue
+            try:
+                imported += len(self.sessions.import_path(source, group="inbox"))
+            except Exception as exc:
+                self.log(f"JSON import failed for {source.name}: {exc}", severity="warning")
         queued = queue_external_sessions(self.config, paths)
-        if not queued:
+        if not sources:
             self.log("Drop ignored: add .session or JSON session files (or folders containing them).", severity="warning")
             event.ignore()
             return
         event.acceptProposedAction()
+        if imported:
+            self.log(f"Imported {imported} JSON session(s) locally; no new Telegram authorization requested.")
+            self.refresh_accounts()
+        if not queued:
+            return
         self.log(f"Queued {len(queued)} external session(s) in imports/auth_input. Original files were not changed.")
         if self.confirm(
             "Process external sessions?",
@@ -2107,28 +2138,23 @@ class QtDesktopApp(QMainWindow):
             self.process_external_sessions(queued)
 
     def process_external_sessions(self, queued: list[Path] | None = None) -> None:
-        from modules.session_onboarding import ForeignSessionOnboarding, OnboardingResult
+        from modules.session_onboarding import ForeignSessionOnboarding, OnboardingResult, pending_external_sessions
+
+        if self.external_sessions_running:
+            self.log("The external session queue is already being processed.")
+            return
 
         if queued is None:
-            # dotenv does not override a pre-existing TELEGRAM_IMPORT_DIR.
-            # A desktop app launched from a shortcut can therefore inherit a
-            # different directory than the project shell.  The project queue
-            # is a safe fallback and makes drag/drop predictable.
-            queues = [self.config.import_dir / "auth_input"]
-            project_queue = Path(__file__).resolve().parent.parent / "imports" / "auth_input"
-            if project_queue.resolve() != queues[0].resolve():
-                queues.append(project_queue)
-            queued = []
-            seen: set[Path] = set()
-            for queue in queues:
-                for item in sorted(queue.glob("*.session")) if queue.exists() else []:
-                    resolved = item.resolve()
-                    if resolved not in seen:
-                        queued.append(resolved)
-                        seen.add(resolved)
+            queued = pending_external_sessions(self.config)
         if not queued:
             self.log("No queued external .session files. Drag files or a folder onto this window first.")
             return
+        try:
+            self.config.require_telegram_api()
+        except RuntimeError as exc:
+            self.log(str(exc), severity="warning")
+            return
+        self.external_sessions_running = True
 
         async def ask_for_input(phone: str, source: Path, *, password: bool = False) -> str | None:
             request = {"phone": phone, "source": source, "password": password, "event": threading.Event(), "value": ""}
@@ -2143,6 +2169,12 @@ class QtDesktopApp(QMainWindow):
             return await ask_for_input(phone, source, password=True)
 
         async def run(_stop: asyncio.Event):
+            try:
+                return await process_queue(_stop)
+            finally:
+                self.external_sessions_running = False
+
+        async def process_queue(_stop: asyncio.Event):
             onboarding = ForeignSessionOnboarding(self.config)
             results = []
             for source in queued:
@@ -2176,7 +2208,11 @@ class QtDesktopApp(QMainWindow):
         self.current_progress = progress
         self.signals.progress_updated.emit(progress.to_dict())
         self.log(f"External session queue: {len(queued)} file(s). Progress is shown in the top bar.")
-        self.start_managed_task("process-external-sessions", run)
+        try:
+            self.start_managed_task("process-external-sessions", run)
+        except Exception:
+            self.external_sessions_running = False
+            raise
 
     def on_auth_code_requested(self, request: object) -> None:
         if not isinstance(request, dict):
@@ -2198,6 +2234,30 @@ class QtDesktopApp(QMainWindow):
 
     def auto_import_tick(self) -> None:
         self.import_now(verbose=False)
+        self.refresh_external_session_queue()
+
+    def open_external_session_folder(self) -> None:
+        queue = self.config.import_dir / "auth_input"
+        queue.mkdir(parents=True, exist_ok=True)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(queue)))
+
+    def refresh_external_session_queue(self) -> None:
+        from modules.session_onboarding import pending_external_sessions
+        pending = pending_external_sessions(self.config)
+        self.external_queue_label.setText(f"auth_input: {len(pending)} pending · creates a new local session")
+        paths = {str(path.resolve()) for path in pending}
+        fresh = paths - self._announced_external_sources
+        self._announced_external_sources.intersection_update(paths)
+        if not fresh or self.external_sessions_running:
+            return
+        if self.external_auto_check.isChecked():
+            if not self.config.api_id or not self.config.api_hash:
+                return
+            self._announced_external_sources.update(fresh)
+            self.process_external_sessions([path for path in pending if str(path.resolve()) in fresh])
+        else:
+            self._announced_external_sources.update(fresh)
+            self.log(f"Found {len(fresh)} external session(s). Use Actions → External sessions → Process dropped sessions.")
 
     def start_managed_task(
         self,
@@ -2249,6 +2309,8 @@ class QtDesktopApp(QMainWindow):
         group: str,
     ) -> None:
         if error:
+            if name == "process-external-sessions":
+                self.external_sessions_running = False
             self.clear_progress()
             self.log(f"{name} failed to start: {error}", group=group)
             self._set_status_pill(self.task_pill, "Task: failed", "bad")
@@ -2317,12 +2379,16 @@ class QtDesktopApp(QMainWindow):
         self.ui_log.error("[%s] %s failed: %s", group, name, error)
 
     def task_stopped(self, name: str, group: str) -> None:
+        if name == "process-external-sessions":
+            self.external_sessions_running = False
         self.current_task_id = ""
         self.clear_progress()
         self._set_status_pill(self.task_pill, "Task: idle", "ok")
         self.log(f"{name} stopped.", group=group)
 
     def task_finished(self, name: str, result: object, group: str) -> None:
+        if name == "process-external-sessions":
+            self.external_sessions_running = False
         self.current_task_id = ""
         self.clear_progress()
         self._set_status_pill(self.task_pill, "Task: idle", "ok")

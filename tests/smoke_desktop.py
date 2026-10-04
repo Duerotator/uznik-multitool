@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import sys
 import tempfile
+import time
 from pathlib import Path
 from unittest.mock import patch
 
@@ -39,6 +40,19 @@ def main() -> int:
             assert not hasattr(window, "density_combo")
             assert window.table_model.rowCount() == 0
             assert window.accounts.list_accounts() == []
+            assert not window.windowIcon().isNull()
+            assert not window.external_auto_check.isChecked()
+            assert "0 pending" in window.external_queue_label.text()
+            assert (config.import_dir / "auth_input/processed").is_dir()
+            supplied = config.import_dir / "auth_input" / "queue_fixture.session"
+            supplied.write_bytes(b"offline queue fixture")
+            os.utime(supplied, (time.time() - 3, time.time() - 3))
+            window.refresh_external_session_queue()
+            assert "1 pending" in window.external_queue_label.text()
+            assert not window.external_sessions_running
+            window.process_external_sessions()  # Empty API config must block requests.
+            assert not window.external_sessions_running
+            assert supplied.exists()
         finally:
             window.close()
             window.worker.thread.join(timeout=3)

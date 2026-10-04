@@ -11,6 +11,7 @@ import logging
 import re
 import shutil
 import tempfile
+import time
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,6 +27,16 @@ log = logging.getLogger("session-onboarding")
 PHONE_RE = re.compile(r"(?<!\d)(\d{10,15})(?!\d)")
 CODE_RE = re.compile(r"(?<!\d)(\d{5,6})(?!\d)")
 SUPPORTED_SUFFIXES = {".session", ".json"}
+
+
+def pending_external_sessions(config: AppConfig) -> list[Path]:
+    """Only stable direct queue entries; never include the processed archive."""
+    queue = config.import_dir / "auth_input"
+    if not queue.exists():
+        return []
+    return [path for path in sorted(queue.iterdir())
+            if path.is_file() and path.suffix.lower() == ".session"
+            and SessionManager._is_stable_file(path)]
 
 
 def phone_hint_from_name(path: Path) -> str:
@@ -52,9 +63,13 @@ def queue_external_sessions(config: AppConfig, paths: Iterable[Path]) -> list[Pa
     queue.mkdir(parents=True, exist_ok=True)
     queued: list[Path] = []
     for source in session_sources(paths):
+        if source.suffix.lower() != ".session":
+            continue
+        if (queue / "processed").resolve() in source.parents:
+            continue
         target = queue / source.name
         if target.exists() and target.read_bytes() != source.read_bytes():
-            target = queue / f"{source.stem}_{abs(hash(str(source.resolve()))) & 0xFFFFFFFF:08x}{source.suffix}"
+            target = queue / f"{source.stem}_{time.time_ns()}{source.suffix}"
         if not target.exists():
             shutil.copy2(source, target)
         queued.append(target)
@@ -107,58 +122,64 @@ class ForeignSessionOnboarding:
 
         legacy: Any = None
         try:
-            log.info("external session %s: opening supplied session", source.name)
-            legacy = await self._open_legacy_copy(source, backend)
-            me = await legacy["get_me"]()
-            result.phone = str(getattr(me, "phone_number", "") or result.phone)
-        except Exception as exc:
-            # A filename phone can still be used. Keep processing the queue,
-            # but the code cannot be read automatically without this session.
-            log.warning("external session %s: could not open supplied session: %s", source.name, exc)
+            try:
+                log.info("external session %s: opening supplied session", source.name)
+                legacy = await self._open_legacy_copy(source, backend)
+                me = await legacy["get_me"]()
+                result.phone = str(getattr(me, "phone_number", "") or result.phone)
+            except Exception as exc:
+                # A filename phone can still be used. Keep processing the queue,
+                # but the code cannot be read automatically without this session.
+                log.warning("external session %s: could not open supplied session: %s", source.name, exc)
+                await self._close_legacy(legacy)
+                legacy = None
+            if not result.phone:
+                result.status = "needs_phone"
+                result.error = "Phone number is not in the filename and the supplied session could not be opened."
+                return result
+
+            known_message_ids = await self._recent_service_message_ids(legacy)
+            log.info("external session %s: requesting login code for %s", source.name, result.phone)
+            sent = await self.auth.send_code(result.phone)
+            if not sent.get("ok"):
+                result.error = str(sent.get("error", "Could not send login code."))
+                return result
+
+            log.info("external session %s: waiting for a fresh 777000 code", source.name)
+            code = await self._read_recent_code(legacy, known_message_ids)
+            if not code and code_provider:
+                code = await code_provider(result.phone, source)
             await self._close_legacy(legacy)
             legacy = None
-        if not result.phone:
-            result.status = "needs_phone"
-            result.error = "Phone number is not in the filename and the supplied session could not be opened."
-            return result
+            if not code:
+                result.status = "needs_code"
+                result.error = "Login code was not found in 777000. Enter it and retry this session."
+                return result
 
-        known_message_ids = await self._recent_service_message_ids(legacy)
-        log.info("external session %s: requesting login code for %s", source.name, result.phone)
-        sent = await self.auth.send_code(result.phone)
-        if not sent.get("ok"):
-            result.error = str(sent.get("error", "Could not send login code."))
+            signed = await self.auth.sign_in(result.phone, str(sent["phone_code_hash"]), code)
+            if signed.get("status") == "2fa_required":
+                password = await password_provider(result.phone, source) if password_provider else ""
+                if password:
+                    signed = await self.auth.check_password(result.phone, password)
+                else:
+                    result.status = "needs_2fa"
+                    result.error = "Cloud password is required."
+            elif signed.get("ok"):
+                result.status = "authorized"
+                result.imported = bool(signed.get("imported"))
+                self._archive_source(source)
+            if signed.get("ok") and result.status != "authorized":
+                result.status = "authorized"
+                result.imported = bool(signed.get("imported"))
+                self._archive_source(source)
+            elif result.status != "needs_2fa" and not signed.get("ok"):
+                result.error = str(signed.get("error", "Sign-in failed."))
+            return result
+        finally:
             await self._close_legacy(legacy)
-            return result
-
-        log.info("external session %s: waiting for a fresh 777000 code", source.name)
-        code = await self._read_recent_code(legacy, known_message_ids)
-        if not code and code_provider:
-            code = await code_provider(result.phone, source)
-        await self._close_legacy(legacy)
-        if not code:
-            result.status = "needs_code"
-            result.error = "Login code was not found in 777000. Enter it and retry this session."
-            return result
-
-        signed = await self.auth.sign_in(result.phone, str(sent["phone_code_hash"]), code)
-        if signed.get("status") == "2fa_required":
-            password = await password_provider(result.phone, source) if password_provider else ""
-            if password:
-                signed = await self.auth.check_password(result.phone, password)
-            else:
-                result.status = "needs_2fa"
-                result.error = "Cloud password is required."
-        elif signed.get("ok"):
-            result.status = "authorized"
-            result.imported = bool(signed.get("imported"))
-            self._archive_source(source)
-        if signed.get("ok") and result.status != "authorized":
-            result.status = "authorized"
-            result.imported = bool(signed.get("imported"))
-            self._archive_source(source)
-        elif result.status != "needs_2fa" and not signed.get("ok"):
-            result.error = str(signed.get("error", "Sign-in failed."))
-        return result
+            close_login = getattr(self.auth, "close_session", None)
+            if close_login and result.phone:
+                await close_login(result.phone)
 
     @staticmethod
     def _archive_source(source: Path) -> None:
@@ -173,29 +194,35 @@ class ForeignSessionOnboarding:
     async def _open_legacy_copy(self, source: Path, backend: str) -> dict[str, Any]:
         """Open a disposable copy so Pyrogram/Telethon cannot mutate the supplied file."""
         tmp_dir = Path(tempfile.mkdtemp(prefix="tgbmt_auth_"))
-        copy = tmp_dir / source.name
-        shutil.copy2(source, copy)
-        proxy_url = await self.auth.verified_proxy_url()
-        proxy = ProxyConfig.from_url(proxy_url)
-        if backend == "telethon":
-            from telethon import TelegramClient
-            client = TelegramClient(str(copy.with_suffix("")), self.config.api_id, self.config.api_hash, proxy=proxy.to_telethon() if proxy else None)
+        copy = tmp_dir / f"{source.stem}.session"
+        client = None
+        try:
+            shutil.copy2(source, copy)
+            proxy_url = await self.auth.verified_proxy_url()
+            proxy = ProxyConfig.from_url(proxy_url)
+            if backend == "telethon":
+                from telethon import TelegramClient
+                client = TelegramClient(str(copy.with_suffix("")), self.config.api_id, self.config.api_hash, proxy=proxy.to_telethon() if proxy else None)
+                read_messages = lambda: self._telethon_service_messages(client)
+            else:
+                from pyrogram import Client
+                client = Client(name=copy.stem, api_id=self.config.api_id, api_hash=self.config.api_hash, workdir=str(copy.parent), no_updates=True, proxy=proxy.to_pyrogram() if proxy else None)
+                read_messages = lambda: self._pyrogram_service_messages(client)
             await client.connect()
             return {
                 "get_me": client.get_me,
-                "get_service_messages": lambda: self._telethon_service_messages(client),
+                "get_service_messages": read_messages,
                 "close": client.disconnect,
                 "tmp": tmp_dir,
             }
-        from pyrogram import Client
-        client = Client(name=copy.stem, api_id=self.config.api_id, api_hash=self.config.api_hash, workdir=str(copy.parent), no_updates=True, proxy=proxy.to_pyrogram() if proxy else None)
-        await client.connect()
-        return {
-            "get_me": client.get_me,
-            "get_service_messages": lambda: self._pyrogram_service_messages(client),
-            "close": client.stop,
-            "tmp": tmp_dir,
-        }
+        except BaseException:
+            if client is not None:
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            raise
 
     async def _pyrogram_service_messages(self, client: Any) -> list[dict[str, Any]]:
         messages: list[dict[str, Any]] = []
@@ -215,9 +242,9 @@ class ForeignSessionOnboarding:
             for message in await client.get_messages(777000, limit=8)
         ]
 
-    async def _recent_service_message_ids(self, legacy: dict[str, Any] | None) -> set[int]:
+    async def _recent_service_message_ids(self, legacy: dict[str, Any] | None) -> set[int] | None:
         if not legacy:
-            return set()
+            return None
         try:
             return {
                 int(message.get("id") or 0)
@@ -226,10 +253,10 @@ class ForeignSessionOnboarding:
             }
         except Exception as exc:
             log.debug("Could not read baseline 777000 messages: %s", exc)
-            return set()
+            return None
 
-    async def _read_recent_code(self, legacy: dict[str, Any] | None, known_message_ids: set[int]) -> str:
-        if not legacy:
+    async def _read_recent_code(self, legacy: dict[str, Any] | None, known_message_ids: set[int] | None) -> str:
+        if not legacy or known_message_ids is None:
             return ""
         # Login messages may arrive later than send_code() returns. Only
         # accept a message created after the request, never an old code.
