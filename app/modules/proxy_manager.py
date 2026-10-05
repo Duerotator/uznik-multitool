@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import httpx
 
@@ -1146,6 +1146,11 @@ def _parse_json_response(
 PER_SOURCE_CAP = 3000
 
 
+def _is_geonode_source(url: str) -> bool:
+    host = (urlsplit(url).hostname or "").lower().rstrip(".")
+    return host == "geonode.com" or host.endswith(".geonode.com")
+
+
 async def harvest_sources(
     sources: list[str], pool: ProxyPool | None = None, timeout: float = 12.0
 ) -> tuple[list[tuple[str, int, str]], dict[str, dict], dict[tuple[str, int, str], set[str]]]:
@@ -1265,7 +1270,7 @@ async def harvest_sources(
                 default_proto = "http"
             before = len(results)
             content_type = response.headers.get("content-type", "")
-            if "geonode.com" in url_lower or content_type.startswith("application/json"):
+            if _is_geonode_source(url) or content_type.startswith("application/json"):
                 _parse_json_response(text, default_proto, limits, seen, results, counts, blacklist)
                 for item in results[before:]:
                     provenance.setdefault(item, set()).add(url)

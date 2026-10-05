@@ -31,6 +31,13 @@ Runner запускает `unittest`: границы desktop-пакета, от�
 автономные тесты на чистом Windows runner; `codeql.yml` — статический анализ.
 Эти проверки не используют пользовательские аккаунты или `.env`.
 
+`test_security_privacy.py` — отсутствие API-ключей и текстов ответов в ошибках
+Webshare, корректное распознавание hostname источника прокси. Только fake HTTP:
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest discover -s tests -p test_security_privacy.py -v
+```
+
 `test_sidebar_layout.py` проверяет перенос кнопок и сохранность обработчиков;
 smoke проверяет полные подписи всех секций при обычной и минимальной ширине окна.
 

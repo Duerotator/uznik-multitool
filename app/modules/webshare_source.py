@@ -37,7 +37,7 @@ class WebshareSource:
 
         proxies: list[tuple[str, int, str, str, str]] = []
         async with httpx.AsyncClient(timeout=15) as client:
-            for account in accounts:
+            for account_index, account in enumerate(accounts, start=1):
                 api_key = account.get("api_key", "")
                 if not api_key:
                     continue
@@ -47,7 +47,7 @@ class WebshareSource:
                         headers={"Authorization": f"Token {api_key}"},
                     )
                     if r.status_code != 200:
-                        logger.warning("Webshare API error for %s...: %s", api_key[:10], r.status_code)
+                        logger.warning("Webshare API error for account #%d: HTTP %d", account_index, r.status_code)
                         continue
                     data = r.json()
                     for p in data.get("results", []):
@@ -60,8 +60,9 @@ class WebshareSource:
                             p["username"],
                             p["password"],
                         ))
-                except Exception:
-                    logger.exception("Webshare fetch failed for %s...", api_key[:10])
+                except Exception as exc:
+                    # Response errors may contain credentials; log only the type.
+                    logger.warning("Webshare fetch failed for account #%d (%s)", account_index, type(exc).__name__)
 
         self._cache = proxies
         logger.info("Webshare source: %d proxies from %d accounts", len(proxies), len(accounts))

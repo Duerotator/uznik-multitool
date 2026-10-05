@@ -22,7 +22,8 @@ class AppLayoutTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {
             "TELEGRAM_API_ID": "", "TELEGRAM_API_HASH": "",
         }, clear=True):
-            project = Path(temp) / "project"
+            # Windows runners may expose TEMP through its 8.3 alias.
+            project = Path(temp).resolve() / "project"
             project.mkdir()
             env_file = project / ".env"
             env_file.write_text(
@@ -47,7 +48,7 @@ class AppLayoutTests(unittest.TestCase):
     def test_missing_api_error_names_the_actual_configuration_file(self):
         from core.config import AppConfig
         with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {}, clear=True):
-            env_file = Path(temp) / ".env"
+            env_file = Path(temp).resolve() / ".env"
             config = AppConfig.load(env_file)
             with self.assertRaises(RuntimeError) as error:
                 config.require_telegram_api()
@@ -87,7 +88,7 @@ class AppLayoutTests(unittest.TestCase):
         entry = namespace["main"]
         previous_dir, previous_path = Path.cwd(), sys.path[:]
         with tempfile.TemporaryDirectory() as temp:
-            project = Path(temp)
+            project = Path(temp).resolve()
             (project / "app").mkdir()
             entry.__globals__["__file__"] = str(project / "app/main.py")
             try:
@@ -107,7 +108,7 @@ class AppLayoutTests(unittest.TestCase):
         namespace = runpy.run_path(str(ROOT / "app/launch.pyw"), run_name="launcher_test")
         entry = namespace["main"]
         with tempfile.TemporaryDirectory() as temp:
-            project = Path(temp)
+            project = Path(temp).resolve()
             executable = project / ".venv/Scripts/pythonw.exe"
             executable.parent.mkdir(parents=True)
             executable.touch()
