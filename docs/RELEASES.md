@@ -4,8 +4,9 @@
 
 Проект распространяется как исходный код, не как подписанный `.exe`.
 На [странице Releases](https://github.com/Duerotator/uznik-multitool/releases)
-проверяемый релиз должен содержать `*-source.zip`, `SHA256SUMS.txt` и
-`provenance.json`. Если таких релизов ещё нет, используйте Git и проверяйте
+проверяемый релиз должен содержать `*-source.zip`, `SHA256SUMS.txt`,
+`provenance.json` и подписанный bundle `attestation.sigstore.json`.
+Если таких релизов ещё нет, используйте Git и проверяйте
 коммит; обычный GitHub Download ZIP не получает нашу attestation автоматически.
 
 Сравните SHA-256 скачанного ZIP с `SHA256SUMS.txt`:
@@ -19,6 +20,14 @@ Get-FileHash .\uznik-multitool-<commit>-source.zip -Algorithm SHA256
 
 ```powershell
 gh attestation verify .\uznik-multitool-<commit>-source.zip --repo Duerotator/uznik-multitool
+```
+
+Более строгая проверка с локально скачанным bundle, ожидаемым workflow и
+коммитом из `provenance.json`:
+
+```powershell
+$sourceCommit = (Get-Content .\provenance.json -Raw | ConvertFrom-Json).commit
+gh attestation verify .\uznik-multitool-<commit>-source.zip --bundle .\attestation.sigstore.json --repo Duerotator/uznik-multitool --signer-workflow Duerotator/uznik-multitool/.github/workflows/release.yml --source-digest $sourceCommit --source-ref refs/heads/main
 ```
 
 Проверьте, что attestation относится к workflow `.github/workflows/release.yml`
@@ -36,6 +45,10 @@ gh attestation verify .\uznik-multitool-<commit>-source.zip --repo Duerotator/uz
    Workflow проверит, что тег указывает на коммит запущенного workflow.
 4. Проверьте созданный **черновик** релиза, ZIP, checksum и attestation, затем
    опубликуйте вручную. Уже существующий релиз workflow не перезаписывает.
+
+До создания черновика workflow самостоятельно проверяет SHA-256 и подписанный
+bundle: репозиторий, workflow, исходный коммит и ветка должны совпадать.
+Не публикуйте релиз, если этот этап завершился ошибкой.
 
 Builder берёт файлы через `git archive` из указанного коммита, а не копирует
 рабочую папку. Неотслеживаемые `.env`, ящики, сессии и базы не попадают в архив.

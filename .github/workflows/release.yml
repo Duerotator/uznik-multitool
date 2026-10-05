@@ -39,8 +39,21 @@ jobs:
       - name: Package committed source only
         run: python scripts/releases/build_source_release.py --ref "$GITHUB_SHA"
       - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        id: attest
         with:
           subject-path: dist/source/*-source.zip
+      - name: Verify checksum and signed provenance before creating release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ATTESTATION_BUNDLE: ${{ steps.attest.outputs.bundle-path }}
+        run: |
+          (cd dist/source && sha256sum --check SHA256SUMS.txt)
+          cp "$ATTESTATION_BUNDLE" dist/source/attestation.sigstore.json
+          gh attestation verify dist/source/*-source.zip \
+            --bundle dist/source/attestation.sigstore.json \
+            --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
+            --source-digest "$GITHUB_SHA" --source-ref refs/heads/main
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: source-release
