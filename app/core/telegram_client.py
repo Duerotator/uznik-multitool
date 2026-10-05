@@ -15,6 +15,7 @@ from core.config import AppConfig
 from core.diagnostics import get_proxy_diagnostics
 from core.logging_setup import account_logger
 from core.models import AccountRecord, ProxyConfig
+from core.telegram_connection import CLEANUP_TIMEOUT, CONNECT_TIMEOUT, connection_error, is_connection_error
 
 
 _SESSION_LOCKS: dict[str, asyncio.Lock] = {}
@@ -124,6 +125,8 @@ class AccountClient(ABC):
 
     @staticmethod
     def _is_network_error(exc: Exception) -> bool:
+        if is_connection_error(exc):
+            return True
         msg = str(exc).lower()
         return any(
             kw in msg for kw in (
@@ -167,8 +170,8 @@ class AccountClient(ABC):
             entry = await pool.acquire(protocol=None)
         if entry is None:
             get_proxy_diagnostics().trace_replace_proxy(self.account.id, old_proxy, None)
-            self.log.error("No MTProto-verified proxy available; direct connection is forbidden.")
-            raise RuntimeError(f"No working proxy for {self.account.id}; direct connection is forbidden")
+            self.log.error("No MTProto-verified replacement proxy available.")
+            raise connection_error(old_proxy or self.config.global_proxy)
         self.account.proxy = entry.url
         get_proxy_diagnostics().trace_replace_proxy(self.account.id, old_proxy, self.account.proxy)
         self.log.info("Switched to proxy %s (%.2fs)", entry.url, entry.latency)
@@ -195,6 +198,20 @@ class AccountClient(ABC):
             return False
         self.log.debug("Proxy %s:%s passed Telegram MTProto validation", proxy.hostname, proxy.port)
         return True
+
+    async def _startup_proxy(self) -> ProxyConfig | None:
+        url = self.account.proxy or self.config.global_proxy
+        if not url:
+            # Preserve automatic use of the UI pool, but allow an empty pool.
+            try:
+                entry = await asyncio.wait_for(
+                    _proxy_pool(self.config).acquire(protocol="socks5"), CONNECT_TIMEOUT
+                )
+            except TimeoutError:
+                raise connection_error(True) from None
+            if entry:
+                self.account.proxy = url = entry.url
+        return ProxyConfig.from_url(url)
 
     async def _with_retry(self, factory, max_retries: int = 3):
         last_exc: Exception | None = None
@@ -463,20 +480,12 @@ class PyrogramAccountClient(AccountClient):
 
         MAX_RETRIES = 10
         for attempt in range(MAX_RETRIES + 1):
-            proxy = ProxyConfig.from_url(self.account.proxy or self.config.global_proxy)
+            proxy = await self._startup_proxy()
             get_proxy_diagnostics().trace_client_lifecycle(
                 self.account.id, "proxy_check", f"attempt={attempt + 1}/{MAX_RETRIES + 1} proxy={proxy}"
             )
             if proxy is None:
-                get_proxy_diagnostics().trace_client_lifecycle(
-                    self.account.id, "proxy_missing", f"attempt={attempt + 1} acquiring"
-                )
-                if attempt < MAX_RETRIES:
-                    await self._replace_proxy()
-                    continue
-                raise RuntimeError(
-                    f"No working proxy for {self.account.id}; direct connection is forbidden"
-                )
+                self.log.info("No proxy configured; connecting to Telegram directly")
             if proxy and not await self._proxy_usable(proxy):
                 if attempt < MAX_RETRIES:
                     get_proxy_diagnostics().trace_client_lifecycle(
@@ -505,7 +514,6 @@ class PyrogramAccountClient(AccountClient):
                 authorized = await self.client.connect()
                 if authorized:
                     return
-                await self.client.disconnect()
                 raise RuntimeError(
                     "Pyrogram session is not authorized; interactive login is disabled"
                 )
@@ -514,24 +522,26 @@ class PyrogramAccountClient(AccountClient):
                 get_proxy_diagnostics().trace_client_lifecycle(
                     self.account.id, "pyrogram_connecting", f"attempt={attempt + 1}"
                 )
-                await self._retry_locked(connect_existing_session)
+                await asyncio.wait_for(self._retry_locked(connect_existing_session), CONNECT_TIMEOUT)
                 self._connected_via_connect = True
                 self.log.info("Pyrogram client connected")
                 return
-            except Exception as exc:
+            except BaseException as exc:
                 get_proxy_diagnostics().trace_client_lifecycle(
                     self.account.id, "pyrogram_connect_failed", f"attempt={attempt + 1} error={exc}"
                 )
                 self.log.warning("Pyrogram start attempt %d failed: %s", attempt + 1, exc)
                 try:
-                    if self._connected_via_connect:
-                        await self.client.disconnect()
-                    else:
-                        await self.client.stop()
+                    # start() uses connect(), not initialize()/start().
+                    await asyncio.wait_for(self.client.disconnect(), CLEANUP_TIMEOUT)
                 except Exception as stop_exc:  # noqa: BLE001 - cleanup must not hide the start error
                     self.log.debug("Could not stop failed Pyrogram client: %s", stop_exc)
                 self.client = None
                 self._connected_via_connect = False
+                if not isinstance(exc, Exception):
+                    raise
+                if proxy is None and self._is_network_error(exc):
+                    raise connection_error(None) from exc
                 if attempt < MAX_RETRIES and self._is_network_error(exc):
                     await self._replace_proxy()
                     continue
@@ -1695,21 +1705,13 @@ class TelethonAccountClient(AccountClient):
 
         MAX_RETRIES = 10
         for attempt in range(MAX_RETRIES + 1):
-            proxy = ProxyConfig.from_url(self.account.proxy or self.config.global_proxy)
+            proxy = await self._startup_proxy()
             get_proxy_diagnostics().trace_client_lifecycle(
                 self.account.id, "proxy_check", f"attempt={attempt + 1}/{MAX_RETRIES + 1} proxy={proxy} backend=telethon"
             )
             if proxy is None:
-                get_proxy_diagnostics().trace_client_lifecycle(
-                    self.account.id, "proxy_missing", f"attempt={attempt + 1} acquiring backend=telethon"
-                )
-                if attempt < MAX_RETRIES:
-                    await self._replace_proxy()
-                    continue
-                raise RuntimeError(
-                    f"No working proxy for {self.account.id}; direct connection is forbidden"
-                )
-            if not await self._proxy_usable(proxy):
+                self.log.info("No proxy configured; connecting to Telegram directly")
+            if proxy and not await self._proxy_usable(proxy):
                 if attempt < MAX_RETRIES:
                     get_proxy_diagnostics().trace_client_lifecycle(
                         self.account.id, "proxy_rejected", f"attempt={attempt + 1} swapping backend=telethon"
@@ -1734,21 +1736,27 @@ class TelethonAccountClient(AccountClient):
                 get_proxy_diagnostics().trace_client_lifecycle(
                     self.account.id, "telethon_connecting", f"attempt={attempt + 1}"
                 )
-                await self.client.connect()
-                if not await self.client.is_user_authorized():
-                    raise RuntimeError(f"Telethon session is not authorized: {self.account.id}")
+                async def connect_existing_session() -> None:
+                    await self.client.connect()
+                    if not await self.client.is_user_authorized():
+                        raise RuntimeError(f"Telethon session is not authorized: {self.account.id}")
+                await asyncio.wait_for(connect_existing_session(), CONNECT_TIMEOUT)
                 self.log.info("Telethon client started")
                 return
-            except Exception as exc:
+            except BaseException as exc:
                 get_proxy_diagnostics().trace_client_lifecycle(
                     self.account.id, "telethon_connect_failed", f"attempt={attempt + 1} error={exc}"
                 )
                 self.log.warning("Telethon start attempt %d failed: %s", attempt + 1, exc)
                 try:
-                    await self.client.disconnect()
+                    await asyncio.wait_for(self.client.disconnect(), CLEANUP_TIMEOUT)
                 except Exception as disconnect_exc:  # noqa: BLE001 - cleanup must not hide the start error
                     self.log.debug("Could not disconnect failed Telethon client: %s", disconnect_exc)
                 self.client = None
+                if not isinstance(exc, Exception):
+                    raise
+                if proxy is None and self._is_network_error(exc):
+                    raise connection_error(None) from exc
                 if attempt < MAX_RETRIES and self._is_network_error(exc):
                     await self._replace_proxy()
                     continue

@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any
 from core.config import AppConfig
 from core.session_manager import SessionManager
 from core.storage import write_json_atomic
+from core.telegram_connection import CLEANUP_TIMEOUT, CONNECT_TIMEOUT, REQUEST_TIMEOUT, connection_error, is_connection_error
 from modules.accounts import AccountService
 from modules.fingerprint_generator import FingerprintGenerator
 from utils.telegram_errors import short_error
@@ -41,30 +42,39 @@ class AuthManager:
         self._lock = asyncio.Lock()
         (config.import_dir / "auth_input").mkdir(parents=True, exist_ok=True)
 
-    async def verified_proxy_url(self, proxy_url: str | None = None) -> str:
-        """Return an MTProto-verified proxy; never permit direct Telegram I/O."""
+    async def verified_proxy_url(self, proxy_url: str | None = None) -> str | None:
+        """Use the configured proxy or pool; an empty pool permits direct I/O."""
         from core.models import ProxyConfig
         from modules.proxy_manager import ProxyPool, validate_proxy
 
         proxy_url = proxy_url or self.config.global_proxy
         if proxy_url:
-            cfg = ProxyConfig.from_url(proxy_url)
+            try:
+                cfg = ProxyConfig.from_url(proxy_url)
+            except ValueError:
+                raise RuntimeError("Некорректный адрес прокси: проверьте TELEGRAM_GLOBAL_PROXY в .env.") from None
             if cfg is not None:
                 scheme = cfg.scheme.replace("socks5h", "socks5")
                 auth = (cfg.username, cfg.password or "") if cfg.username else None
-                ok, _ = await validate_proxy(
-                    cfg.hostname, cfg.port, scheme, timeout=8.0, auth=auth
-                )
+                try:
+                    ok, _ = await asyncio.wait_for(validate_proxy(
+                        cfg.hostname, cfg.port, scheme, timeout=8.0, auth=auth
+                    ), 9.0)
+                except (TimeoutError, OSError):
+                    raise connection_error(proxy_url) from None
                 if ok:
                     return proxy_url
+            # An explicit proxy must never silently expose the local IP.
+            raise connection_error(proxy_url)
         pool = ProxyPool(self.config.proxy_pool_db)
-        entry = await pool.acquire(protocol="socks5") or await pool.acquire(protocol=None)
+        # acquire already falls back to other protocols. Bound stale pool checks.
+        try:
+            entry = await asyncio.wait_for(pool.acquire(protocol="socks5"), CONNECT_TIMEOUT)
+        except TimeoutError:
+            raise connection_error(True) from None
         if entry is None:
-            raise RuntimeError(
-                "No MTProto-verified proxy available; direct connection is forbidden. "
-                f"Set TELEGRAM_GLOBAL_PROXY in {self.config.env_file or '.env'} "
-                "or add and verify a proxy in the desktop Proxy section."
-            )
+            logger.info("No proxy configured or available; using direct Telegram connection")
+            return None
         return entry.url
 
     async def send_code(self, phone: str, proxy_url: str | None = None) -> dict[str, Any]:
@@ -76,7 +86,7 @@ class AuthManager:
             existing = self.sessions.get(phone)
             if existing:
                 try:
-                    await existing.client.disconnect()
+                    await asyncio.wait_for(existing.client.disconnect(), CLEANUP_TIMEOUT)
                 except Exception:
                     pass
             self.sessions.pop(phone, None)
@@ -104,8 +114,9 @@ class AuthManager:
         )
 
         try:
-            await client.connect()
-            sent: SentCode = await client.send_code(phone)
+            logger.info("Connecting to Telegram via %s", "proxy" if proxy_url else "local IP (direct)")
+            await asyncio.wait_for(client.connect(), CONNECT_TIMEOUT)
+            sent: SentCode = await asyncio.wait_for(client.send_code(phone), REQUEST_TIMEOUT)
             phone_code_hash = sent.phone_code_hash
 
             async with self._lock:
@@ -126,12 +137,12 @@ class AuthManager:
             }
         except BaseException as exc:
             try:
-                await client.disconnect()
+                await asyncio.wait_for(client.disconnect(), CLEANUP_TIMEOUT)
             except Exception:
                 pass
             if not isinstance(exc, Exception):
                 raise
-            err = short_error(exc)
+            err = str(connection_error(proxy_url)) if is_connection_error(exc) else short_error(exc)
             logger.error("send_code failed for %s: %s", phone, err)
             return {"ok": False, "error": err}
 
@@ -145,7 +156,7 @@ class AuthManager:
             return {"ok": False, "error": "Session not found. Call send_code first."}
 
         try:
-            user = await auth.client.sign_in(phone, phone_code_hash, code)
+            user = await asyncio.wait_for(auth.client.sign_in(phone, phone_code_hash, code), REQUEST_TIMEOUT)
             return await self._finalize_auth(phone, auth, user)
         except SessionPasswordNeeded:
             return {"ok": False, "status": "2fa_required", "hint": "Enter cloud password."}
@@ -155,7 +166,7 @@ class AuthManager:
             return {"ok": False, "error": f"Flood wait {exc.value}s", "wait": exc.value}
         except Exception as exc:
             logger.exception("sign_in failed for %s", phone)
-            return {"ok": False, "error": short_error(exc)}
+            return {"ok": False, "error": str(connection_error(auth.proxy_url)) if is_connection_error(exc) else short_error(exc)}
 
     async def check_password(self, phone: str, password: str) -> dict[str, Any]:
         async with self._lock:
@@ -165,10 +176,10 @@ class AuthManager:
             return {"ok": False, "error": "Session not found. Call send_code first."}
 
         try:
-            user = await auth.client.check_password(password)
+            user = await asyncio.wait_for(auth.client.check_password(password), REQUEST_TIMEOUT)
             return await self._finalize_auth(phone, auth, user)
         except Exception as exc:
-            return {"ok": False, "error": short_error(exc)}
+            return {"ok": False, "error": str(connection_error(auth.proxy_url)) if is_connection_error(exc) else short_error(exc)}
 
     async def _finalize_auth(self, phone: str, auth: AuthSession, user: Any) -> dict[str, Any]:
         user_id = getattr(user, "id", 0) or 0

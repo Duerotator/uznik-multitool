@@ -208,7 +208,13 @@ class ForeignSessionOnboarding:
                 from pyrogram import Client
                 client = Client(name=copy.stem, api_id=self.config.api_id, api_hash=self.config.api_hash, workdir=str(copy.parent), no_updates=True, proxy=proxy.to_pyrogram() if proxy else None)
                 read_messages = lambda: self._pyrogram_service_messages(client)
-            await client.connect()
+            from core.telegram_connection import CONNECT_TIMEOUT, connection_error, is_connection_error
+            try:
+                await asyncio.wait_for(client.connect(), CONNECT_TIMEOUT)
+            except Exception as exc:
+                if is_connection_error(exc):
+                    raise connection_error(proxy) from exc
+                raise
             return {
                 "get_me": client.get_me,
                 "get_service_messages": read_messages,
@@ -218,7 +224,7 @@ class ForeignSessionOnboarding:
         except BaseException:
             if client is not None:
                 try:
-                    await client.disconnect()
+                    await asyncio.wait_for(client.disconnect(), 5.0)
                 except Exception:
                     pass
             shutil.rmtree(tmp_dir, ignore_errors=True)
