@@ -206,7 +206,8 @@ def _tokens(path: Path, root: Path) -> list[str]:
 
 
 def _stable_name(path: Path) -> str:
-    digest = hashlib.sha1(str(path).encode("utf-8", errors="ignore")).hexdigest()[:12]
+    # Keep existing filenames; this digest is only a deterministic path label.
+    digest = hashlib.sha1(str(path).encode("utf-8", errors="ignore"), usedforsecurity=False).hexdigest()[:12]
     stem = "".join(char if char.isalnum() else "_" for char in path.stem.lower()).strip("_")
     stem = stem[:42] or "avatar"
     return f"{stem}_{digest}{path.suffix.lower()}"

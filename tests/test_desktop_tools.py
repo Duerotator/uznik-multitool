@@ -89,6 +89,16 @@ class FolderTests(unittest.TestCase):
 
 
 class HelperTests(unittest.TestCase):
+    def test_non_security_hashes_preserve_existing_account_and_avatar_names(self):
+        import hashlib
+        from core.session_manager import SessionManager
+        from utils.avatar_pack_downloader import _stable_name
+        path = Path("fixture.session")
+        expected = hashlib.sha1(str(path).encode(), usedforsecurity=False).hexdigest()
+        manager = SessionManager.__new__(SessionManager)
+        self.assertEqual(f"fixture_{expected[:10]}", manager._make_account_id(path))
+        self.assertEqual(f"fixture_{expected[:12]}.session", _stable_name(path))
+
     @unittest.skipUnless(os.name == "nt", "WinGet executable aliases are Windows-specific")
     def test_xray_winget_alias_is_found_before_path_refresh(self):
         from modules.vpn_gateway import xray_executable

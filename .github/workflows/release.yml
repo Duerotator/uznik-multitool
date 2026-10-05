@@ -1,0 +1,55 @@
+name: Source release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing version tag on the selected main commit (v1.2.3)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  source:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      RELEASE_TAG: ${{ inputs.tag }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.14'
+      - name: Verify version tag and workflow commit
+        shell: bash
+        run: |
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$ ]] || exit 1
+          tag_commit=$(git rev-parse --verify "refs/tags/${RELEASE_TAG}^{commit}")
+          [[ "$tag_commit" == "$GITHUB_SHA" ]] || { echo 'Tag must match workflow commit'; exit 1; }
+      - name: Package committed source only
+        run: python scripts/releases/build_source_release.py --ref "$GITHUB_SHA"
+      - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: dist/source/*-source.zip
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: source-release
+          path: dist/source/
+          if-no-files-found: error
+      - name: Create draft (never replace an existing release)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$RELEASE_TAG" dist/source/* --verify-tag --draft \
+            --title "Uznik MultiTool $RELEASE_TAG" \
+            --notes "Source commit: $GITHUB_SHA. Verify SHA256SUMS.txt and GitHub attestation; see docs/RELEASES.md. No runtime credentials or bundled dependencies."

@@ -292,7 +292,8 @@ class SessionManager:
         return "pyrogram"
 
     def _make_account_id(self, path: Path) -> str:
-        digest = hashlib.sha1(str(path).encode("utf-8")).hexdigest()[:10]
+        # Stable path identifier, not a password hash or integrity check.
+        digest = hashlib.sha1(str(path).encode("utf-8"), usedforsecurity=False).hexdigest()[:10]
         safe_name = "".join(ch if ch.isalnum() else "_" for ch in path.stem.lower()).strip("_")
         return f"{safe_name or 'account'}_{digest}"
 
