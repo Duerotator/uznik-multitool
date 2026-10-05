@@ -8,6 +8,7 @@
   `scripts/windows/start_debug.bat` — диагностика.
 - `app/main.py`, `app/ui/qt_app.py` — единственная точка входа и Qt-интерфейс,
   фиксированный Comfortable, собственные QSettings.
+  Фоновые настройки Warmup и сна — отдельная раскрывающаяся секция `Warmup / Sleep`.
 - `toolbox.bat`, `scripts/toolbox.py` — меню вспомогательных desktop-утилит;
   `scripts/{sessions,accounts,profiles,network}/`, `scripts/README.md` — команды.
 - `sessions/` — пользовательские входы, запускатели, список телефонов и памятка;
@@ -18,6 +19,7 @@
 - `app/core/project_layout.py`, `scripts/prepare_layout.py` — пустая структура данных;
   `imports/auth_input/` — очередь новой авторизации; `imports/` — обычный импорт.
 - `assets/branding/uznik-multitool.ico` — иконка ярлыка и окна приложения.
+- `app/core/desktop_identity.py` — Windows AppUserModelID для окна и ярлыка.
 - `app/core/` — конфигурация, клиенты MTProto, сессии, хранение, задачи и UI-контракты.
 - `app/core/private_storage.py` — шифрование плана профилей и DPAPI-ключ;
   `profile_customizer.load_profile_plan` — загрузка и миграция старых JSON.
@@ -32,6 +34,10 @@
   — пользовательские прокси и необязательный локальный Xray.
 - `app/modules/chat_actions.py`, `warmup_engine.py`, `ai_companion.py`, `scenarios.py`
   — действия, прогрев и сценарии; `online_mode.py`, `sleep_scheduler.py` — расписание.
+  `data/warmup_limits.json` — локальный бюджет и cooldown прогрева;
+  `warmup_settings.py` — политика и история; настройки и подтверждённые действия
+  в `data/warmup_settings.json`, `data/warmup_history.json`.
+  `data/sleep_zones.json` — зоны и настройки сна (старый формат поддерживается).
 - `tests/TEST_MAP.md` — автономная проверка desktop-контракта и базовой логики.
 - `.github/workflows/` — публичные проверки безопасности и исходные релизы;
   `scripts/releases/build_source_release.py`, `docs/RELEASES.md` — сборка из Git,

@@ -50,7 +50,22 @@ def main() -> int:
             assert not window.windowIcon().isNull()
             # Long captions must fit at both the default and minimum window
             # size, without hidden horizontal overflow in the sidebar.
-            for section in (window.actions_section, window.giveaway_section,
+            # The background settings have their own accordion and are not duplicated in Actions.
+            window.warmup_section.button.click()
+            app.processEvents()
+            assert window.warmup_section.content.isVisible()
+            assert not window.actions_section.content.isVisible()
+            assert window.warmup_section.isAncestorOf(window.warmup_channels)
+            assert window.warmup_section.isAncestorOf(window.sleep_zone_entry)
+            warmup_buttons = {button.text() for button in window.warmup_section.findChildren(QPushButton)}
+            actions_buttons = {button.text() for button in window.actions_section.findChildren(QPushButton)}
+            for caption in ("Warmup", "Stop warmup", "Save warmup settings", "Apply sleep schedule", "Assign timezones"):
+                assert caption in warmup_buttons and caption not in actions_buttons, caption
+            window.actions_section.button.click()
+            app.processEvents()
+            assert window.actions_section.content.isVisible()
+            assert not window.warmup_section.content.isVisible()
+            for section in (window.actions_section, window.warmup_section, window.giveaway_section,
                             window.profile_section, window.security_section,
                             window.passkeys_section, window.scenarios_section):
                 section.set_open(True)
@@ -72,6 +87,17 @@ def main() -> int:
                         assert button.height() >= button.sizeHint().height(), button.text()
                         assert button.parentWidget().rect().contains(button.geometry()), button.text()
             mailbox_list = config.import_dir / "emails/accounts.txt"
+            # Warmup policy is explicit, persists locally, and does not start Telegram.
+            assert not any(window.warmup_controls[key].isChecked() for key in ("reactions", "save_posts", "join_channels"))
+            window.warmup_channels.setPlainText("@Fixture\nhttps://t.me/fixture")
+            window.save_warmup_settings()
+            from modules.warmup_settings import WarmupOptions
+            assert WarmupOptions.load(config.data_dir / "warmup_settings.json").channels == ["fixture"]
+            window.warmup_channels.setPlainText("https://t.me/+not-a-public-channel")
+            with patch("ui.qt_app.QMessageBox.warning") as warning:
+                window.save_warmup_settings()
+                warning.assert_called_once()
+            assert WarmupOptions.load(config.data_dir / "warmup_settings.json").channels == ["fixture"]
             assert mailbox_list.is_file()
             with patch("ui.qt_app.QMessageBox.warning") as warning:
                 assert window.email_task_config() is None  # Empty list fails before any task.

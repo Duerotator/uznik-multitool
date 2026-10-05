@@ -19,6 +19,9 @@ class TaskRunner:
         self.log = logging.getLogger("tasks")
 
     def start(self, name: str, coro_factory: Callable[[asyncio.Event], Awaitable[Any]]) -> str:
+        active = next((task for task in self.tasks.values() if not task.done()), None)
+        if active is not None:
+            raise RuntimeError(f"Task '{active.get_name()}' is already running. Stop it before starting '{name}'.")
         task_id = uuid.uuid4().hex[:12]
         stop_event = asyncio.Event()
         self.stop_events[task_id] = stop_event
@@ -78,13 +81,11 @@ class TaskRunner:
         return stopped
 
     async def stop_all(self) -> int:
-        stopped = 0
-        for task_id, task in list(self.tasks.items()):
-            if task.done():
-                continue
-            if await self.stop(task_id):
-                stopped += 1
-        return stopped
+        ids = [task_id for task_id, task in self.tasks.items() if not task.done()]
+        for task_id in ids:
+            self.stop_events[task_id].set()
+        results = await asyncio.gather(*(self.stop(task_id) for task_id in ids), return_exceptions=True)
+        return sum(result is True for result in results)
 
     def snapshots(self) -> list[TaskSnapshot]:
         raw = read_json(self.config.tasks_file, {"tasks": []})

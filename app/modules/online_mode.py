@@ -25,11 +25,11 @@ def _is_transient_network_error(exc: BaseException) -> bool:
 
 
 class OnlineModeService:
-    def __init__(self, config: AppConfig):
+    def __init__(self, config: AppConfig, *, scheduler=None):
         self.config = config
         self.accounts = AccountService(config)
         from modules.sleep_scheduler import SleepScheduler
-        self.scheduler = SleepScheduler()
+        self.scheduler = scheduler or SleepScheduler(str(config.data_dir / "sleep_zones.json"))
         self.log = logging.getLogger("online-mode")
 
     async def run(self, accounts: list[AccountRecord], stop_event: asyncio.Event) -> None:
@@ -70,10 +70,9 @@ class OnlineModeService:
                     pass
                 continue
 
-            wave = awake[index : index + wave_size]
-            if len(wave) < wave_size and len(awake) > len(wave):
-                wave += awake[: wave_size - len(wave)]
-            index = (index + wave_size) % len(awake)
+            count = min(wave_size, len(awake))
+            wave = [awake[(index + offset) % len(awake)] for offset in range(count)]
+            index = (index + count) % len(awake)
 
             self.log.info(
                 "Online wave starting: %s",

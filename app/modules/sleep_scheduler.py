@@ -2,14 +2,13 @@ from __future__ import annotations
 
 import functools
 import logging
-import random
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable
 
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from core.storage import read_json, write_json_atomic
+from core.storage import read_json, update_json
 
 logger = logging.getLogger("sleep-scheduler")
 
@@ -99,14 +98,43 @@ class SleepScheduler:
     def __init__(self, storage_path: str = DEFAULT_SLEEP_FILE):
         self.storage_path = storage_path
         self._zones: dict[str, str] = {}
+        self.settings = {"timezone": "UTC", "start": 1, "end": 7, "enabled": True}
+        self._version = None
+        self._warned: set[str] = set()
         self._load()
 
     def _load(self) -> None:
         data = read_json(Path(self.storage_path), {})
-        self._zones = {str(k): str(v) for k, v in data.items()}
+        zones = data.get("zones", data)
+        self._zones = {str(k): str(v) for k, v in zones.items()}
+        if "zones" in data:
+            self.settings.update(data.get("settings", {}))
+        path = Path(self.storage_path)
+        self._version = path.stat().st_mtime_ns if path.exists() else None
 
     def _save(self) -> None:
-        write_json_atomic(Path(self.storage_path), dict(self._zones))
+        def merge(data):
+            zones = dict(data.get("zones", data))
+            zones.update(self._zones)
+            return {"zones": zones, "settings": dict(self.settings)}
+        update_json(Path(self.storage_path), {}, merge)
+        self._load()
+
+    def _refresh(self) -> None:
+        path = Path(self.storage_path)
+        version = path.stat().st_mtime_ns if path.exists() else None
+        if version != self._version:
+            self._load()
+
+    def configure(self, accounts: list[Any], *, timezone: str, start: int, end: int, enabled: bool) -> None:
+        ZoneInfo(timezone)  # Reject missing tzdata / invalid names before writing.
+        if not (0 <= start <= 23 and 0 <= end <= 23) or (enabled and start == end):
+            raise ValueError("Sleep start/end must be different hours between 0 and 23.")
+        self._refresh()
+        self.settings = {"timezone": timezone, "start": start, "end": end, "enabled": enabled}
+        for account in accounts:
+            self._zones[str(getattr(account, "id", account))] = timezone
+        self._save()
 
     @staticmethod
     def _country_code(phone: str | None) -> str:
@@ -120,61 +148,78 @@ class SleepScheduler:
         return "7"
 
     def assign_timezone(self, account_id: str, phone: str | None = None) -> str:
+        self._refresh()
         if account_id in self._zones:
             return self._zones[account_id]
-        code = self._country_code(phone)
-        pool = COUNTRY_TIMEZONES.get(code, ["UTC"])
-        tz = random.choice(pool)
+        tz = self.settings["timezone"]
         self._zones[account_id] = tz
         self._save()
-        logger.debug("Assigned %s timezone %s (country %s)", account_id, tz, code)
+        logger.debug("Assigned %s timezone %s", account_id, tz)
         return tz
 
     def get_timezone(self, account_id: str) -> str | None:
+        self._refresh()
         return self._zones.get(account_id)
 
     def assign_all(self, accounts: list[Any]) -> int:
+        self._refresh()
         count = 0
         for acc in accounts:
             aid = str(getattr(acc, "id", acc))
             phone = getattr(acc, "phone", None)
-            self.assign_timezone(aid, phone)
-            count += 1
+            if aid not in self._zones:
+                self._zones[aid] = self.settings["timezone"]
+                count += 1
+        if count:
+            self._save()
         return count
 
-    def is_sleeping(self, account_id: str) -> bool:
+    def state(self, account_id: str, *, now: datetime | None = None) -> str:
+        self._refresh()
+        if not self.settings["enabled"]:
+            return "awake"
         tz_name = self._zones.get(account_id)
         if not tz_name:
-            return False
+            return "unknown"
         try:
             tz = ZoneInfo(tz_name)
-            now = datetime.now(tz)
-            return SLEEP_START_HOUR <= now.hour < SLEEP_END_HOUR
-        except Exception:
-            return False
+            current = now.astimezone(tz) if now else datetime.now(tz)
+            start, end = int(self.settings["start"]), int(self.settings["end"])
+            if not (0 <= start <= 23 and 0 <= end <= 23) or start == end:
+                raise ValueError("Invalid sleep hours")
+            sleeping = start <= current.hour < end if start < end else current.hour >= start or current.hour < end
+            return "sleeping" if sleeping else "awake"
+        except (ZoneInfoNotFoundError, ValueError, TypeError):
+            if tz_name not in self._warned:
+                logger.error("Cannot determine sleep state for timezone %s; check timezone settings and tzdata.", tz_name)
+                self._warned.add(tz_name)
+            return "unknown"
+
+    def is_sleeping(self, account_id: str) -> bool:
+        # Background automation must not treat an invalid schedule as Awake.
+        return self.state(account_id) != "awake"
 
     def wake_at(self, account_id: str) -> float | None:
-        tz_name = self._zones.get(account_id)
-        if not tz_name:
+        if self.state(account_id) != "sleeping":
             return None
+        tz_name = self._zones.get(account_id)
         try:
             tz = ZoneInfo(tz_name)
             now = datetime.now(tz)
-            if now.hour >= SLEEP_END_HOUR or now.hour < SLEEP_START_HOUR:
-                return None
-            wake_hour = SLEEP_END_HOUR
+            wake_hour = int(self.settings["end"])
             wake = now.replace(hour=wake_hour, minute=0, second=0, microsecond=0)
             if wake <= now:
                 wake += timedelta(days=1)
-            return (wake - now).total_seconds()
+            return wake.timestamp() - now.timestamp()
         except Exception:
             return None
 
     def sleep_status(self, account_id: str) -> str:
-        if self.is_sleeping(account_id):
+        state = self.state(account_id)
+        if state == "sleeping":
             tz = self._zones.get(account_id, "?")
             return f"sleeping ({tz})"
-        return "awake"
+        return state
 
 
 def is_account_sleeping(scheduler: SleepScheduler, account: Any) -> bool:

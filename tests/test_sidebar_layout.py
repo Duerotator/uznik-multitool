@@ -114,6 +114,8 @@ class ManagedTaskOrderTests(unittest.IsolatedAsyncioTestCase):
         failed = asyncio.get_running_loop().create_future()
         tasks = {}
         def start(name, factory):
+            self.assertEqual([("warmup",), ("online-mode",)],
+                             [call.args for call in window.tasks.stop_by_name_prefix.await_args_list])
             tasks["fixture"] = asyncio.create_task(factory(asyncio.Event()))
             return "fixture"
         window.tasks = SimpleNamespace(stop_by_name_prefix=AsyncMock(return_value=0), start=start, tasks=tasks)

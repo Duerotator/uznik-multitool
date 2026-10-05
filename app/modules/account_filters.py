@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, time, timezone
-from typing import Any, Collection, Iterable
+from typing import Any, Collection, Iterable, Mapping
 
 from core.models import AccountRecord
 from utils.phone_region import detect_phone_region, display_region
@@ -64,6 +64,8 @@ def filter_accounts(
     spec: AccountFilter,
     *,
     sleeping_ids: Collection[str] | None = None,
+    sleep_states: Mapping[str, str] | None = None,
+    global_proxy: str | None = None,
 ) -> list[AccountRecord]:
     start = _date_bound(spec.created_from, end=False)
     end = _date_bound(spec.created_to, end=True)
@@ -88,7 +90,7 @@ def filter_accounts(
         spamblock = str(metadata.get("spamblock_status") or "unknown").lower()
         if spec.spamblock != "any" and spamblock != spec.spamblock:
             continue
-        login_mail = str(metadata.get("login_email_status") or "unknown").lower()
+        login_mail = login_mail_state(account)
         if spec.login_mail != "any" and login_mail != spec.login_mail:
             continue
         if not _matches_presence(spec.two_fa, metadata.get("cloud_password")):
@@ -98,12 +100,11 @@ def filter_accounts(
             continue
         if spec.validity != "any" and _validity(account) != spec.validity:
             continue
-        if not _matches_presence(spec.proxy, bool(account.proxy)):
+        if not _matches_presence(spec.proxy, bool(effective_proxy(account, global_proxy))):
             continue
         sleeping = account.id in sleeping_ids if sleeping_ids is not None else False
-        if spec.sleep == "sleeping" and not sleeping:
-            continue
-        if spec.sleep == "awake" and sleeping:
+        state = sleep_states.get(account.id, "unknown") if sleep_states is not None else ("sleeping" if sleeping else "awake")
+        if spec.sleep != "any" and state != spec.sleep:
             continue
         if spec.enabled == "enabled" and not account.enabled:
             continue
@@ -111,6 +112,16 @@ def filter_accounts(
             continue
         result.append(account)
     return result
+
+
+def login_mail_state(account: AccountRecord) -> str:
+    if account.metadata.get("login_email"):
+        return "custom"
+    return str(account.metadata.get("login_email_status") or "unknown").lower()
+
+
+def effective_proxy(account: AccountRecord, global_proxy: str | None = None) -> str | None:
+    return account.proxy or account.metadata.get("proxy") or global_proxy
 
 
 def country_options(accounts: Iterable[AccountRecord]) -> list[dict[str, Any]]:

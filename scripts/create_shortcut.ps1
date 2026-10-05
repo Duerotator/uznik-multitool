@@ -16,5 +16,8 @@ foreach ($shortcutPath in $shortcutPaths) {
     else { $shortcut.IconLocation = "$pythonWindowless,0" }
     $shortcut.WindowStyle = 1
     $shortcut.Save()
+    $pythonConsole = Join-Path $projectRoot '.venv\Scripts\python.exe'
+    & $pythonConsole -c 'import sys; sys.path.insert(0, sys.argv[1]); from core.desktop_identity import set_shortcut_app_id; set_shortcut_app_id(sys.argv[2])' (Join-Path $projectRoot 'app') $shortcutPath
+    if ($LASTEXITCODE -ne 0) { throw 'Could not set shortcut taskbar identity.' }
     Write-Host "Shortcut: $shortcutPath"
 }

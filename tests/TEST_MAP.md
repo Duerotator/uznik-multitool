@@ -51,6 +51,34 @@ smoke проверяет полные подписи всех секций пр�
 локальную валидацию списка в GUI и порядок Started → Failed для быстрых ошибок.
 Только fake-серверы, без настоящих ящиков и Telegram.
 
+`test_session_coordination.py` — ожидание занятой сессии, сохранение чужой
+блокировки при таймауте/отмене, освобождение сессии между циклами Warmup,
+безопасная ошибка занятости при смене login/recovery email. Только fake-клиенты:
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest discover -s tests -p test_session_coordination.py -v
+```
+
+`test_background_state.py` — границы сна (включая полночь), Unknown и ошибка зоны,
+миграция/обновление расписания, согласованность фильтров, сохранение бюджета/cooldown,
+остановка цикла при FloodWait, область Warmup и сценариев, отсутствие повторов Online,
+одна ручная задача, защита прогресса от старых событий и сохранение ошибок при выходе.
+Windows-проверка создаёт только временный `.lnk` и проверяет AppUserModelID.
+
+`test_warmup_policy.py` — явные каналы и шаблоны, read-only по умолчанию,
+часовой/суточный бюджет, конечные циклы, сохранение успехов без повторов,
+недоступные каналы, таймаут запроса и остановка после трёх неудачных циклов.
+Smoke дополнительно проверяет отдельную раскрывающуюся секцию Warmup / Sleep,
+отсутствие дублей в Actions, настройки Warmup и сохранение без Telegram.
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest discover -s tests -p test_warmup_policy.py -v
+```
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest discover -s tests -p test_background_state.py -v
+```
+
 ```powershell
 .\.venv\Scripts\python.exe -m unittest discover -s tests -p test_email_mailbox.py -v
 ```

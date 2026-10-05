@@ -35,6 +35,7 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QScrollArea,
+    QSpinBox,
     QSizePolicy,
     QTableView,
     QVBoxLayout,
@@ -54,7 +55,7 @@ from core.ui_logs import Severity, UiLogEntry
 from core.ui_state import UiStateStore
 from core.telegram_client import ReactionChoice
 from modules.account_security import AccountSecurityService, passkey_restore_candidates
-from modules.account_filters import AccountFilter, country_options, filter_accounts
+from modules.account_filters import AccountFilter, country_options, effective_proxy, filter_accounts, login_mail_state
 from modules.accounts import AccountService
 from modules.ai_companion import AICompanion, AIConversationConfig
 from modules.chat_actions import ChatActionService
@@ -126,9 +127,9 @@ class AsyncWorker:
 
 class UiSignals(QObject):
     task_started = Signal(str, object, object, str)
-    task_finished = Signal(str, object, str)
-    task_failed = Signal(str, str, str)
-    task_stopped = Signal(str, str)
+    task_finished = Signal(str, object, str, str)
+    task_failed = Signal(str, str, str, str)
+    task_stopped = Signal(str, str, str)
     log_message = Signal(str, str)
     refresh_requested = Signal()
     session_check_done = Signal(int, object, str)
@@ -138,6 +139,7 @@ class UiSignals(QObject):
     reaction_choices_failed = Signal(str, str)
     proxy_count_ready = Signal(int, int)
     progress_updated = Signal(object)
+    warmup_status = Signal(object)
     auth_code_requested = Signal(object)
 
 
@@ -313,6 +315,8 @@ class QtDesktopApp(QMainWindow):
         self.structured_logs: list[dict[str, str]] = []
         self.group_name = "inbox"
         self.current_task_id = ""
+        self.current_task_name = ""
+        self._task_start_pending = False
         self.sections: dict[str, Section] = {}
         self.recording_steps: list[ScenarioStep] = []
         self.recording_scenario = False
@@ -353,6 +357,9 @@ class QtDesktopApp(QMainWindow):
         self.import_timer = QTimer(self)
         self.import_timer.timeout.connect(self.auto_import_tick)
         self.import_timer.start(5000)
+        self.sleep_timer = QTimer(self)
+        self.sleep_timer.timeout.connect(self.refresh_sleep_states)
+        self.sleep_timer.start(30_000)
         self.proxy_dashboard_timer = QTimer(self)
         self.proxy_dashboard_timer.timeout.connect(self.refresh_proxy_dashboard)
         self.proxy_dashboard_timer.start(5000)
@@ -404,6 +411,7 @@ class QtDesktopApp(QMainWindow):
         self.signals.reaction_choices_failed.connect(self.on_reaction_choices_failed)
         self.signals.proxy_count_ready.connect(self.on_proxy_count_ready)
         self.signals.progress_updated.connect(self.on_progress_updated)
+        self.signals.warmup_status.connect(self.on_warmup_status)
         self.signals.auth_code_requested.connect(self.on_auth_code_requested)
 
     def _build_layout(self) -> None:
@@ -430,6 +438,9 @@ class QtDesktopApp(QMainWindow):
 
         self.actions_section = self._add_section(sidebar_layout, "actions", "Actions")
         self._build_actions_section(self.actions_section.content_layout)
+
+        self.warmup_section = self._add_section(sidebar_layout, "warmup", "Warmup / Sleep")
+        self._build_warmup_section(self.warmup_section.content_layout)
 
         self.giveaway_section = self._add_section(sidebar_layout, "giveaways", "Giveaways")
         self._build_giveaway_section(self.giveaway_section.content_layout)
@@ -525,6 +536,7 @@ class QtDesktopApp(QMainWindow):
         self.filter_sleep.addItem("Any sleep state", "any")
         self.filter_sleep.addItem("Awake", "awake")
         self.filter_sleep.addItem("Sleeping", "sleeping")
+        self.filter_sleep.addItem("Unknown", "unknown")
         filters_layout.addWidget(self.filter_query, 0, 0, 1, 2)
         filters_layout.addWidget(QLabel("Added from"), 0, 2)
         filters_layout.addWidget(self.filter_from, 0, 3)
@@ -730,13 +742,6 @@ class QtDesktopApp(QMainWindow):
         self._add_button_row(
             layout,
             [
-                ("Warmup", self.start_warmup, "primary"),
-                ("Stop warmup", self.stop_warmup, "secondary"),
-            ],
-        )
-        self._add_button_row(
-            layout,
-            [
                 ("Check sessions", self.check_sessions, "secondary"),
                 ("Check registration date", self.check_account_age, "secondary"),
             ],
@@ -779,7 +784,6 @@ class QtDesktopApp(QMainWindow):
         self._add_button_row(
             layout,
             [
-                ("Assign timezones", self.assign_timezones, "secondary"),
                 ("Check VPN pool", self.refresh_proxy_pool, "primary"),
             ],
         )
@@ -789,6 +793,70 @@ class QtDesktopApp(QMainWindow):
         self.ai_topic_entry = self._add_line_with_paste(layout, "Topic")
         self.ai_count_entry = self._add_line_with_paste(layout, "messages")
         self._add_button_row(layout, [("Run AI for group", self.start_ai, "primary")])
+
+    def _build_warmup_section(self, layout: QVBoxLayout) -> None:
+        self._add_button_row(
+            layout,
+            [
+                ("Warmup", self.start_warmup, "primary"),
+                ("Stop warmup", self.stop_warmup, "secondary"),
+            ],
+        )
+        from modules.warmup_settings import WarmupOptions
+        self._add_title(layout, "Warmup settings")
+        try:
+            options = WarmupOptions.load(self.config.data_dir / "warmup_settings.json")
+        except (ValueError, TypeError) as exc:
+            options = WarmupOptions()
+            self.ui_log.warning("Warmup settings need correction: %s", exc)
+        self.warmup_channels = QPlainTextEdit()
+        self.warmup_channels.setPlaceholderText("Public channels: @channel or https://t.me/channel\nOne per line; no automatic channel suggestions")
+        self.warmup_channels.setPlainText("\n".join(options.channels))
+        self.warmup_channels.setFixedHeight(82)
+        layout.addWidget(self.warmup_channels)
+        self.warmup_controls = {}
+        for key, caption, low, high in (("posts_per_cycle", "Posts per cycle", 1, 6),
+                                       ("cycles", "Cycles per account (0 = continuous)", 0, 100),
+                                       ("hourly_budget", "Read/action attempts per hour", 1, 100),
+                                       ("daily_budget", "Read/action attempts per 24 hours", 1, 1000)):
+            row = QHBoxLayout()
+            label, control = QLabel(caption), QSpinBox()
+            label.setWordWrap(True)
+            control.setRange(low, high)
+            control.setValue(getattr(options, key))
+            row.addWidget(label, 1)
+            row.addWidget(control)
+            layout.addLayout(row)
+            self.warmup_controls[key] = control
+        for key, caption in (("reactions", "Allow reactions (up to one per cycle)"),
+                             ("save_posts", "Save post links to Saved Messages"),
+                             ("join_channels", "Join only the configured channels")):
+            control = QCheckBox(caption)
+            control.setChecked(getattr(options, key))
+            layout.addWidget(control)
+            self.warmup_controls[key] = control
+        self._add_button_row(layout, [("Save warmup settings", self.save_warmup_settings, "secondary")])
+        self.warmup_status_label = QLabel("Not running. Default: read-only; writes require opt-in.")
+        self.warmup_status_label.setWordWrap(True)
+        layout.addWidget(self.warmup_status_label)
+        self._add_title(layout, "Sleep schedule")
+        self.sleep_enabled = QCheckBox("Enable sleep schedule for background tasks")
+        self.sleep_enabled.setChecked(bool(self.scheduler.settings["enabled"]))
+        layout.addWidget(self.sleep_enabled)
+        self.sleep_zone_entry = self._add_line_with_paste(layout, "Timezone: Europe/Moscow, UTC…")
+        self.sleep_zone_entry.setText(str(self.scheduler.settings["timezone"]))
+        hours = QHBoxLayout()
+        self.sleep_start_hour, self.sleep_end_hour = QSpinBox(), QSpinBox()
+        for title, control, key in (("Sleep from", self.sleep_start_hour, "start"), ("to", self.sleep_end_hour, "end")):
+            control.setRange(0, 23)
+            control.setSuffix(":00")
+            control.setValue(int(self.scheduler.settings[key]))
+            hours.addWidget(QLabel(title))
+            hours.addWidget(control)
+        layout.addLayout(hours)
+        self._add_button_row(layout, [("Apply sleep schedule", self.apply_sleep_schedule, "secondary")])
+        self._add_button_row(layout, [("Assign timezones", self.assign_timezones, "secondary")])
+
 
     def _build_giveaway_section(self, layout: QVBoxLayout) -> None:
         self._add_label(layout, "Giveaway engine")
@@ -1537,13 +1605,12 @@ class QtDesktopApp(QMainWindow):
 
     def filtered_accounts(self, accounts):
         items = list(accounts)
-        sleeping_ids = {
-            account.id for account in items if self.scheduler.is_sleeping(account.id)
-        } if self.account_filter.sleep != "any" else None
+        states = {account.id: self.scheduler.state(account.id) for account in items} if self.account_filter.sleep != "any" else None
         return filter_accounts(
             items,
             self.account_filter,
-            sleeping_ids=sleeping_ids,
+            sleep_states=states,
+            global_proxy=self.config.global_proxy,
         )
 
     def format_added(self, value: str) -> str:
@@ -1568,12 +1635,7 @@ class QtDesktopApp(QMainWindow):
         return "unknown"
 
     def login_mail_status(self, account) -> str:
-        if account.metadata.get("login_email"):
-            return "custom"
-        status = str(account.metadata.get("login_email_status") or "").lower()
-        if status == "custom":
-            return "custom"
-        return "absent"
+        return login_mail_state(account)
 
     def cloud_password_status(self, account) -> str:
         value = account.metadata.get("cloud_password")
@@ -1605,7 +1667,7 @@ class QtDesktopApp(QMainWindow):
         return f"@{username}" if username else "none"
 
     def proxy_status(self, account) -> str:
-        proxy = account.proxy or account.metadata.get("proxy")
+        proxy = effective_proxy(account, self.config.global_proxy)
         if not proxy:
             return "none"
         latency = account.metadata.get("proxy_latency")
@@ -1621,8 +1683,32 @@ class QtDesktopApp(QMainWindow):
             return "unknown"
 
     def sleep_status(self, account) -> str:
-        self.scheduler.assign_timezone(account.id, account.phone)
         return self.scheduler.sleep_status(account.id)
+
+    def refresh_sleep_states(self) -> None:
+        if self.account_filter.sleep != "any":
+            self.refresh_accounts()
+            return
+        for row, (account_id, values) in enumerate(self.table_model.rows):
+            status = self.scheduler.sleep_status(account_id)
+            if values[7] != status:
+                values[7] = status
+                index = self.table_model.index(row, 7)
+                self.table_model.dataChanged.emit(index, index)
+
+    def apply_sleep_schedule(self) -> None:
+        accounts = self.get_selected_accounts() or self.group_accounts()
+        if not self.confirm("Apply sleep schedule?", f"Set timezone for {len(accounts)} filtered/selected account(s)? Sleep hours and enabled state apply to all background tasks."):
+            return
+        try:
+            self.scheduler.configure(accounts, timezone=self.sleep_zone_entry.text().strip(),
+                                     start=self.sleep_start_hour.value(), end=self.sleep_end_hour.value(),
+                                     enabled=self.sleep_enabled.isChecked())
+        except (ValueError, KeyError) as exc:
+            QMessageBox.warning(self, "Invalid sleep schedule", f"{exc}\nCheck the IANA timezone and install requirements (tzdata).")
+            return
+        self.log(f"Sleep schedule saved for {len(accounts)} account(s).")
+        self.refresh_accounts()
 
     def registration_status(self, account) -> str:
         return account.metadata.get("registration") or ""
@@ -1857,6 +1943,8 @@ class QtDesktopApp(QMainWindow):
             return
         captured = dict(params)
         captured.setdefault("group", self.active_group())
+        captured.setdefault("account_ids", [account.id for account in self.group_accounts()])
+        captured.setdefault("account_filter", self.account_filter.to_dict())
         step = ScenarioStep(action=action, label=label, params=captured)
         self.recording_steps.append(step)
         self.log(f"Recorded scenario step #{len(self.recording_steps)}: {label}")
@@ -1896,10 +1984,7 @@ class QtDesktopApp(QMainWindow):
             return
         mode = f"active group '{run_group}'" if force_active_group else "saved groups"
         groups = sorted({str(step.params.get("group") or "inbox") for step in runnable.steps})
-        group_counts = ", ".join(
-            f"{group}={len(self.accounts.list_accounts(group=group, enabled_only=True))}"
-            for group in groups
-        )
+        group_counts = ", ".join(f"step {index}: {len(self.scenario_accounts(step.params))}" for index, step in enumerate(runnable.steps, 1))
         if not self.confirm(
             "Run scenario?",
             f"Run '{scenario.name}' with {len(runnable.steps)} step(s) using {mode}?\n\nAccounts: {group_counts}",
@@ -1921,7 +2006,7 @@ class QtDesktopApp(QMainWindow):
             self.log(f"Active group does not exist: {active_group}")
             return None
         active_accounts = self.accounts.list_accounts(group=active_group, enabled_only=True)
-        if not active_accounts:
+        if force_active_group and not active_accounts:
             self.log(f"No enabled accounts in active group '{active_group}'.")
             return None
 
@@ -1935,12 +2020,18 @@ class QtDesktopApp(QMainWindow):
                 if saved_group != active_group:
                     replaced.append(saved_group)
                 params["group"] = active_group
+                params["account_ids"] = [a.id for a in self.group_accounts()]
+                params["account_filter"] = self.account_filter.to_dict()
             elif not saved_accounts:
                 self.log(
                     f"Scenario '{scenario.name}' refers to missing or empty group '{saved_group}'. "
                     f"Open that group first or use 'Run active'."
                 )
                 return None
+            if not force_active_group:
+                params.setdefault("account_filter", self.account_filter.to_dict())
+                if "account_ids" not in params:
+                    params["account_ids"] = [a.id for a in self.scenario_accounts(params)]
             prepared_steps.append(ScenarioStep(action=step.action, label=step.label, params=params))
 
         if replaced:
@@ -2044,10 +2135,20 @@ class QtDesktopApp(QMainWindow):
         if run_group != step_group:
             self.signals.log_message.emit(message, run_group)
 
+    def scenario_accounts(self, params: dict) -> list:
+        accounts = self.accounts.list_accounts(group=str(params.get("group") or "inbox"), enabled_only=True)
+        ids = params.get("account_ids")
+        if ids is not None:
+            allowed = set(ids)
+            accounts = [a for a in accounts if a.id in allowed]
+        spec = AccountFilter.from_dict(params.get("account_filter", self.account_filter.to_dict()))
+        states = {a.id: self.scheduler.state(a.id) for a in accounts} if spec.sleep != "any" else None
+        return filter_accounts(accounts, spec, sleep_states=states, global_proxy=self.config.global_proxy)
+
     async def execute_scenario_step(self, step: ScenarioStep, stop: asyncio.Event) -> object:
         params = step.params
         group = str(params.get("group") or "inbox")
-        accounts = self.accounts.list_accounts(group=group, enabled_only=True)
+        accounts = self.scenario_accounts(params)
         action = step.action
 
         if action in {"profile.generate", "profile.split_unknown"}:
@@ -2284,13 +2385,7 @@ class QtDesktopApp(QMainWindow):
             self.signals.refresh_requested.emit()
             return results
 
-        progress = OperationProgress(
-            "External sessions",
-            len(queued),
-            on_update=lambda snapshot: self.signals.progress_updated.emit(snapshot),
-        )
-        self.current_progress = progress
-        self.signals.progress_updated.emit(progress.to_dict())
+        progress = self.begin_operation_progress("External sessions", queued)
         self.log(f"External session queue: {len(queued)} file(s). Progress is shown in the top bar.")
         try:
             self.start_managed_task("process-external-sessions", run)
@@ -2349,11 +2444,23 @@ class QtDesktopApp(QMainWindow):
         factory: Callable[[asyncio.Event], Awaitable[object]],
         task_group: str | None = None,
     ) -> None:
+        if self._task_start_pending is True or QtDesktopApp.foreground_task_busy(self):
+            if name == "process-external-sessions":
+                self.external_sessions_running = False
+            self.log("Another task is running or starting. Use Stop current before starting a new task.")
+            return
         if self.current_progress is None:
             self.begin_indeterminate_progress(self._task_progress_label(name))
+        self._task_start_pending = True
         task_group = task_group or self.active_group()
 
         async def starter():
+            stopped_warmup = await self.tasks.stop_by_name_prefix("warmup")
+            if stopped_warmup:
+                self.signals.log_message.emit(
+                    f"Stopped warmup before {name}: {stopped_warmup} task(s).",
+                    task_group,
+                )
             stopped_online = await self.tasks.stop_by_name_prefix("online-mode")
             if stopped_online:
                 self.signals.log_message.emit(
@@ -2369,14 +2476,14 @@ class QtDesktopApp(QMainWindow):
                 try:
                     result = await task
                 except asyncio.CancelledError:
-                    self.signals.task_stopped.emit(name, task_group)
+                    self.signals.task_stopped.emit(name, task_group, task_id)
                     return
                 except Exception as exc:
                     details = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
-                    self.signals.task_failed.emit(name, details, task_group)
+                    self.signals.task_failed.emit(name, details, task_group, task_id)
                     self.signals.refresh_requested.emit()
                     return
-                self.signals.task_finished.emit(name, result, task_group)
+                self.signals.task_finished.emit(name, result, task_group, task_id)
                 self.signals.refresh_requested.emit()
 
             asyncio.create_task(watch())
@@ -2394,19 +2501,25 @@ class QtDesktopApp(QMainWindow):
         error: BaseException | None,
         group: str,
     ) -> None:
+        self._task_start_pending = False
         if error:
             if name == "process-external-sessions":
                 self.external_sessions_running = False
-            self.clear_progress()
+            if not self.current_task_id:
+                self.clear_progress()
             self.log(f"{name} failed to start: {error}", group=group)
             self._set_status_pill(self.task_pill, "Task: failed", "bad")
             return
         self.current_task_id = str(result)
+        self.current_task_name = name
         self._set_status_pill(self.task_pill, f"Task: {name}", "warn")
         self.log(f"Started {name}: {result}", group=group)
 
     def on_progress_updated(self, snapshot: object) -> None:
         if not isinstance(snapshot, dict):
+            return
+        token = snapshot.get("progress_token")
+        if token is not None and (self.current_progress is None or token != id(self.current_progress)):
             return
         total = int(snapshot.get("total", 0) or 0)
         completed = int(snapshot.get("completed", 0) or 0)
@@ -2442,46 +2555,57 @@ class QtDesktopApp(QMainWindow):
     def begin_indeterminate_progress(self, operation: str) -> OperationProgress:
         progress = OperationProgress.indeterminate(
             operation,
-            on_update=lambda snapshot: self.signals.progress_updated.emit(snapshot),
+            on_update=lambda snapshot: self.publish_progress(progress, snapshot),
         )
-        self.current_progress = progress
-        self.signals.progress_updated.emit(progress.to_dict())
+        if not QtDesktopApp.foreground_task_busy(self) and self._task_start_pending is not True:
+            self.current_progress = progress
+            self.publish_progress(progress, progress.to_dict())
         return progress
 
     def begin_operation_progress(self, operation: str, accounts) -> OperationProgress:
         progress = OperationProgress(
             operation,
             len(accounts),
-            on_update=lambda snapshot: self.signals.progress_updated.emit(snapshot),
+            on_update=lambda snapshot: self.publish_progress(progress, snapshot),
         )
-        self.current_progress = progress
-        self.signals.progress_updated.emit(progress.to_dict())
+        if not QtDesktopApp.foreground_task_busy(self) and self._task_start_pending is not True:
+            self.current_progress = progress
+            self.publish_progress(progress, progress.to_dict())
         return progress
 
-    def task_failed(self, name: str, error: str, group: str) -> None:
+    def foreground_task_busy(self) -> bool:
+        return isinstance(self.current_task_id, str) and bool(self.current_task_id) and self.current_task_name not in {"warmup", "online-mode"}
+
+    def publish_progress(self, progress: OperationProgress, snapshot: dict) -> None:
+        if self.current_progress is progress:
+            self.signals.progress_updated.emit({**snapshot, "progress_token": id(progress)})
+
+    def clear_task_state(self, task_id: str, *, failed: bool = False) -> None:
+        if (task_id and task_id != self.current_task_id) or self._task_start_pending is True:
+            return
         self.current_task_id = ""
+        self.current_task_name = ""
         self.clear_progress()
-        self._set_status_pill(self.task_pill, "Task: failed", "bad")
+        self._set_status_pill(self.task_pill, "Task: failed" if failed else "Task: idle", "bad" if failed else "ok")
+
+    def task_failed(self, name: str, error: str, group: str, task_id: str = "") -> None:
+        QtDesktopApp.clear_task_state(self, task_id, failed=True)
         self.ui_log.error("[%s] %s failed: %s", group, name, error)
         summary = error.strip().splitlines()[-1] if error.strip() else "Unknown error"
         self.log(f"{name} failed: {summary}", group=group, severity="error")
         if name in {"change-login-email", "bind-recovery-email"}:
             QMessageBox.warning(self, "Email operation failed", summary)
 
-    def task_stopped(self, name: str, group: str) -> None:
+    def task_stopped(self, name: str, group: str, task_id: str = "") -> None:
         if name == "process-external-sessions":
             self.external_sessions_running = False
-        self.current_task_id = ""
-        self.clear_progress()
-        self._set_status_pill(self.task_pill, "Task: idle", "ok")
+        QtDesktopApp.clear_task_state(self, task_id)
         self.log(f"{name} stopped.", group=group)
 
-    def task_finished(self, name: str, result: object, group: str) -> None:
+    def task_finished(self, name: str, result: object, group: str, task_id: str = "") -> None:
         if name == "process-external-sessions":
             self.external_sessions_running = False
-        self.current_task_id = ""
-        self.clear_progress()
-        self._set_status_pill(self.task_pill, "Task: idle", "ok")
+        QtDesktopApp.clear_task_state(self, task_id)
         if isinstance(result, ActionResult):
             self.log(result.summary(name), group=group, operation=name)
             for account_id, detail in result.details.items():
@@ -2798,7 +2922,7 @@ class QtDesktopApp(QMainWindow):
             self.log("No enabled accounts in selected group.")
             return
         self.scenario_not_recorded("online mode is long-running; start it separately.")
-        service = OnlineModeService(self.config)
+        service = OnlineModeService(self.config, scheduler=self.scheduler)
         self.start_managed_task("online-mode", lambda stop: service.run(accounts, stop))
 
     def start_warmup(self) -> None:
@@ -2808,10 +2932,60 @@ class QtDesktopApp(QMainWindow):
         if not accounts:
             self.log("No enabled accounts in selected group.")
             return
-        self.scenario_not_recorded("warmup is long-running; start it separately.")
-        engine = WarmupEngine(self.config)
+        if self.foreground_task_busy() or self._task_start_pending:
+            self.log("Finish or stop the current task before starting Warmup.")
+            return
+        if self.current_task_name == "warmup":
+            self.log("Warmup is already running. Stop it before changing its policy.")
+            return
+        try:
+            options = self.warmup_options()
+            engine = WarmupEngine(self.config, scheduler=self.scheduler, options=options)
+            engine.validate_accounts(accounts)
+        except (ValueError, TypeError) as exc:
+            QMessageBox.warning(self, "Warmup settings", str(exc))
+            return
+        writes = ", ".join(name for name, enabled in (("reactions", options.reactions), ("Saved Messages", options.save_posts), ("subscriptions", options.join_channels)) if enabled) or "none (read-only)"
+        if not self.confirm("Start Warmup?", f"Accounts: {len(accounts)} (current filters).\nCycles per account: {options.cycles or 'continuous until Stop'}.\nBudgets: {options.hourly_budget}/hour, {options.daily_budget}/24h.\nWrites: {writes}.\nSleep and persisted cooldowns apply; this does not guarantee protection from Telegram limits."):
+            return
+        options.save(self.config.data_dir / "warmup_settings.json")
+        self.scenario_not_recorded("warmup uses background settings; start it separately.")
+        progress = self.begin_operation_progress("Warmup", accounts) if options.cycles else self.begin_indeterminate_progress("Warmup")
+        states = {}
+        def report(snapshot):
+            states[snapshot["account_id"]] = snapshot
+            if snapshot["terminal"] and snapshot["status"] != "Stopped" and options.cycles:
+                if snapshot["stats"]["errors"] or snapshot["stats"]["skipped"] and not snapshot["stats"]["viewed"]:
+                    progress.mark_error(snapshot["account_id"])
+                else:
+                    progress.mark_ok(snapshot["account_id"])
+            self.signals.warmup_status.emit({"token": id(progress), "states": list(states.values()), "total": len(accounts), "status": f"{snapshot['account_id']}: {snapshot['status']}"})
+        engine.on_status = report
         group = self.active_group()
-        self.start_managed_task("warmup", lambda stop: engine.run_for_group(group, stop))
+        self.start_managed_task("warmup", lambda stop: engine.run_for_group(group, stop, accounts=accounts))
+
+    def warmup_options(self):
+        from modules.warmup_settings import WarmupOptions
+        values = {key: control.isChecked() if isinstance(control, QCheckBox) else control.value()
+                  for key, control in self.warmup_controls.items()}
+        return WarmupOptions(channels=self.warmup_channels.toPlainText(), **values).validate()
+
+    def save_warmup_settings(self) -> None:
+        try:
+            self.warmup_options().save(self.config.data_dir / "warmup_settings.json")
+        except (ValueError, TypeError) as exc:
+            QMessageBox.warning(self, "Warmup settings", str(exc))
+            return
+        self.log("Warmup settings saved. Changes apply on the next start.")
+
+    def on_warmup_status(self, snapshot) -> None:
+        if self.current_progress is None or snapshot.get("token") != id(self.current_progress):
+            return
+        states = snapshot["states"]
+        done = sum(state["terminal"] and state["status"] != "Stopped" for state in states)
+        counts = {key: sum(state["stats"][key] for state in states) for key in ("viewed", "reacted", "saved", "joined", "errors")}
+        detail = snapshot["status"]
+        self.warmup_status_label.setText(f"Accounts finished: {done}/{snapshot['total']} · viewed: {counts['viewed']} · errors: {counts['errors']}\nReactions: {counts['reacted']} · saved: {counts['saved']} · joined: {counts['joined']}\n{detail}")
 
     def stop_warmup(self) -> None:
         self.worker.submit(self.tasks.stop_by_name_prefix("warmup"))
@@ -2953,9 +3127,7 @@ class QtDesktopApp(QMainWindow):
     def _assign_proxies(self, account_ids: list[str]) -> None:
         from modules.proxy_manager import ProxyPool
         pool = ProxyPool(self.config.proxy_pool_db)
-        progress = OperationProgress("Assign VPN exits", len(account_ids))
-        self.current_progress = progress
-        self.signals.progress_updated.emit(progress.to_dict())
+        progress = self.begin_operation_progress("Assign VPN exits", account_ids)
 
         async def runner(_stop: asyncio.Event) -> ActionResult:
             result = ActionResult()
@@ -2974,13 +3146,11 @@ class QtDesktopApp(QMainWindow):
                 assigned_ids.add(account_id)
                 result.add_ok(account_id)
                 progress.mark_ok(account_id)
-                self.signals.progress_updated.emit(progress.to_dict())
                 await asyncio.sleep(0)
             for account_id in account_ids:
                 if account_id not in assigned_ids:
                     result.add_error(account_id, "no VPN exits in pool")
                     progress.mark_error(account_id)
-                    self.signals.progress_updated.emit(progress.to_dict())
             return result
 
         self.start_managed_task("assign-proxy", runner)
@@ -3007,9 +3177,7 @@ class QtDesktopApp(QMainWindow):
         from modules.proxy_manager import ProxyPool, validate_proxy
         from urllib.parse import unquote, urlparse
         pool = ProxyPool(self.config.proxy_pool_db)
-        progress = OperationProgress("Check VPN exits", len(accounts))
-        self.current_progress = progress
-        self.signals.progress_updated.emit(progress.to_dict())
+        progress = self.begin_operation_progress("Check VPN exits", accounts)
 
         async def runner(_stop: asyncio.Event) -> ActionResult:
             result = ActionResult()
@@ -3017,12 +3185,10 @@ class QtDesktopApp(QMainWindow):
             def mark_ok(account_id: str) -> None:
                 result.add_ok(account_id)
                 progress.mark_ok(account_id)
-                self.signals.progress_updated.emit(progress.to_dict())
 
             def mark_error(account_id: str, detail: str) -> None:
                 result.add_error(account_id, detail)
                 progress.mark_error(account_id)
-                self.signals.progress_updated.emit(progress.to_dict())
 
             if os.getenv("PROXY_MODE", "").strip().lower() == "vpn_gateway":
                 return await self._check_gateway_proxies(
@@ -4010,14 +4176,12 @@ class QtDesktopApp(QMainWindow):
         self.settings.setValue("active_group", self.active_group())
         self.settings.setValue("table_widths", [self.table.columnWidth(i) for i in range(self.table_model.columnCount())])
         self.import_timer.stop()
+        self.sleep_timer.stop()
         self.proxy_dashboard_timer.stop()
         if self.vpn_gateway_future is not None and not self.vpn_gateway_future.done():
             self.vpn_gateway_future.cancel()
         f1 = self.worker.submit(self.direct_access.close_all())
         f2 = self.worker.submit(self.tasks.stop_all())
-        cleared = self.accounts.clear_all_errors()
-        if cleared:
-            self.log(f"Cleared old session errors: {cleared}")
         
         try:
             import concurrent.futures
@@ -4030,6 +4194,8 @@ class QtDesktopApp(QMainWindow):
 
 def run_desktop_app(config: AppConfig) -> None:
     app = QApplication.instance() or QApplication([])
+    app.setApplicationName("Uznik MultiTool")
+    app.setWindowIcon(QIcon(str(Path(__file__).resolve().parents[2] / "assets/branding/uznik-multitool.ico")))
     window = QtDesktopApp(config)
     window.show()
     app.exec()

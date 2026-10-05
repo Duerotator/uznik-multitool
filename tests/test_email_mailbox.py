@@ -351,7 +351,7 @@ class EmailSecurityFlowTests(unittest.IsolatedAsyncioTestCase):
                 native = SimpleNamespace(**{telegram_method: hang})
                 closed = Mock()
                 @asynccontextmanager
-                async def create(*args):
+                async def create(*args, **kwargs):
                     try:
                         yield native
                     finally:
@@ -393,7 +393,7 @@ class EmailSecurityFlowTests(unittest.IsolatedAsyncioTestCase):
             client = SimpleNamespace(**{telegram_method: request})
 
             @asynccontextmanager
-            async def create(*_):
+            async def create(*_, **kwargs):
                 yield client
 
             service = AccountSecurityService.__new__(AccountSecurityService)

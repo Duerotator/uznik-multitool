@@ -16,10 +16,15 @@ from core.diagnostics import get_proxy_diagnostics
 from core.logging_setup import account_logger
 from core.models import AccountRecord, ProxyConfig
 from core.telegram_connection import CLEANUP_TIMEOUT, CONNECT_TIMEOUT, connection_error, is_connection_error
+from utils.telegram_errors import flood_wait_seconds, is_invalid_auth_error
 
 
 _SESSION_LOCKS: dict[str, asyncio.Lock] = {}
 _PROXY_POOLS: dict[str, Any] = {}
+
+
+class AccountBusyError(RuntimeError):
+    """Another task owns the session; this is not an authentication failure."""
 
 
 def session_lock(account: AccountRecord) -> asyncio.Lock:
@@ -68,6 +73,8 @@ class AccountClient(ABC):
         self.account = account
         self.log = account_logger(account.id)
         self._lock: asyncio.Lock | None = None
+        self._lock_acquired = False
+        self.lock_wait_timeout: float | None = None
         # High-volume callers may lower this threshold and rotate accounts.
         self.flood_wait_raise_after = 60
         self.flood_wait_count = 0
@@ -75,7 +82,17 @@ class AccountClient(ABC):
     async def __aenter__(self) -> "AccountClient":
         self._lock = session_lock(self.account)
         get_proxy_diagnostics().trace_client_lifecycle(self.account.id, "lock_acquire", "waiting")
-        await self._lock.acquire()
+        try:
+            if self.lock_wait_timeout is None:
+                await self._lock.acquire()
+            else:
+                await asyncio.wait_for(self._lock.acquire(), timeout=self.lock_wait_timeout)
+        except TimeoutError:
+            get_proxy_diagnostics().trace_client_lifecycle(self.account.id, "lock_busy", "wait expired")
+            raise AccountBusyError(
+                "Account is busy with another task. Stop Warmup / Online or wait for the current task to finish, then retry."
+            ) from None
+        self._lock_acquired = True
         get_proxy_diagnostics().trace_client_lifecycle(self.account.id, "lock_acquired", "ok")
         try:
             get_proxy_diagnostics().trace_client_lifecycle(self.account.id, "client_start", f"proxy={self.account.proxy or '(none)'}")
@@ -88,8 +105,9 @@ class AccountClient(ABC):
             except Exception as stop_exc:  # noqa: BLE001 - cleanup must not hide the start error
                 self.log.debug("Could not stop client after failed start: %s", stop_exc)
             finally:
-                if self._lock.locked():
+                if self._lock_acquired:
                     self._lock.release()
+                    self._lock_acquired = False
             raise
         return self
 
@@ -111,8 +129,9 @@ class AccountClient(ABC):
                 else:
                     get_proxy_diagnostics().trace_client_lifecycle(self.account.id, "client_stopped", "ok")
         finally:
-            if self._lock and self._lock.locked():
+            if self._lock and self._lock_acquired:
                 self._lock.release()
+                self._lock_acquired = False
                 get_proxy_diagnostics().trace_client_lifecycle(self.account.id, "lock_released", "ok")
 
     @staticmethod
@@ -298,7 +317,7 @@ class AccountClient(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    async def random_reaction(self, link: str) -> str:
+    async def random_reaction(self, link: str, *, mark_viewed: bool = True) -> str:
         raise NotImplementedError
 
     @abstractmethod
@@ -367,7 +386,7 @@ class AccountClient(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    async def get_recent_chat_messages(self, chat: str, limit: int = 10) -> list[dict[str, Any]]:
+    async def get_recent_chat_messages(self, chat: str, limit: int = 10, *, include_media: bool = False) -> list[dict[str, Any]]:
         raise NotImplementedError
 
     @abstractmethod
@@ -663,9 +682,10 @@ class PyrogramAccountClient(AccountClient):
             )
         )
 
-    async def random_reaction(self, link: str) -> str:
+    async def random_reaction(self, link: str, *, mark_viewed: bool = True) -> str:
         target, message_id = parse_post_link(link)
-        await self.view_post(link)
+        if mark_viewed:
+            await self.view_post(link)
         reactions = await self._allowed_reactions(target)
         if not reactions:
             raise RuntimeError("No reactions are available for this post.")
@@ -686,6 +706,8 @@ class PyrogramAccountClient(AccountClient):
                 return f"reaction={reaction.display}; available={len(reactions)}"
             except Exception as exc:
                 last_error = exc
+                if flood_wait_seconds(exc) is not None or is_invalid_auth_error(exc):
+                    raise
                 self.log.warning(
                     "Reaction candidate failed for %s/%s: %s (%s)",
                     target,
@@ -1030,12 +1052,12 @@ class PyrogramAccountClient(AccountClient):
                 messages.append({"received_at": created_at, "text": text})
         return messages
 
-    async def get_recent_chat_messages(self, chat: str, limit: int = 10) -> list[dict[str, Any]]:
+    async def get_recent_chat_messages(self, chat: str, limit: int = 10, *, include_media: bool = False) -> list[dict[str, Any]]:
         messages: list[dict[str, Any]] = []
         async for message in self.client.get_chat_history(chat, limit=limit):
             created_at = _datetime_timestamp(getattr(message, "date", None))
             text = getattr(message, "text", None) or getattr(message, "caption", None) or ""
-            if text:
+            if text or include_media and getattr(message, "media", None):
                 messages.append(
                     {
                         "id": getattr(message, "id", 0),
@@ -1869,9 +1891,10 @@ class TelethonAccountClient(AccountClient):
             )
         )
 
-    async def random_reaction(self, link: str) -> str:
+    async def random_reaction(self, link: str, *, mark_viewed: bool = True) -> str:
         target, message_id = parse_post_link(link)
-        await self.view_post(link)
+        if mark_viewed:
+            await self.view_post(link)
         reactions = await self._allowed_reactions(target)
         if not reactions:
             raise RuntimeError("No reactions are available for this post.")
@@ -1893,6 +1916,8 @@ class TelethonAccountClient(AccountClient):
                 return f"reaction={reaction.display}; available={len(reactions)}"
             except Exception as exc:
                 last_error = exc
+                if flood_wait_seconds(exc) is not None or is_invalid_auth_error(exc):
+                    raise
                 self.log.warning(
                     "Reaction candidate failed for %s/%s: %s (%s)",
                     target,
@@ -2118,12 +2143,12 @@ class TelethonAccountClient(AccountClient):
                 messages.append({"received_at": created_at, "text": text})
         return messages
 
-    async def get_recent_chat_messages(self, chat: str, limit: int = 10) -> list[dict[str, Any]]:
+    async def get_recent_chat_messages(self, chat: str, limit: int = 10, *, include_media: bool = False) -> list[dict[str, Any]]:
         messages: list[dict[str, Any]] = []
         async for message in self.client.iter_messages(chat, limit=limit):
             created_at = _datetime_timestamp(getattr(message, "date", None))
             text = getattr(message, "message", None) or getattr(message, "text", None) or ""
-            if text:
+            if text or include_media and getattr(message, "media", None):
                 messages.append(
                     {
                         "id": getattr(message, "id", 0),
@@ -2604,12 +2629,17 @@ def _register_pyrogram_passkey_raw_types() -> None:
     objects[PyrogramPasskeys.ID] = PyrogramPasskeys
 
 
-def create_client(config: AppConfig, account: AccountRecord) -> AccountClient:
+def create_client(
+    config: AppConfig, account: AccountRecord, *, lock_wait_timeout: float | None = None,
+) -> AccountClient:
     if account.backend == "pyrogram":
-        return PyrogramAccountClient(config, account)
-    if account.backend == "telethon":
-        return TelethonAccountClient(config, account)
-    raise ValueError(f"Unsupported backend: {account.backend}")
+        client = PyrogramAccountClient(config, account)
+    elif account.backend == "telethon":
+        client = TelethonAccountClient(config, account)
+    else:
+        raise ValueError(f"Unsupported backend: {account.backend}")
+    client.lock_wait_timeout = lock_wait_timeout
+    return client
 
 
 DEFAULT_REACTION_EMOJIS = [

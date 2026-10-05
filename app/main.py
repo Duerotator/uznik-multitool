@@ -14,6 +14,8 @@ def main() -> int:
     from core.config import AppConfig
     from core.diagnostics import install_global_exception_handler
     from core.logging_setup import configure_logging
+    from core.desktop_identity import initialize_desktop_identity
+    initialize_desktop_identity()  # Before importing Qt / creating any windows.
     config = AppConfig.load(root / ".env")
     configure_logging(config)
     install_global_exception_handler()

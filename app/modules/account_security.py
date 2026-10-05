@@ -9,7 +9,7 @@ from core.config import AppConfig
 from core.models import AccountRecord
 from core.results import ActionResult
 from core.storage import update_json
-from core.telegram_client import create_client
+from core.telegram_client import AccountBusyError, create_client
 from core.ui_progress import OperationProgress
 from modules.accounts import AccountService
 from modules.email_inbox import create_email_inbox
@@ -18,6 +18,7 @@ from utils.rate_limit import human_delay
 from utils.telegram_errors import is_invalid_auth_error, short_error
 
 EMAIL_OPERATION_OVERHEAD = 90.0
+EMAIL_SESSION_WAIT_TIMEOUT = 30.0
 
 def passkey_restore_candidates(accounts: list[AccountRecord]) -> list[AccountRecord]:
     """Only narrow the caller's scope; never discover accounts in other groups."""
@@ -48,7 +49,7 @@ def _security_error(exc: BaseException) -> str:
 
 
 def _is_transient_network_error(exc: BaseException) -> bool:
-    if isinstance(exc, MailboxError):
+    if isinstance(exc, (MailboxError, AccountBusyError)):
         return False
     text = f"{exc.__class__.__name__}: {exc}".lower()
     if "no email code received" in text:
@@ -411,7 +412,7 @@ class AccountSecurityService:
                     async def operation() -> None:
                         await inbox.prepare(email)
                         self.log.info("%s: mailbox ready; connecting to Telegram for recovery email", account.id)
-                        async with create_client(self.config, account) as client:
+                        async with create_client(self.config, account, lock_wait_timeout=EMAIL_SESSION_WAIT_TIMEOUT) as client:
                             await client.set_recovery_email(
                                 email=email,
                                 code_provider=code_provider,
@@ -436,7 +437,8 @@ class AccountSecurityService:
                     if progress:
                         progress.mark_error(account.id)
                     disable = is_invalid_auth_error(exc)
-                    self.accounts.mark_error(account.id, error, disable=disable)
+                    if not isinstance(exc, AccountBusyError):
+                        self.accounts.mark_error(account.id, error, disable=disable)
                     self.log.error("Recovery email failed for %s: %s", account.id, error)
 
         await asyncio.gather(*(worker(account) for account in accounts if account.enabled))
@@ -478,7 +480,7 @@ class AccountSecurityService:
                     async def operation() -> None:
                         await inbox.prepare(email)
                         self.log.info("%s: mailbox ready; connecting to Telegram for login email", account.id)
-                        async with create_client(self.config, account) as client:
+                        async with create_client(self.config, account, lock_wait_timeout=EMAIL_SESSION_WAIT_TIMEOUT) as client:
                             await client.set_login_email(email=email, code_provider=code_provider)
 
                     await _run_email_operation(operation, code_timeout)
@@ -506,7 +508,8 @@ class AccountSecurityService:
                     if progress:
                         progress.mark_error(account.id)
                     disable = is_invalid_auth_error(exc)
-                    self.accounts.mark_error(account.id, error, disable=disable)
+                    if not isinstance(exc, AccountBusyError):
+                        self.accounts.mark_error(account.id, error, disable=disable)
                     self.log.error("Login email failed for %s: %s", account.id, error)
 
         await asyncio.gather(*(worker(account) for account in accounts if account.enabled))
