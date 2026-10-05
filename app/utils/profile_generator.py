@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import random
 import re
 import shutil
@@ -8,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from core.models import AccountRecord
+from core.private_storage import write_private_json
 
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
@@ -97,11 +97,7 @@ def write_profile_plan(
     used_avatars: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     plan = generate_profile_plan(accounts, avatar_root, seed=seed, used_avatars=used_avatars)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(
-        json.dumps({"profiles": plan}, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    write_private_json(output_path, {"profiles": plan})
     return plan
 
 

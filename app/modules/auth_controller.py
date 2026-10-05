@@ -143,7 +143,7 @@ class AuthManager:
             if not isinstance(exc, Exception):
                 raise
             err = str(connection_error(proxy_url)) if is_connection_error(exc) else short_error(exc)
-            logger.error("send_code failed for %s: %s", phone, err)
+            logger.error("send_code failed (%s)", type(exc).__name__)
             return {"ok": False, "error": err}
 
     async def sign_in(self, phone: str, phone_code_hash: str, code: str) -> dict[str, Any]:
@@ -165,7 +165,7 @@ class AuthManager:
         except FloodWait as exc:
             return {"ok": False, "error": f"Flood wait {exc.value}s", "wait": exc.value}
         except Exception as exc:
-            logger.exception("sign_in failed for %s", phone)
+            logger.error("sign_in failed (%s)", type(exc).__name__)
             return {"ok": False, "error": str(connection_error(auth.proxy_url)) if is_connection_error(exc) else short_error(exc)}
 
     async def check_password(self, phone: str, password: str) -> dict[str, Any]:

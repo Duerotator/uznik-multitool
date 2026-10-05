@@ -33,6 +33,9 @@ Runner запускает `unittest`: границы desktop-пакета, от�
 
 `test_security_privacy.py` — отсутствие API-ключей и текстов ответов в ошибках
 Webshare, корректное распознавание hostname источника прокси. Только fake HTTP:
+Также проверяет защищённый план, миграцию JSON, потерю ключа, подмену содержимого
+и отсутствие телефона в ошибках входа; Windows DPAPI вызывается локально,
+без Telegram или пользовательских данных.
 
 ```powershell
 .\.venv\Scripts\python.exe -m unittest discover -s tests -p test_security_privacy.py -v

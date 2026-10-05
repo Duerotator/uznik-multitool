@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import random
 from dataclasses import dataclass
@@ -256,13 +255,17 @@ class ProfileCustomizer:
         return self.load_lines(path) if path.exists() else None
 
     def load_profile_plan(self, path: Path) -> list[dict[str, Any]]:
-        raw = json.loads(path.read_text(encoding="utf-8"))
+        from core.private_storage import read_private_json, write_private_json
+
+        raw, encrypted = read_private_json(path)
         if isinstance(raw, dict):
             profiles = raw.get("profiles", [])
         else:
             profiles = raw
         if not isinstance(profiles, list):
             raise ValueError("Profile plan must contain a list named 'profiles'.")
+        if not encrypted:
+            write_private_json(path, raw)
         return [item for item in profiles if isinstance(item, dict)]
 
     def _pick(self, values: list[str | None] | None, index: int) -> str | None:

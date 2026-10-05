@@ -123,14 +123,14 @@ class ForeignSessionOnboarding:
         legacy: Any = None
         try:
             try:
-                log.info("external session %s: opening supplied session", source.name)
+                log.info("external session: opening supplied session")
                 legacy = await self._open_legacy_copy(source, backend)
                 me = await legacy["get_me"]()
                 result.phone = str(getattr(me, "phone_number", "") or result.phone)
             except Exception as exc:
                 # A filename phone can still be used. Keep processing the queue,
                 # but the code cannot be read automatically without this session.
-                log.warning("external session %s: could not open supplied session: %s", source.name, exc)
+                log.warning("external session: could not open supplied session (%s)", type(exc).__name__)
                 await self._close_legacy(legacy)
                 legacy = None
             if not result.phone:
@@ -139,13 +139,13 @@ class ForeignSessionOnboarding:
                 return result
 
             known_message_ids = await self._recent_service_message_ids(legacy)
-            log.info("external session %s: requesting login code for %s", source.name, result.phone)
+            log.info("external session: requesting login code")
             sent = await self.auth.send_code(result.phone)
             if not sent.get("ok"):
                 result.error = str(sent.get("error", "Could not send login code."))
                 return result
 
-            log.info("external session %s: waiting for a fresh 777000 code", source.name)
+            log.info("external session: waiting for a fresh 777000 code")
             code = await self._read_recent_code(legacy, known_message_ids)
             if not code and code_provider:
                 code = await code_provider(result.phone, source)

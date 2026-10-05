@@ -1176,13 +1176,7 @@ async def _apply_profile(
         try:
             year = source.birthday.get("year")
             await client.set_birthday(source.birthday["day"], source.birthday["month"], year=year)
-            log.info(
-                "%s: birthday %d.%d%s",
-                acc.id,
-                source.birthday["day"],
-                source.birthday["month"],
-                f".{year}" if year else "",
-            )
+            log.info("Birthday applied")
             await human_delay(1.0, 2.0)
         except Exception as exc:
             log.warning("%s birthday: %s", acc.id, short_error(exc))

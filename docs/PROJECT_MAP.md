@@ -19,6 +19,8 @@
   `imports/auth_input/` — очередь новой авторизации; `imports/` — обычный импорт.
 - `assets/branding/uznik-multitool.ico` — иконка ярлыка и окна приложения.
 - `app/core/` — конфигурация, клиенты MTProto, сессии, хранение, задачи и UI-контракты.
+- `app/core/private_storage.py` — шифрование плана профилей и DPAPI-ключ;
+  `profile_customizer.load_profile_plan` — загрузка и миграция старых JSON.
 - `app/modules/accounts.py`, `session_*.py`, `account_security.py`, `direct_access.py`
   — аккаунты, импорт, проверка, безопасность и Telegram Web.
 - `app/modules/email_inbox.py`, `email_mailbox.py`, `imports/emails/README.md`
