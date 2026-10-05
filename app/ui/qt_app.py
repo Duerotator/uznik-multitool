@@ -2362,6 +2362,8 @@ class QtDesktopApp(QMainWindow):
                 )
             task_id = self.tasks.start(name, factory)
             task = self.tasks.tasks[task_id]
+            # Queue Started before a fast validation failure can queue Failed.
+            self.signals.task_started.emit(name, task_id, None, task_group)
 
             async def watch() -> None:
                 try:
@@ -2382,7 +2384,7 @@ class QtDesktopApp(QMainWindow):
 
         self.worker.submit(
             starter(),
-            lambda result, error: self.signals.task_started.emit(name, result, error, task_group),
+            lambda result, error: self.signals.task_started.emit(name, result, error, task_group) if error else None,
         )
 
     def task_started(
@@ -2461,6 +2463,10 @@ class QtDesktopApp(QMainWindow):
         self.clear_progress()
         self._set_status_pill(self.task_pill, "Task: failed", "bad")
         self.ui_log.error("[%s] %s failed: %s", group, name, error)
+        summary = error.strip().splitlines()[-1] if error.strip() else "Unknown error"
+        self.log(f"{name} failed: {summary}", group=group, severity="error")
+        if name in {"change-login-email", "bind-recovery-email"}:
+            QMessageBox.warning(self, "Email operation failed", summary)
 
     def task_stopped(self, name: str, group: str) -> None:
         if name == "process-external-sessions":
@@ -3814,9 +3820,10 @@ class QtDesktopApp(QMainWindow):
         config = replace(self.config, email_inbox_backend=str(self.email_backend_combo.currentData()),
                          email_mailboxes_file=Path(path).resolve() if path else None)
         try:
-            email_setup_description(config)
+            email_setup_description(config, validate_list=True)
         except RuntimeError as exc:
             self.log(str(exc))
+            QMessageBox.warning(self, "Email settings", str(exc))
             return None
         return config
 

@@ -34,7 +34,7 @@ async def login_phone(config, phone: str) -> dict:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Create and import your own Telegram session through your verified proxy.")
+    parser = argparse.ArgumentParser(description="Create and import your own Telegram session, directly or through your configured proxy.")
     parser.add_argument("--phone", help="Your phone in international format; prompted if omitted.")
     args = parser.parse_args()
     os.chdir(ROOT)

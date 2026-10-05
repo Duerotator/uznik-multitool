@@ -73,6 +73,14 @@ class MailboxParsingTests(unittest.TestCase):
         box = self.parse("owner@firstmail.example:secret", host="mail.example.org", port=1993)[0]
         self.assertEqual(("mail.example.org", 1993), (box.host, box.port))
 
+    def test_missing_custom_server_names_line_and_setting_without_credentials(self):
+        with self.assertRaises(MailboxError) as caught:
+            self.parse("# mailboxes\nowner@unknown.org:private-password")
+        self.assertIn("line 2", str(caught.exception))
+        self.assertIn("EMAIL_MAILBOX_HOST", str(caught.exception))
+        self.assertNotIn("private-password", str(caught.exception))
+        self.assertNotIn("owner@", str(caught.exception))
+
     def test_duplicate_identical_entries_are_deduplicated(self):
         self.assertEqual(1, len(self.parse("reader@mail.ru:secret\nreader@mail.ru:secret")))
 
@@ -281,6 +289,32 @@ class MailboxProtocolTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(asyncio.CancelledError):
                 await task
 
+    async def test_prepare_bounds_a_blocked_worker_and_keeps_snapshot_unset(self):
+        inbox = self.client(socket_timeout=0.01)
+        def blocked(*args):
+            time.sleep(0.12)
+            return (7, 100)
+        with patch.object(inbox, "_snapshot", side_effect=blocked):
+            started = time.monotonic()
+            with self.assertRaisesRegex(MailboxError, "connection failed or timed out"):
+                await inbox.prepare(ADDRESS)
+            self.assertLess(time.monotonic() - started, 0.1)
+            await asyncio.sleep(0.14)
+        self.assertNotIn(ADDRESS, inbox.snapshots)
+
+    async def test_poll_wait_is_bounded_even_if_socket_worker_is_blocked(self):
+        inbox = self.client()
+        inbox.snapshots[ADDRESS] = (7, 100)
+        def blocked(*args):
+            time.sleep(0.2)
+            return "123456"
+        with patch.object(inbox, "_poll", side_effect=blocked):
+            started = time.monotonic()
+            with self.assertRaisesRegex(TimeoutError, "No email code received"):
+                await inbox.wait_code(ADDRESS, 0, 6)
+            self.assertLess(time.monotonic() - started, 0.18)
+            await asyncio.sleep(0.15)
+
 
 class EmailFactoryTests(unittest.TestCase):
     def test_http_backend_keeps_existing_api_contract(self):
@@ -305,6 +339,42 @@ class EmailFactoryTests(unittest.TestCase):
 
 
 class EmailSecurityFlowTests(unittest.IsolatedAsyncioTestCase):
+    async def test_telegram_stall_times_out_and_marks_account_error_for_both_actions(self):
+        from modules.account_security import AccountSecurityService
+        for method, telegram_method in (("change_login_emails", "set_login_email"),
+                                        ("bind_recovery_emails", "set_recovery_email")):
+            with self.subTest(method=method):
+                inbox = Mock(healthcheck=AsyncMock(), prepare=AsyncMock())
+                inbox.address_for.return_value = ADDRESS
+                async def hang(**kwargs):
+                    await asyncio.Event().wait()
+                native = SimpleNamespace(**{telegram_method: hang})
+                closed = Mock()
+                @asynccontextmanager
+                async def create(*args):
+                    try:
+                        yield native
+                    finally:
+                        closed()
+                service = AccountSecurityService.__new__(AccountSecurityService)
+                service.config = SimpleNamespace(email_inbox_backend="imap", max_concurrency=1, min_action_delay=0, max_action_delay=0)
+                service.accounts, service.log = Mock(), logging.getLogger("security-test")
+                service._email_inbox = Mock(return_value=inbox)
+                progress = Mock()
+                with patch("modules.account_security.create_client", create), patch("modules.account_security.human_delay", AsyncMock()), patch("modules.account_security.EMAIL_OPERATION_OVERHEAD", 0):
+                    result = await getattr(service, method)([SimpleNamespace(id="a", enabled=True)], "", "", "", code_timeout=0.02, progress=progress)
+                self.assertIn("Email operation timed out", result.details["a"])
+                progress.mark_error.assert_called_once_with("a")
+                service.accounts.update_profile_metadata.assert_not_called()
+                closed.assert_called_once()
+
+    async def test_mailbox_timeout_is_terminal_not_retried(self):
+        from modules.account_security import _with_network_retries
+        operation = AsyncMock(side_effect=MailboxError("IMAP connection failed or timed out"))
+        with self.assertRaises(MailboxError):
+            await _with_network_retries(operation, base_delay=0)
+        operation.assert_awaited_once()
+
     async def test_mailbox_prepared_before_both_telegram_requests_and_metadata_saved(self):
         from modules.account_security import AccountSecurityService
         for method, telegram_method, metadata_key in (("change_login_emails", "set_login_email", "login_email"),

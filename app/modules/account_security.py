@@ -13,9 +13,11 @@ from core.telegram_client import create_client
 from core.ui_progress import OperationProgress
 from modules.accounts import AccountService
 from modules.email_inbox import create_email_inbox
+from modules.email_mailbox import MailboxError
 from utils.rate_limit import human_delay
 from utils.telegram_errors import is_invalid_auth_error, short_error
 
+EMAIL_OPERATION_OVERHEAD = 90.0
 
 def passkey_restore_candidates(accounts: list[AccountRecord]) -> list[AccountRecord]:
     """Only narrow the caller's scope; never discover accounts in other groups."""
@@ -46,6 +48,8 @@ def _security_error(exc: BaseException) -> str:
 
 
 def _is_transient_network_error(exc: BaseException) -> bool:
+    if isinstance(exc, MailboxError):
+        return False
     text = f"{exc.__class__.__name__}: {exc}".lower()
     if "no email code received" in text:
         return False
@@ -69,7 +73,22 @@ async def _with_network_retries(operation, *, attempts: int = 3, base_delay: flo
         except Exception as exc:
             if not _is_transient_network_error(exc) or attempt == attempts - 1:
                 raise
+            logging.getLogger("security").warning(
+                "Network operation failed (%s); retry %s/%s in %.0fs",
+                type(exc).__name__, attempt + 2, attempts, base_delay * (attempt + 1),
+            )
             await asyncio.sleep(base_delay * (attempt + 1))
+
+
+async def _run_email_operation(operation, code_timeout: float):
+    try:
+        return await asyncio.wait_for(
+            _with_network_retries(operation), timeout=code_timeout + EMAIL_OPERATION_OVERHEAD
+        )
+    except TimeoutError as exc:
+        if not str(exc):
+            raise TimeoutError("Email operation timed out. Check the last mailbox/Telegram stage in the log.") from None
+        raise
 
 
 class AccountSecurityService:
@@ -380,7 +399,10 @@ class AccountSecurityService:
                     # HTTP uses unique aliases and a clock-skew allowance;
                     # IMAP/POP3 exclude old mail using a pre-request snapshot.
                     overlap = 60 if getattr(self.config, "email_inbox_backend", "http") == "http" else 0
-                    return await inbox.wait_code(target_email, after=max(0, started_at - overlap), length=length)
+                    self.log.info("%s: waiting for recovery email code (up to %.0fs)", account.id, code_timeout)
+                    code = await inbox.wait_code(target_email, after=max(0, started_at - overlap), length=length)
+                    self.log.info("%s: recovery email code received; confirming with Telegram", account.id)
+                    return code
 
                 try:
                     email = inbox.address_for(account.id)
@@ -388,6 +410,7 @@ class AccountSecurityService:
 
                     async def operation() -> None:
                         await inbox.prepare(email)
+                        self.log.info("%s: mailbox ready; connecting to Telegram for recovery email", account.id)
                         async with create_client(self.config, account) as client:
                             await client.set_recovery_email(
                                 email=email,
@@ -397,7 +420,7 @@ class AccountSecurityService:
                                 current_password=current_password or None,
                             )
 
-                    await _with_network_retries(operation)
+                    await _run_email_operation(operation, code_timeout)
                     self.accounts.update_profile_metadata(
                         account.id,
                         {"recovery_email": email, "recovery_email_bound_at": str(started_at)},
@@ -443,7 +466,10 @@ class AccountSecurityService:
                     # HTTP uses unique aliases and a clock-skew allowance;
                     # IMAP/POP3 exclude old mail using a pre-request snapshot.
                     overlap = 60 if getattr(self.config, "email_inbox_backend", "http") == "http" else 0
-                    return await inbox.wait_code(target_email, after=max(0, started_at - overlap), length=length)
+                    self.log.info("%s: waiting for login email code (up to %.0fs)", account.id, code_timeout)
+                    code = await inbox.wait_code(target_email, after=max(0, started_at - overlap), length=length)
+                    self.log.info("%s: login email code received; confirming with Telegram", account.id)
+                    return code
 
                 try:
                     email = inbox.address_for(account.id)
@@ -451,10 +477,11 @@ class AccountSecurityService:
 
                     async def operation() -> None:
                         await inbox.prepare(email)
+                        self.log.info("%s: mailbox ready; connecting to Telegram for login email", account.id)
                         async with create_client(self.config, account) as client:
                             await client.set_login_email(email=email, code_provider=code_provider)
 
-                    await _with_network_retries(operation)
+                    await _run_email_operation(operation, code_timeout)
                     self.accounts.update_profile_metadata(
                         account.id,
                         {

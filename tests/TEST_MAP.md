@@ -24,7 +24,10 @@ smoke проверяет полные подписи всех секций пр�
 
 Почтовые коды: `test_email_mailbox.py` — форматы списка, уникальные закрепления,
 свежие UID/UIDL, MIME/HTML, TLS, read-only IMAP/POP3, таймауты и порядок операций
-в login/recovery email. Только fake-серверы, без настоящих ящиков и Telegram.
+в login/recovery email, зависший IMAP/POP3 worker, общий дедлайн смены email
+и понятные ошибки отсутствующего сервера. `test_sidebar_layout.py` проверяет
+локальную валидацию списка в GUI и порядок Started → Failed для быстрых ошибок.
+Только fake-серверы, без настоящих ящиков и Telegram.
 
 ```powershell
 .\.venv\Scripts\python.exe -m unittest discover -s tests -p test_email_mailbox.py -v

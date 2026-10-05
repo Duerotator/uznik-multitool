@@ -78,6 +78,12 @@ def load_mailboxes(path: Path, protocol: str, *, host: str = "", port: int = 0,
                         "mail.ru": "mail.ru"}.get(domain)
             if not server and provider:
                 server = ("imap." if protocol == "imap" else "pop.") + provider
+            if not server:
+                raise MailboxError(
+                    f"Mailbox line {number}: mail server is not specified for this provider. "
+                    "Set EMAIL_MAILBOX_HOST in .env, or use email:password;host;port in the selected list. "
+                    "Entry contents are hidden."
+                )
             if not re.fullmatch(r"[A-Za-z0-9.-]+", server) or not data["password"]:
                 raise ValueError
             if (protocol == "pop3" and server.startswith("imap.")) or (protocol == "imap" and server.startswith(("pop.", "pop3."))):
@@ -278,8 +284,19 @@ class MailboxInboxClient:
             return (int(validity[0]), int(next_uid[0]) - 1)
 
     async def prepare(self, email: str) -> None:
-        self.snapshots[email] = await asyncio.to_thread(
-            self._snapshot, self.pool.boxes[email], time.monotonic() + self.socket_timeout * 3)
+        box = self.pool.boxes[email]
+        budget = self.socket_timeout * 3
+        log.info("Checking %s mailbox at %s:%s (up to %.0fs)", self.protocol.upper(), box.host, box.port, budget)
+        try:
+            snapshot = await asyncio.wait_for(asyncio.to_thread(
+                self._snapshot, box, time.monotonic() + budget), timeout=budget)
+        except (TimeoutError, OSError):
+            raise MailboxError(
+                f"{self.protocol.upper()} mailbox connection failed or timed out. "
+                "Check EMAIL_MAILBOX_HOST/PORT, network access and mail client permissions."
+            ) from None
+        self.snapshots[email] = snapshot
+        log.info("%s mailbox authenticated; fresh-message snapshot ready", self.protocol.upper())
 
     def _poll(self, box: Mailbox, after: int, length: int | None, deadline: float) -> str | None:
         baseline = self.snapshots[box.email]
@@ -322,10 +339,14 @@ class MailboxInboxClient:
             raise MailboxError("Mailbox must be prepared before requesting the Telegram code.")
         deadline = time.monotonic() + self.timeout
         attempts = 0
+        log.info("Waiting for a fresh %s email code (up to %.0fs)", self.protocol.upper(), self.timeout)
         while time.monotonic() < deadline:
             attempts += 1
             try:
-                code = await asyncio.to_thread(self._poll, self.pool.boxes[email], after, length, deadline)
+                code = await asyncio.wait_for(
+                    asyncio.to_thread(self._poll, self.pool.boxes[email], after, length, deadline),
+                    timeout=max(0.01, deadline - time.monotonic()),
+                )
                 if code:
                     return code
             except OSError as exc:

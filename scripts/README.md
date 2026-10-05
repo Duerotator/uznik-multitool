@@ -7,11 +7,11 @@
 Диагностика и пересоздание ярлыка — `windows/start_debug.bat` и
 `windows/create_shortcut.bat`. Код backend расположен в `app/`, зависимости —
 `config/requirements.txt`.
-Для команд ниже используется `.venv\\Scripts\\python.exe`.
+Для команд ниже используется `.venv\Scripts\python.exe`.
 
 | Папка / утилита | Назначение |
 | --- | --- |
-| sessions/create_session.py | Ручной вход по своему номеру, новый локальный клиент с fingerprint и проверенным прокси |
+| sessions/create_session.py | Ручной вход по своему номеру; fingerprint, свой прокси / проверенный пул либо прямое подключение |
 | sessions/menu.py | Меню создания сессий и открытия папок `imports/auth_input/` и `sessions/` |
 | sessions/batch_create_sessions.py | Последовательный вход по списку номеров из `sessions/batch_phones.txt`; коды/2FA вводятся вручную |
 | sessions/process_auth_input.py | Новая авторизация из очереди .session; пробует автоматически прочитать свежий код через исходную сессию |
@@ -39,7 +39,8 @@
 ```
 
 У cleanup и security без `--execute` изменения не выполняются.
-Cleanup даже в dry-run **читает Telegram**, поэтому нужны свои ключи и прокси;
+Cleanup даже в dry-run **читает Telegram**, поэтому нужны свои ключи и доступ
+к Telegram (прямой или через настроенный прокси);
 предпросмотр остальных утилит без `--execute` выполняется локально.
 `--group inbox` означает весь список приложения, а не только группу без имени.
 Не запускайте очистку, пока не убедились в выбранных аккаунтах.

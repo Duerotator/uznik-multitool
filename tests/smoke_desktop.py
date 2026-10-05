@@ -71,8 +71,13 @@ def main() -> int:
                         )
                         assert button.height() >= button.sizeHint().height(), button.text()
                         assert button.parentWidget().rect().contains(button.geometry()), button.text()
+            mailbox_list = config.import_dir / "emails/accounts.txt"
+            assert mailbox_list.is_file()
+            with patch("ui.qt_app.QMessageBox.warning") as warning:
+                assert window.email_task_config() is None  # Empty list fails before any task.
+                warning.assert_called_once()
+            mailbox_list.write_text("fixture@mail.ru:offline-password", encoding="utf-8")
             assert window.email_task_config().email_inbox_backend == "pop3"
-            assert (config.import_dir / "emails/accounts.txt").is_file()
             for selected in ([], ["first"], ["first", "second"]):
                 with patch.object(window, "selected_account_ids", return_value=selected):
                     window.update_header_status()

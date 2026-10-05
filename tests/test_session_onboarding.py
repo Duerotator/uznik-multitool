@@ -455,6 +455,20 @@ class DirectAccountClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("pool.invalid", proxy.hostname)
         self.assertEqual("socks5://pool.invalid:1080", self.account.proxy)
 
+    async def test_timed_out_operation_cannot_hang_forever_during_cleanup(self):
+        from core.telegram_client import PyrogramAccountClient
+        client = PyrogramAccountClient(self.config, self.account)
+        client.start = AsyncMock()
+        client.set_offline = AsyncMock()
+        async def hang():
+            await asyncio.Event().wait()
+        client.stop = AsyncMock(side_effect=hang)
+        with patch("core.telegram_client.CLEANUP_TIMEOUT", 0.01):
+            with self.assertRaisesRegex(TimeoutError, "request timed out"):
+                async with client:
+                    raise TimeoutError("request timed out")
+        self.assertFalse(client._lock.locked())
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -73,6 +73,18 @@ class RequirementsTests(unittest.TestCase):
             if not link.startswith(("https://", "http://", "#")):
                 self.assertTrue((ROOT / link).is_file(), link)
 
+    def test_all_readme_local_links_and_documented_tool_paths_exist(self):
+        readmes = [ROOT / "README.md", *ROOT.glob("*/README.md"), *ROOT.glob("*/*/README.md")]
+        self.assertGreaterEqual(len(readmes), 11)
+        for path in readmes:
+            content = path.read_text(encoding="utf-8")
+            for link in re.findall(r"\]\(([^)]+)\)", content):
+                if not link.startswith(("https://", "http://", "#")):
+                    self.assertTrue((path.parent / link.split("#", 1)[0]).is_file(), f"{path}: {link}")
+        tools = (ROOT / "scripts/README.md").read_text(encoding="utf-8")
+        for command in re.findall(r"^\| ([\w./-]+\.(?:py|ps1)) \|", tools, re.M):
+            self.assertTrue((ROOT / "scripts" / command).is_file(), command)
+
 
 class InstallationCheckTests(unittest.TestCase):
     def test_namespace_check_is_safe_before_packages_are_installed(self):

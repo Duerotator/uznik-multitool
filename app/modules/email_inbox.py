@@ -88,7 +88,8 @@ def generate_recovery_email(domain: str, account_id: str) -> str:
     return f"tg-{safe_id.lower()}-{secrets.token_hex(3)}@{domain.strip().lower()}"
 
 
-def email_setup_description(config, *, domain: str | None = None, api_url: str | None = None) -> str:
+def email_setup_description(config, *, domain: str | None = None, api_url: str | None = None,
+                            validate_list: bool = False) -> str:
     backend = getattr(config, "email_inbox_backend", "http").strip().lower()
     if backend == "http":
         if not (domain if domain is not None else config.email_domain).strip() or not (api_url if api_url is not None else config.email_inbox_api_url).strip():
@@ -99,6 +100,10 @@ def email_setup_description(config, *, domain: str | None = None, api_url: str |
     path = getattr(config, "email_mailboxes_file", None)
     if not path or not Path(path).is_file():
         raise RuntimeError("Select a mailbox list in Security, or set EMAIL_MAILBOXES_FILE.")
+    if validate_list:
+        from modules.email_mailbox import load_mailboxes
+        load_mailboxes(Path(path), backend, host=config.email_mailbox_host,
+                       port=config.email_mailbox_port, folder=config.email_mailbox_folder)
     return f"Assigns mailboxes from the selected list and reads fresh codes through {backend.upper()} over TLS."
 
 

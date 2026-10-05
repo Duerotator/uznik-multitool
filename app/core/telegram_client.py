@@ -84,7 +84,7 @@ class AccountClient(ABC):
         except BaseException as exc:
             get_proxy_diagnostics().trace_client_lifecycle(self.account.id, "client_start_failed", str(exc))
             try:
-                await self.stop()
+                await asyncio.wait_for(self.stop(), CLEANUP_TIMEOUT)
             except Exception as stop_exc:  # noqa: BLE001 - cleanup must not hide the start error
                 self.log.debug("Could not stop client after failed start: %s", stop_exc)
             finally:
@@ -101,8 +101,15 @@ class AccountClient(ABC):
             except Exception as offline_exc:  # noqa: BLE001 - cleanup must not hide task errors
                 self.log.debug("Could not force offline before stop: %s", offline_exc)
             finally:
-                await self.stop()
-                get_proxy_diagnostics().trace_client_lifecycle(self.account.id, "client_stopped", "ok")
+                try:
+                    await asyncio.wait_for(self.stop(), CLEANUP_TIMEOUT)
+                except Exception as stop_exc:
+                    get_proxy_diagnostics().trace_client_lifecycle(self.account.id, "client_cleanup_failed", type(stop_exc).__name__)
+                    if exc is None:
+                        raise
+                    self.log.warning("Client cleanup failed after task error (%s)", type(stop_exc).__name__)
+                else:
+                    get_proxy_diagnostics().trace_client_lifecycle(self.account.id, "client_stopped", "ok")
         finally:
             if self._lock and self._lock.locked():
                 self._lock.release()
