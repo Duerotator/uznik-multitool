@@ -62,6 +62,48 @@ class ScheduleTests(unittest.TestCase):
         self.assertEqual("UTC", other.get_timezone("b"))
         self.assertEqual("awake", other.state("unassigned"))
 
+    def test_atomic_update_with_same_mtime_and_size_refreshes_zones_and_settings(self):
+        self.scheduler.configure(["a"], timezone="UTC", start=23, end=7, enabled=True)
+        other = SleepScheduler(str(self.path))
+        before = self.path.stat()
+        self.scheduler.configure(["a"], timezone="GMT", start=22, end=8, enabled=True)
+        os.utime(self.path, ns=(before.st_atime_ns, before.st_mtime_ns))
+        self.assertEqual(before.st_mtime_ns, self.path.stat().st_mtime_ns)
+        self.assertEqual(before.st_size, self.path.stat().st_size)
+        self.assertEqual("GMT", other.get_timezone("a"))
+        self.assertEqual(22, other.settings["start"])
+        self.assertEqual(8, other.settings["end"])
+
+    def test_reload_does_not_mark_data_stale_during_read_as_current(self):
+        from core.storage import read_json, write_json_atomic
+        self.scheduler.configure(["a"], timezone="UTC", start=23, end=7, enabled=True)
+        other = SleepScheduler(str(self.path))
+        def replacing_read(path, default):
+            old_data = read_json(path, default)
+            write_json_atomic(path, {
+                "zones": {**old_data["zones"], "b": "GMT"},
+                "settings": {**old_data["settings"], "enabled": False},
+            })
+            return old_data
+        with patch("modules.sleep_scheduler.read_json", side_effect=replacing_read):
+            other._load()
+        self.assertEqual("GMT", other.get_timezone("b"))
+        self.assertFalse(other.settings["enabled"])
+
+    def test_removing_schedule_resets_disabled_settings_and_fails_closed(self):
+        self.scheduler.configure(["a"], timezone="UTC", start=23, end=7, enabled=False)
+        self.path.unlink()  # Only a fixture inside TemporaryDirectory.
+        self.assertEqual("unknown", self.scheduler.state("a"))
+        self.assertTrue(self.scheduler.is_sleeping("a"))
+        self.assertTrue(self.scheduler.settings["enabled"])
+
+    def test_unchanged_schedule_avoids_repeated_json_reads(self):
+        self.scheduler.assign_timezone("a")
+        with patch("modules.sleep_scheduler.read_json") as read:
+            self.assertEqual("UTC", self.scheduler.get_timezone("a"))
+            self.assertEqual("UTC", self.scheduler.get_timezone("a"))
+        read.assert_not_called()
+
     def test_missing_timezone_data_never_looks_awake(self):
         self.scheduler._zones["a"] = "invalid/fixture-zone"
         with self.assertLogs("sleep-scheduler", level="ERROR"):

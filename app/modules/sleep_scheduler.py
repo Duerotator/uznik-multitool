@@ -104,13 +104,27 @@ class SleepScheduler:
         self._load()
 
     def _load(self) -> None:
-        data = read_json(Path(self.storage_path), {})
+        path = Path(self.storage_path)
+        # Capture the version before reading: a replacement during the read must
+        # trigger another refresh, not mark older data as the newest version.
+        version = self._file_version(path)
+        data = read_json(path, {})
         zones = data.get("zones", data)
         self._zones = {str(k): str(v) for k, v in zones.items()}
+        self.settings = {"timezone": "UTC", "start": 1, "end": 7, "enabled": True}
         if "zones" in data:
             self.settings.update(data.get("settings", {}))
-        path = Path(self.storage_path)
-        self._version = path.stat().st_mtime_ns if path.exists() else None
+        self._version = version
+
+    @staticmethod
+    def _file_version(path: Path) -> tuple[int, int, int, int, int] | None:
+        try:
+            stat = path.stat()
+        except FileNotFoundError:
+            return None
+        # JSON writes use atomic replacement. File identity detects same-size
+        # replacements even when the filesystem preserves/coarsens mtime.
+        return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns
 
     def _save(self) -> None:
         def merge(data):
@@ -122,7 +136,7 @@ class SleepScheduler:
 
     def _refresh(self) -> None:
         path = Path(self.storage_path)
-        version = path.stat().st_mtime_ns if path.exists() else None
+        version = self._file_version(path)
         if version != self._version:
             self._load()
 
