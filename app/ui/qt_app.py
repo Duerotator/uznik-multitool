@@ -68,6 +68,8 @@ from modules.profile_customizer import ProfileCustomizer, ProfileUpdatePlan
 from modules.profile_snapshots import ProfileSnapshotService
 from modules.scenarios import Scenario, ScenarioStep, ScenarioStore
 from modules.session_health import SessionHealthService
+from modules.resumable_jobs import ResumableJobs
+from modules.local_backup import LocalBackup, RestoreRollbackError
 from modules.sleep_scheduler import SleepScheduler
 from modules.spamblock import SpamBlockService
 from modules.telegram_codes import TelegramCodeScanResult, TelegramCodeService
@@ -326,6 +328,8 @@ class QtDesktopApp(QMainWindow):
         self.proxy_total_count = 0
         self.current_progress: OperationProgress | None = None
         self.direct_access = DirectAccessService(config)
+        self.resumable_jobs = ResumableJobs(config)
+        self._restart_required = False
         self.external_sessions_running = False
         self._announced_external_sources: set[str] = set()
         self.settings = QSettings("UznikMultiTool", "Desktop")
@@ -456,6 +460,9 @@ class QtDesktopApp(QMainWindow):
 
         self.scenarios_section = self._add_section(sidebar_layout, "scenarios", "Scenarios")
         self._build_scenarios_section(self.scenarios_section.content_layout)
+
+        self.recovery_section = self._add_section(sidebar_layout, "recovery", "Tasks / Backups")
+        self._build_recovery_section(self.recovery_section.content_layout)
 
         sidebar_layout.addStretch(1)
 
@@ -1097,6 +1104,143 @@ class QtDesktopApp(QMainWindow):
             [("By added date", lambda: self.smart_group("added_date"), "primary")],
         )
         self._add_button_row(layout, [("By spamblock", lambda: self.smart_group("spamblock"), "secondary")])
+
+    def _build_recovery_section(self, layout: QVBoxLayout) -> None:
+        self._add_label(layout, "Interrupted batches keep their original account list. Completed accounts are skipped.")
+        self._add_button_row(layout, [("Resume batch…", self.resume_batch, "primary")])
+        self._add_label(layout, "Encrypted backups contain private sessions and settings. Keep the password separately.")
+        self._add_button_row(layout, [("Create backup…", self.create_backup, "secondary")])
+        self._add_button_row(layout, [("Restore backup…", self.restore_backup, "secondary")])
+
+    def start_resumable_batch(self, operation: str, accounts, *, options=None, job_id=None) -> None:
+        if self._restart_required:
+            self.log("Restart after restoring a backup before starting another batch.")
+            return
+        if self.foreground_task_busy() or self._task_start_pending:
+            self.log("Another task is running; stop it before starting or resuming a batch.")
+            return
+        group = self.resumable_jobs.get(job_id).get("group", self.active_group()) if job_id else self.active_group()
+        job_id = job_id or self.resumable_jobs.create(operation, accounts, group=group, options=options)
+        progress = self.begin_operation_progress(operation, accounts)
+        async def runner(stop):
+            bad_ids, frozen_ids = set(), set()
+            async def execute(name, account, saved_options):
+                if name != "check-sessions":
+                    return await self.resumable_jobs._execute(name, account, saved_options)
+                service = SessionHealthService(self.config)
+                outcome = await service.validate([account])
+                bad_ids.update(service.invalid_session_ids)
+                frozen_ids.update(service.frozen_session_ids)
+                return outcome
+            result = await self.resumable_jobs.run(job_id, stop, progress=progress, execute=execute)
+            if operation == "check-sessions":
+                self.signals.session_check_done.emit(result.ok, sorted(bad_ids), group)
+                if frozen_ids:
+                    self.accounts.delete_accounts(sorted(frozen_ids), delete_sessions=True)
+            self.signals.refresh_requested.emit()
+            return result
+        self.log(f"Saved batch {job_id[:8]}: {operation}, {len(accounts)} pending account(s).", group=group)
+        self.start_managed_task(operation, runner, task_group=group)
+
+    def resume_batch(self) -> None:
+        if self.foreground_task_busy() or self._task_start_pending:
+            self.log("Stop the current task before resuming a batch.")
+            return
+        jobs = self.resumable_jobs.incomplete()
+        if not jobs:
+            self.log("No interrupted or failed batches to resume.")
+            return
+        labels = [f"{j['operation']} · {len(self.resumable_jobs.pending_ids(j['id']))} pending · {j['created_at']} · {j['id'][:8]}" for j in jobs]
+        label, accepted = QInputDialog.getItem(self, "Resume batch", "Choose the saved batch:", labels, 0, False)
+        if not accepted:
+            return
+        job = jobs[labels.index(label)]
+        pending = set(self.resumable_jobs.pending_ids(job["id"]))
+        accounts = [a for a in self.accounts.list_accounts() if a.id in pending]
+        if not self.confirm("Resume saved batch?", f"Operation: {job['operation']}\nPending records: {len(pending)}\n"
+                            "Uses the saved account list and options, not current filters. Missing/disabled accounts are not replaced.\n"
+                            "Completed accounts are skipped. Failed/interrupted actions will be retried; some profile fields may be reapplied."):
+            return
+        self.start_resumable_batch(job["operation"], accounts, job_id=job["id"])
+
+    def _backup_password(self, *, creating: bool) -> str:
+        password = self.ask_text("Backup password", "Password (at least 10 characters). Without it the backup cannot be recovered.", password=True)
+        if password and creating:
+            repeated = self.ask_text("Confirm backup password", "Repeat the backup password:", password=True)
+            if password != repeated:
+                QMessageBox.warning(self, "Backup", "Passwords do not match.")
+                return ""
+        return password
+
+    def create_backup(self) -> None:
+        self._run_backup(restore=False)
+
+    def restore_backup(self) -> None:
+        self._run_backup(restore=True)
+
+    def _run_backup(self, *, restore: bool) -> None:
+        if self._restart_required:
+            self.log("Restart the application before another backup operation.")
+            return
+        if self.foreground_task_busy() or self._task_start_pending:
+            self.log("Stop the current task before working with backups.")
+            return
+        if restore:
+            path, _ = QFileDialog.getOpenFileName(self, "Restore Uznik backup", str(self.config.data_dir / "backups"), "Uznik backup (*.uzbk)")
+        else:
+            default = self.config.data_dir / "backups" / ("uznik-" + datetime.now().strftime("%Y%m%d-%H%M%S") + ".uzbk")
+            path, _ = QFileDialog.getSaveFileName(self, "Save encrypted backup", str(default), "Uznik backup (*.uzbk)")
+        if not path:
+            return
+        password = self._backup_password(creating=not restore)
+        if not password:
+            return
+        message = ("Restore verified files over current data? Extra current files are retained. A password-encrypted recovery copy is saved first.\n"
+                   "Close other application instances first. Telegram Web windows will close. Restart is required afterwards. DPAPI plans require the original Windows user."
+                   if restore else "Back up sessions, settings, imports, templates and avatars? The archive contains private data, including .env and mailboxes.\n"
+                   "Telegram Web windows will close; browser caches and logs are excluded. Never publish this backup.")
+        if not self.confirm("Restore backup?" if restore else "Create backup?", message):
+            return
+        self._backup_timer_states = [(timer, timer.isActive()) for timer in (self.import_timer, self.sleep_timer, self.proxy_dashboard_timer)]
+        for timer, _ in self._backup_timer_states:
+            timer.stop()
+        group = self.active_group()
+        async def runner(_stop):
+            await self.direct_access.close_all()
+            self.signals.log_message.emit("Verifying/restoring backup…" if restore else "Creating encrypted backup…", group)
+            service = LocalBackup(self.config)
+            # Disk transactions must finish/roll back before cancellation frees
+            # the foreground slot; do not leave a detached restore thread.
+            work = asyncio.create_task(asyncio.to_thread(service.restore if restore else service.create, Path(path), password))
+            try:
+                output = await asyncio.shield(work)
+            except RestoreRollbackError:
+                self._restart_required = True
+                raise
+            except asyncio.CancelledError:
+                try:
+                    output = await work
+                except RestoreRollbackError:
+                    self._restart_required = True
+                    raise
+                if restore:
+                    self._restart_required = True
+                    self.signals.log_message.emit(f"Restore completed during stop. Recovery copy: {output}. Restart the application now.", group)
+                raise
+            if restore:
+                self._restart_required = True
+            self.signals.log_message.emit(f"Backup verified/restored. Recovery copy: {output}. Restart the application now." if restore else f"Encrypted backup saved: {output}", group)
+            return "Restart required" if restore else "Backup complete"
+        self.start_managed_task("restore-backup" if restore else "create-backup", runner)
+
+    def _resume_backup_timers(self, name: str) -> None:
+        if name == "restore-backup" and self._restart_required:
+            self.centralWidget().setEnabled(False)
+            self.log("Restore requires a restart. Review its result in the log, then close Uznik before continuing.")
+        if name in {"restore-backup", "create-backup"} and not self._restart_required:
+            for timer, active in getattr(self, "_backup_timer_states", []):
+                if active:
+                    timer.start()
 
     def _add_section(self, layout: QVBoxLayout, key: str, title: str) -> Section:
         section = Section(key, title)
@@ -1778,6 +1922,9 @@ class QtDesktopApp(QMainWindow):
         self.refresh_accounts()
 
     def delete_selected_accounts(self) -> None:
+        if self.foreground_task_busy() or self._task_start_pending or self._restart_required:
+            self.log("Stop the current task (or restart after restore) before deleting accounts.")
+            return
         account_ids = self.selected_account_ids()
         if not account_ids:
             self.log("Select one or more accounts first.")
@@ -2444,6 +2591,9 @@ class QtDesktopApp(QMainWindow):
         factory: Callable[[asyncio.Event], Awaitable[object]],
         task_group: str | None = None,
     ) -> None:
+        if getattr(self, "_restart_required", False) is True:
+            self.log("Restart the application after restoring a backup before starting another task.")
+            return
         if self._task_start_pending is True or QtDesktopApp.foreground_task_busy(self):
             if name == "process-external-sessions":
                 self.external_sessions_running = False
@@ -2503,6 +2653,7 @@ class QtDesktopApp(QMainWindow):
     ) -> None:
         self._task_start_pending = False
         if error:
+            QtDesktopApp._resume_backup_timers(self, name)
             if name == "process-external-sessions":
                 self.external_sessions_running = False
             if not self.current_task_id:
@@ -2589,6 +2740,7 @@ class QtDesktopApp(QMainWindow):
         self._set_status_pill(self.task_pill, "Task: failed" if failed else "Task: idle", "bad" if failed else "ok")
 
     def task_failed(self, name: str, error: str, group: str, task_id: str = "") -> None:
+        QtDesktopApp._resume_backup_timers(self, name)
         QtDesktopApp.clear_task_state(self, task_id, failed=True)
         self.ui_log.error("[%s] %s failed: %s", group, name, error)
         summary = error.strip().splitlines()[-1] if error.strip() else "Unknown error"
@@ -2597,12 +2749,14 @@ class QtDesktopApp(QMainWindow):
             QMessageBox.warning(self, "Email operation failed", summary)
 
     def task_stopped(self, name: str, group: str, task_id: str = "") -> None:
+        QtDesktopApp._resume_backup_timers(self, name)
         if name == "process-external-sessions":
             self.external_sessions_running = False
         QtDesktopApp.clear_task_state(self, task_id)
         self.log(f"{name} stopped.", group=group)
 
     def task_finished(self, name: str, result: object, group: str, task_id: str = "") -> None:
+        QtDesktopApp._resume_backup_timers(self, name)
         if name == "process-external-sessions":
             self.external_sessions_running = False
         QtDesktopApp.clear_task_state(self, task_id)
@@ -3051,46 +3205,25 @@ class QtDesktopApp(QMainWindow):
         if not accounts:
             self.log("No accounts in selected group.")
             return
-        check_group = self.active_group()
-        service = SessionHealthService(self.config)
-
-        progress = self.begin_operation_progress("Check sessions", accounts)
-        async def runner(_stop: asyncio.Event) -> ActionResult:
-            result = await service.validate(accounts, progress=progress)
-            bad_ids = sorted(service.invalid_session_ids)
-            frozen_ids = sorted(service.frozen_session_ids)
-            self.signals.session_check_done.emit(result.ok, bad_ids, check_group)
-            if frozen_ids:
-                deleted = self.accounts.delete_accounts(frozen_ids, delete_sessions=True)
-                self.log(f"Deleting {deleted} frozen account(s): {frozen_ids}")
-            self.signals.refresh_requested.emit()
-            return result
-
         self.record_scenario_step(
             "session.check",
             "check sessions",
             {"group": self.active_group()},
         )
-        self.start_managed_task("check-sessions", runner)
+        self.start_resumable_batch("check-sessions", accounts)
 
     def check_spamblock(self) -> None:
         accounts = self.group_accounts()
         if not accounts:
             self.log("No enabled accounts in selected group.")
             return
-        service = SpamBlockService(self.config)
-
-        async def runner(_stop: asyncio.Event) -> ActionResult:
-            result = await service.check(accounts)
-            self.signals.refresh_requested.emit()
-            return result
 
         self.record_scenario_step(
             "session.spamblock",
             "check spamblock",
             {"group": self.active_group()},
         )
-        self.start_managed_task("check-spamblock", runner)
+        self.start_resumable_batch("check-spamblock", accounts)
 
     def check_account_age(self) -> None:
         accounts = self.group_accounts()
@@ -3563,11 +3696,6 @@ class QtDesktopApp(QMainWindow):
             "generate profile plan",
             {"group": self.active_group()},
         )
-        from modules.fingerprint_generator import FingerprintGenerator
-        fg = FingerprintGenerator()
-        for account in accounts:
-            fg.regenerate(account.id)
-        self.log(f"Fingerprints regenerated for {len(accounts)} account(s).")
         self.refresh_accounts()
 
     def download_avatar_pack(self) -> None:
@@ -3747,11 +3875,15 @@ class QtDesktopApp(QMainWindow):
             "apply profiles from local archive",
             {"group": self.active_group()},
         )
-        scraper = ProfileScraperService(self.config)
-        self.start_managed_task(
-            "apply-saved-profiles",
-            lambda _stop: scraper.apply_saved_profiles(accounts, on_log=self.log),
-        )
+        from modules.story_publication import StoryPublicationStore
+        receipts = StoryPublicationStore(self.config.data_dir)
+        legacy = any(int((a.metadata or {}).get("stories_uploaded", 0) or 0) > 0 and not receipts.has_receipts(a.id) for a in accounts)
+        accept_legacy = False
+        if legacy:
+            accept_legacy = self.confirm("Legacy story counters", "Some accounts have old counters without per-media receipts.\n"
+                                         "Confirm ONLY if their first N archived stories were published in archive order.\n"
+                                         "Otherwise choose No: those accounts will stop with an explicit reconciliation error rather than risk duplicates.")
+        self.start_resumable_batch("apply-saved-profiles", accounts, options={"accept_legacy_stories": accept_legacy})
 
     def rollback_profile_snapshot(self) -> None:
         accounts = self.group_accounts()
@@ -4172,6 +4304,10 @@ class QtDesktopApp(QMainWindow):
         self.refresh_accounts()
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        if self.current_task_name in {"create-backup", "restore-backup"}:
+            QMessageBox.warning(self, "Backup in progress", "Wait for the disk transaction to finish before closing the application.")
+            event.ignore()
+            return
         self.settings.setValue("geometry", self.saveGeometry())
         self.settings.setValue("active_group", self.active_group())
         self.settings.setValue("table_widths", [self.table.columnWidth(i) for i in range(self.table_model.columnCount())])

@@ -108,6 +108,8 @@ class AuthManager:
             system_version=fp["system_version"],
             app_version=fp["app_version"],
             lang_code=fp["lang_code"],
+            system_lang_code=fp.get("system_lang_code", fp["lang_code"]),
+            lang_pack=fp.get("lang_pack", "android"),
             proxy=proxy_dict,
             in_memory=True,
             no_updates=True,

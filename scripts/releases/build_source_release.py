@@ -30,7 +30,7 @@ def validate_path(name: str) -> None:
     if lower == "config/.env.example":
         return
     if (basename.startswith(".env") or re.search(r"\.(session|sqlite|db)", lower)
-            or path.suffix.lower() in {".log", ".pem", ".key", ".p12", ".ovpn"}
+            or path.suffix.lower() in {".log", ".pem", ".key", ".p12", ".ovpn", ".uzbk"}
             or basename in {"batch_phones.txt", "промт.txt"}
             or path.parts[0] in {".venv", "venv", "dist", "build", ".git"}):
         raise ValueError(f"Sensitive/runtime file tracked in Git: {name}")

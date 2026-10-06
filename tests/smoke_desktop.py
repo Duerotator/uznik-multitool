@@ -65,9 +65,16 @@ def main() -> int:
             app.processEvents()
             assert window.actions_section.content.isVisible()
             assert not window.warmup_section.content.isVisible()
+            window.recovery_section.button.click()
+            app.processEvents()
+            assert window.recovery_section.content.isVisible()
+            assert not window.actions_section.content.isVisible()
+            recovery_buttons = {button.text() for button in window.recovery_section.findChildren(QPushButton)}
+            assert {"Resume batch…", "Create backup…", "Restore backup…"} <= recovery_buttons
+            window.resume_batch()  # Empty store does not connect or run a task.
             for section in (window.actions_section, window.warmup_section, window.giveaway_section,
                             window.profile_section, window.security_section,
-                            window.passkeys_section, window.scenarios_section):
+                            window.passkeys_section, window.scenarios_section, window.recovery_section):
                 section.set_open(True)
             for width, height in ((1460, 860), (1080, 680)):
                 window.resize(width, height)

@@ -59,7 +59,7 @@ class SourceReleaseTests(unittest.TestCase):
             validate_path(name)
 
     def test_private_paths_and_traversal_are_refused(self):
-        for name in (".env", "source.session", "source.session-journal", "private.key",
+        for name in (".env", "source.session", "source.session-journal", "private.key", "private.uzbk",
                      "data/accounts.json", "sessions/batch_phones.txt", "templates/bios.txt",
                      "../outside.txt", "/outside.txt", "C:/outside.txt", "bad\\path"):
             with self.subTest(name=name), self.assertRaises(ValueError):

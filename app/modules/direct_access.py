@@ -61,6 +61,11 @@ class DirectAccessService:
         self._contexts: dict[str, object] = {}
         self._authenticated: set[str] = set()
         self._locks: dict[str, asyncio.Lock] = {}
+        self._loop = None
+        self._removed: set[str] = set()
+        self._open_tasks: dict[str, asyncio.Task] = {}
+        from modules.account_cleanup import register_browser_service
+        register_browser_service(config.data_dir, self)
 
     def _lock_for(self, account_id: str) -> asyncio.Lock:
         return self._locks.setdefault(account_id, asyncio.Lock())
@@ -125,7 +130,19 @@ class DirectAccessService:
         return DirectAccessResult(account.id, detail)
 
     async def open_account(self, account: AccountRecord) -> DirectAccessResult:
+        task = asyncio.current_task()
+        self._open_tasks[account.id] = task
+        try:
+            return await self._open_account(account)
+        finally:
+            if self._open_tasks.get(account.id) is task:
+                self._open_tasks.pop(account.id, None)
+
+    async def _open_account(self, account: AccountRecord) -> DirectAccessResult:
         """Show Telegram Web and authorize it with ``account`` when needed."""
+        self._loop = asyncio.get_running_loop()
+        if account.id in self._removed:
+            raise RuntimeError("Account has been deleted")
         async with self._lock_for(account.id):
             context = self._contexts.get(account.id)
             if context is not None:
@@ -163,7 +180,7 @@ class DirectAccessService:
                 page = await self._navigate_to_web(context, page)
                 await page.bring_to_front()
                 return await self._authenticate_page(account, context, page)
-            except Exception:
+            except BaseException:
                 await self._discard_context(account.id, context)
                 raise
 
@@ -174,6 +191,34 @@ class DirectAccessService:
             await context.close()
         except Exception:
             pass
+
+    def account_removed(self, account_id: str) -> bool:
+        self._removed.add(account_id)
+        context = self._contexts.get(account_id)
+        task = self._open_tasks.get(account_id)
+        if context is None and task is None:
+            return False
+        if self._loop is None or not self._loop.is_running():
+            raise RuntimeError("Close the Telegram Web window before deleting this account")
+        async def close_removed():
+            if task is not None and not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            context = self._contexts.get(account_id)
+            if context is not None:
+                await context.close()
+            self._contexts.pop(account_id, None)
+            self._authenticated.discard(account_id)
+            from modules.account_cleanup import remove_browser_profile
+            remove_browser_profile(self.config.data_dir, account_id)
+        future = asyncio.run_coroutine_threadsafe(close_removed(), self._loop)
+        def completed(result):
+            try:
+                result.result()
+            except Exception:
+                self.log.exception("Could not close/remove deleted account browser profile")
+        future.add_done_callback(completed)
+        return True
 
     def _context_closed(self, account_id: str) -> None:
         self._contexts.pop(account_id, None)

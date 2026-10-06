@@ -2,60 +2,25 @@ from __future__ import annotations
 
 import random
 from dataclasses import dataclass
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any
 
-from core.storage import read_json, write_json_atomic
+from core.storage import read_json, update_json
+from modules.device_catalog import DEVICES, DEVICE_TYPES, PLATFORM_LANG_PACKS
 
-DEVICES = [
-    ("Samsung Galaxy S24 Ultra", "Android 14.0", "14.0", "SM-S928B"),
-    ("Samsung Galaxy S24", "Android 14.0", "14.0", "SM-S921B"),
-    ("Samsung Galaxy S23 Ultra", "Android 14.0", "14.0", "SM-S918B"),
-    ("Samsung Galaxy S23", "Android 13.0", "13.0", "SM-S911B"),
-    ("Samsung Galaxy S22", "Android 13.0", "13.0", "SM-S901B"),
-    ("Samsung Galaxy A55", "Android 14.0", "14.0", "SM-A556B"),
-    ("Samsung Galaxy A54", "Android 13.0", "13.0", "SM-A546B"),
-    ("Samsung Galaxy A35", "Android 14.0", "14.0", "SM-A356B"),
-    ("Samsung Galaxy A25", "Android 14.0", "14.0", "SM-A256B"),
-    ("Samsung Galaxy A15", "Android 14.0", "14.0", "SM-A155F"),
-    ("iPhone 15 Pro Max", "iOS 17.4", "17.4", "iPhone15,3"),
-    ("iPhone 15 Pro", "iOS 17.4", "17.4", "iPhone15,2"),
-    ("iPhone 15", "iOS 17.3", "17.3", "iPhone15,4"),
-    ("iPhone 14 Pro Max", "iOS 16.5", "16.5", "iPhone15,3"),
-    ("iPhone 14", "iOS 16.5", "16.5", "iPhone14,7"),
-    ("iPhone 13", "iOS 16.5", "16.5", "iPhone14,5"),
-    ("Xiaomi 14 Ultra", "Android 14.0", "14.0", "24030PN60G"),
-    ("Xiaomi 14", "Android 14.0", "14.0", "23127PN0CG"),
-    ("Xiaomi 13 Pro", "Android 13.0", "13.0", "2210132G"),
-    ("Xiaomi Redmi Note 13 Pro", "Android 13.0", "13.0", "2312DRA50G"),
-    ("Xiaomi Redmi Note 12", "Android 13.0", "13.0", "23021RAA2Y"),
-    ("Xiaomi Poco X6 Pro", "Android 14.0", "14.0", "2311DRK48G"),
-    ("OnePlus 12", "Android 14.0", "14.0", "CPH2573"),
-    ("OnePlus 11", "Android 13.0", "13.0", "CPH2449"),
-    ("Google Pixel 8 Pro", "Android 14.0", "14.0", "GC3VE"),
-    ("Google Pixel 8", "Android 14.0", "14.0", "GKWS6"),
-    ("Google Pixel 7", "Android 13.0", "13.0", "GVU6C"),
-    ("Huawei P60 Pro", "Android 13.0", "13.0", "MNA-LX9"),
-    ("Huawei Mate 60 Pro", "Android 13.0", "13.0", "ALN-AL00"),
-    ("Oppo Find X7 Ultra", "Android 14.0", "14.0", "PHY120"),
-    ("Vivo X100 Pro", "Android 14.0", "14.0", "V2309"),
-    ("Realme GT 5", "Android 13.0", "13.0", "RMX3823"),
-]
 
-TELEGRAM_APP_VERSIONS = [
-    "11.1.1 (4928)",
-    "11.1.0 (4927)",
-    "11.0.1 (4890)",
-    "11.0.0 (4880)",
-    "10.15.0 (4850)",
-    "10.14.0 (4800)",
-    "10.13.0 (4750)",
-    "10.12.0 (4700)",
-    "10.11.0 (4650)",
-    "10.10.1 (4601)",
-    "10.10.0 (4600)",
-    "10.9.0 (4550)",
-]
+def _app_version(backend: str) -> str:
+    # A device label does not turn the library into an official mobile client.
+    # Report the actual implementation, rather than inventing Android builds
+    # for iOS/macOS/desktop connections. Existing stored values stay untouched.
+    package = "Telethon" if backend == "telethon" else "Kurigram"
+    try:
+        installed = version(package)
+    except PackageNotFoundError:
+        installed = "unknown"
+    return f"Uznik MultiTool ({package} {installed})"
+
 
 LANGUAGES = [
     ("en", "en"),
@@ -121,43 +86,84 @@ class FingerprintGenerator:
     def _load(self) -> None:
         data = read_json(Path(self.storage_path), {})
         self._cache = {
-            key: SessionFingerprint.from_dict(val) for key, val in data.items()
+            str(key): SessionFingerprint.from_dict(val)
+            for key, val in (data.items() if isinstance(data, dict) else ())
+            if self._valid(val)
         }
 
-    def _save(self) -> None:
-        write_json_atomic(
-            Path(self.storage_path),
-            {key: fp.to_dict() for key, fp in self._cache.items()},
+    @staticmethod
+    def _valid(data: Any) -> bool:
+        return isinstance(data, dict) and all(
+            isinstance(data.get(key), str) and bool(data[key].strip())
+            for key in ("device_model", "system_version", "app_version")
         )
+
+    def _store(
+        self, key: str, fingerprint: SessionFingerprint, *, replace: bool = False,
+    ) -> dict[str, str]:
+        def merge(data: Any) -> dict[str, Any]:
+            if not isinstance(data, dict):
+                data = {}
+            if replace or not self._valid(data.get(key)):
+                data[key] = fingerprint.to_dict()
+            return data
+
+        # Merge one record under the storage lock: two generator instances must
+        # not erase each other's newly created sessions with stale caches.
+        data = update_json(Path(self.storage_path), {}, merge, skip_unchanged=True)
+        self._cache[key] = SessionFingerprint.from_dict(data[key])
+        return self._cache[key].to_dict()
 
     @staticmethod
-    def generate_random() -> SessionFingerprint:
-        model, android_ver, raw_ver, _device_code = random.choice(DEVICES)
-        is_iphone = "iPhone" in model or "iOS" in android_ver
-        system_version = android_ver
-        platform = "ios" if is_iphone else "android"
-        lang_pack = "ios" if is_iphone else "android"
+    def generate_random(
+        *, device_type: str | None = None, platform: str | None = None,
+        backend: str = "pyrogram",
+    ) -> SessionFingerprint:
+        if device_type is not None and device_type not in DEVICE_TYPES:
+            raise ValueError(f"Unknown device type: {device_type}")
+        if platform is not None and platform not in PLATFORM_LANG_PACKS:
+            raise ValueError(f"Unknown device platform: {platform}")
+        candidates = [
+            device for device in DEVICES
+            if (device_type is None or device.device_type == device_type)
+            and (platform is None or device.platform == platform)
+        ]
+        if not candidates:
+            raise ValueError(f"No devices for {device_type}/{platform}")
+        device = random.choice(candidates)
         lang_code, system_lang_code = random.choice(LANGUAGES)
         return SessionFingerprint(
-            device_model=model,
-            system_version=system_version,
-            app_version=random.choice(TELEGRAM_APP_VERSIONS),
+            device_model=device.model,
+            system_version=random.choice(device.systems),
+            app_version=_app_version(backend),
             lang_code=lang_code,
             system_lang_code=system_lang_code,
-            lang_pack=lang_pack,
-            platform=platform,
+            lang_pack=PLATFORM_LANG_PACKS[device.platform],
+            platform=device.platform,
         )
 
-    def get_params(self, account_id: str) -> dict[str, Any]:
+    def get_params(self, account_id: str, *, backend: str = "pyrogram") -> dict[str, Any]:
+        account_id = str(account_id)
         if account_id not in self._cache:
-            self._cache[account_id] = self.generate_random()
-            self._save()
+            self._load()
+        if account_id not in self._cache:
+            return self._store(account_id, self.generate_random(backend=backend))
         return self._cache[account_id].to_dict()
 
     def regenerate(self, account_id: str) -> dict[str, Any]:
-        self._cache[account_id] = self.generate_random()
-        self._save()
-        return self._cache[account_id].to_dict()
+        return self._store(str(account_id), self.generate_random(), replace=True)
 
     def params_for_account(self, account: Any) -> dict[str, Any]:
-        return self.get_params(str(account.id))
+        key = str(account.id)
+        if key not in self._cache:
+            self._load()
+        if key in self._cache:
+            return self._cache[key].to_dict()
+        # Authorization is keyed by phone; the imported account gets a new ID.
+        # Keep the exact descriptor saved by AuthManager instead of generating
+        # a second, unrelated device at its first desktop action.
+        metadata = getattr(account, "metadata", None) or {}
+        saved = metadata.get("fingerprint")
+        if self._valid(saved):
+            return self._store(key, SessionFingerprint.from_dict(saved))
+        return self.get_params(key, backend=getattr(account, "backend", "pyrogram"))

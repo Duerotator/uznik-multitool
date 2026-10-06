@@ -96,7 +96,7 @@ class DesktopPackageTests(unittest.TestCase):
 
     def test_no_shared_two_factor_password(self):
         from modules.direct_access import DirectAccessService
-        service = DirectAccessService(SimpleNamespace())
+        service = DirectAccessService(SimpleNamespace(data_dir=ROOT / "unused-fixture-data"))
         # With no configured password, no browser interaction is attempted.
         with patch.dict(os.environ, {}, clear=True):
             self.assertFalse(asyncio.run(service._fill_two_factor_if_requested(Mock())))

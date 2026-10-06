@@ -23,6 +23,7 @@ from modules.profile_bindings import ProfileBindings
 from modules.profile_snapshots import ProfileSnapshotService
 from modules.scrape_cache import ProfileFactsCache, ScrapeCache
 from modules.profile_archive import ProfileArchive
+from modules.story_publication import StoryPublicationStore, publish_stories
 from utils.rate_limit import human_delay
 from utils.telegram_errors import short_error
 
@@ -651,6 +652,7 @@ class ProfileScraperService:
                             copy_name=copy_name, copy_bio=copy_bio, copy_username=copy_username,
                             copy_avatars=copy_avatars, copy_music=copy_music,
                             copy_stories=copy_stories, copy_birthday=copy_birthday,
+                            story_store=StoryPublicationStore(self.config.data_dir),
                         )
                         try:
                             self.accounts.update_profile_metadata(
@@ -826,6 +828,7 @@ class ProfileScraperService:
         require_stories: bool = False,
         parallelism: int = 1,
         max_stories_per_account: int | None = 5,
+        accept_legacy_stories: bool = False,
         progress: OperationProgress | None = None,
         on_log: LogFn | None = None,
     ) -> ActionResult:
@@ -888,7 +891,10 @@ class ProfileScraperService:
             async with sem:
                 await human_delay(max(self.config.min_action_delay, 5.0), max(self.config.max_action_delay, 12.0))
                 binding = bindings.get(acc.id)
-                if binding and archive.has(binding.get("profile_key", "")):
+                if binding and not archive.has(binding.get("profile_key", "")):
+                    bindings.unbind(acc.id)
+                    binding = None
+                if binding and archive.has(binding.get("profile_key", "")) and not (acc.metadata or {}).get("profile_apply_pending"):
                     data = archive.load(binding["profile_key"])
                     uploaded_prev = int((acc.metadata or {}).get("stories_uploaded", 0) or 0)
                     stories = (data or {}).get("stories") or []
@@ -896,37 +902,22 @@ class ProfileScraperService:
                         len(stories),
                         max_stories_per_account if max_stories_per_account is not None else len(stories),
                     )
-                    pending = stories[uploaded_prev:publish_limit]
-                    if copy_stories and pending:
+                    if copy_stories and stories:
                         try:
                             async with create_client(self.config, acc) as client:
-                                # Metadata can be missing when an earlier apply was
-                                # interrupted after publishing.  The live story list
-                                # is authoritative and also repairs old unpinned ones.
-                                active_count = await client.pin_active_stories()
-                                completed = min(publish_limit, max(uploaded_prev, active_count))
-                                if completed != uploaded_prev:
-                                    uploaded_prev = completed
-                                    pending = stories[uploaded_prev:publish_limit]
-                                    self.accounts.update_profile_metadata(
-                                        acc.id, {"stories_uploaded": uploaded_prev},
-                                    )
-                                uploaded = 0
-                                for story_info in pending:
-                                    try:
-                                        await client.upload_story(story_info)
-                                        uploaded += 1
-                                        delay = 6.0 if story_info.get("is_video") else 3.0
-                                        await human_delay(delay, delay + 4.0)
-                                    except Exception as exc:
-                                        log.warning("%s story upload: %s", acc.id, short_error(exc))
-                                try:
-                                    self.accounts.update_profile_metadata(
-                                        acc.id, {"stories_uploaded": uploaded_prev + uploaded},
-                                    )
-                                except Exception:
-                                    pass
-                            _log(f"{acc.id}: +{uploaded} stories (complete, profile {binding['profile_key']})")
+                                source = _to_profile(data)
+                                store = StoryPublicationStore(self.config.data_dir)
+                                if uploaded_prev and accept_legacy_stories and not store.records(acc.id, _story_profile_key(source)):
+                                    if uploaded_prev > len(stories):
+                                        raise RuntimeError("Legacy story count exceeds archived media; manual reconciliation is required")
+                                    store.accept_legacy(acc.id, _story_profile_key(source), stories, uploaded_prev)
+                                uploaded = await publish_stories(
+                                    client, acc, _story_profile_key(source), stories[:publish_limit],
+                                    store,
+                                    legacy_count=uploaded_prev, accept_legacy=accept_legacy_stories,
+                                )
+                                self.accounts.update_profile_metadata(acc.id, {"stories_uploaded": uploaded})
+                            _log(f"{acc.id}: {uploaded} confirmed stories (profile {binding['profile_key']})")
                         except Exception as exc:
                             result.add_error(acc.id, short_error(exc))
                             if progress:
@@ -938,12 +929,12 @@ class ProfileScraperService:
                     if progress:
                         progress.mark_ok(acc.id)
                     return
-                if not free_queue:
+                if not free_queue and not binding:
                     result.add_error(acc.id, "no free saved profile left")
                     if progress:
                         progress.mark_error(acc.id)
                     return
-                entry = free_queue.pop(0)
+                entry = {"username": binding["profile_key"]} if binding else free_queue.pop(0)
                 key = entry.get("username", "")
                 data = archive.load(key)
                 if not data:
@@ -953,6 +944,10 @@ class ProfileScraperService:
                     return
                 source = _to_profile(data)
                 try:
+                    # Reserve this exact profile before mutations; a partial
+                    # failure must resume it, not take another free profile.
+                    bindings.bind(acc.id, source.username or key, user_id=source.user_id or None)
+                    self.accounts.update_profile_metadata(acc.id, {"profile_apply_pending": True})
                     async with create_client(self.config, acc) as client:
                         uploaded = await _apply_profile(
                             client, acc, source,
@@ -961,24 +956,19 @@ class ProfileScraperService:
                             copy_avatars=copy_avatars, copy_music=copy_music,
                             copy_stories=copy_stories, copy_birthday=copy_birthday,
                             max_stories=max_stories_per_account,
+                            story_store=StoryPublicationStore(self.config.data_dir),
                         )
-                    try:
-                        self.accounts.update_profile_metadata(
-                            acc.id,
-                            {
-                                "profiled": True,
-                                "last_known_bio": source.bio or "",
-                                "profile_source_username": source.username or "",
-                                "profiled_at": datetime.now(timezone.utc).isoformat(),
-                                "stories_uploaded": uploaded,
-                            },
-                        )
-                    except Exception:
-                        pass
-                    try:
-                        bindings.bind(acc.id, source.username or key, user_id=source.user_id or None)
-                    except Exception:
-                        pass
+                    self.accounts.update_profile_metadata(
+                        acc.id,
+                        {
+                            "profiled": True,
+                            "last_known_bio": source.bio or "",
+                            "profile_source_username": source.username or "",
+                            "profiled_at": datetime.now(timezone.utc).isoformat(),
+                            "stories_uploaded": uploaded,
+                            "profile_apply_pending": False,
+                        },
+                    )
                     result.add_ok(acc.id)
                     if progress:
                         progress.mark_ok(acc.id)
@@ -1121,15 +1111,22 @@ async def _apply_profile(
     copy_stories: bool = False,
     copy_birthday: bool = False,
     max_stories: int | None = 5,
+    story_store: StoryPublicationStore | None = None,
 ) -> int:
     """Apply profile fields to an account; returns the number of stories uploaded."""
     uploaded = 0
+    # Preflight before altering unrelated profile fields.
+    if copy_stories and source.stories and not await client.supports_stories():
+        raise NotImplementedError("Story publication is not supported by this MTProto backend")
+    if copy_music and source.music_meta and not await client.supports_profile_music():
+        raise NotImplementedError("Profile music is not supported by this MTProto backend")
     if clear_first:
         try:
             await client.clear_profile_photos()
             await human_delay(2.0, 4.0)
         except Exception as exc:
             log.warning("%s clear photos: %s", acc.id, short_error(exc))
+            raise
     if copy_name:
         await client.update_profile(
             first_name=source.first_name or "User",
@@ -1165,13 +1162,11 @@ async def _apply_profile(
                 log.info("%s: %d avatars", acc.id, len(paths))
             except Exception as exc:
                 log.warning("%s set photos: %s", acc.id, short_error(exc))
+                raise
         await human_delay(2.0, 4.0)
     if copy_music and source.music_meta:
-        try:
-            await client.set_profile_music(source.music_meta)
-            log.info("%s: music saved", acc.id)
-        except Exception:
-            pass
+        await client.set_profile_music(source.music_meta)
+        log.info("%s: music saved", acc.id)
     if copy_birthday and source.birthday:
         try:
             year = source.birthday.get("year")
@@ -1180,20 +1175,19 @@ async def _apply_profile(
             await human_delay(1.0, 2.0)
         except Exception as exc:
             log.warning("%s birthday: %s", acc.id, short_error(exc))
+            raise
     if copy_stories and source.stories:
-        uploaded = 0
+        if story_store is None:
+            raise RuntimeError("Persistent story receipt store is required")
         story_limit = max_stories if max_stories is not None else len(source.stories)
-        for story_info in source.stories[:story_limit]:
-            try:
-                await client.upload_story(story_info)
-                uploaded += 1
-                delay = 6.0 if story_info.get("is_video") else 3.0
-                await human_delay(delay, delay + 4.0)
-            except Exception as exc:
-                log.warning("%s story upload: %s", acc.id, short_error(exc))
+        uploaded = await publish_stories(client, acc, _story_profile_key(source), source.stories[:story_limit], story_store)
         if uploaded:
             log.info("%s: %d stories uploaded", acc.id, uploaded)
     return uploaded
+
+
+def _story_profile_key(source: ProfileData) -> str:
+    return f"id:{source.user_id}" if source.user_id else source.username.lower().lstrip("@")
 
 
 async def _generate_username(client, source_username: str, first_name: str, last_name: str) -> str | None:

@@ -24,6 +24,8 @@ FINGERPRINT = {
     "system_version": "Test OS",
     "app_version": "1.0",
     "lang_code": "en",
+    "system_lang_code": "ru",
+    "lang_pack": "tdesktop",
 }
 
 
@@ -288,6 +290,8 @@ class AuthManagerTests(unittest.IsolatedAsyncioTestCase):
             result = await self.auth.send_code(PHONE)
         self.assertTrue(result["ok"])
         self.assertIsNone(constructor.call_args.kwargs["proxy"])
+        self.assertEqual("ru", constructor.call_args.kwargs["system_lang_code"])
+        self.assertEqual("tdesktop", constructor.call_args.kwargs["lang_pack"])
         self.assertIsNone(self.auth.sessions[PHONE].proxy_url)
         client.connect.assert_awaited_once()
         client.send_code.assert_awaited_once_with(PHONE)
@@ -409,6 +413,12 @@ class DirectAccountClientTests(unittest.IsolatedAsyncioTestCase):
                     fingerprint.return_value.params_for_account.return_value = FINGERPRINT
                     await client.start()
                 self.assertIsNone(constructor.call_args.kwargs["proxy"])
+                fingerprint.assert_called_once_with(str(self.config.data_dir / "fingerprints.json"))
+                self.assertEqual("ru", constructor.call_args.kwargs["system_lang_code"])
+                if backend == "pyrogram":
+                    self.assertEqual("tdesktop", constructor.call_args.kwargs["lang_pack"])
+                else:
+                    self.assertNotIn("lang_pack", constructor.call_args.kwargs)
                 client._replace_proxy.assert_not_awaited()
                 client._proxy_usable.assert_not_awaited()
                 await client.stop()

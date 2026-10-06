@@ -445,7 +445,7 @@ class AccountClient(ABC):
     ) -> list[dict[str, Any]]:
         raise NotImplementedError
 
-    async def upload_story(self, story_info: dict[str, Any], caption: str = "") -> None:
+    async def upload_story(self, story_info: dict[str, Any], caption: str = "") -> int:
         raise NotImplementedError
 
     async def get_recent_chat_senders(self, target: str, limit: int = 200) -> list[dict[str, Any]]:
@@ -477,7 +477,7 @@ class AccountClient(ABC):
     async def download_profile_music(self, target: str) -> dict[str, Any] | None:
         raise NotImplementedError
 
-    async def set_profile_music(self, music_bytes: bytes, meta: dict[str, Any]) -> None:
+    async def set_profile_music(self, music_meta: dict[str, Any]) -> None:
         raise NotImplementedError
 
     async def probe_frozen(self) -> None:
@@ -522,7 +522,9 @@ class PyrogramAccountClient(AccountClient):
                 raise RuntimeError(f"No working proxy for {self.account.id}")
 
             session_name, workdir, session_string = self._session_args()
-            fingerprint = FingerprintGenerator().params_for_account(self.account)
+            fingerprint = FingerprintGenerator(
+                str(self.config.data_dir / "fingerprints.json")
+            ).params_for_account(self.account)
             self.client = Client(
                 name=session_name,
                 api_id=self.config.api_id,
@@ -535,6 +537,8 @@ class PyrogramAccountClient(AccountClient):
                 system_version=fingerprint["system_version"],
                 app_version=fingerprint["app_version"],
                 lang_code=fingerprint["lang_code"],
+                system_lang_code=fingerprint.get("system_lang_code", fingerprint["lang_code"]),
+                lang_pack=fingerprint.get("lang_pack", "android"),
             )
             async def connect_existing_session() -> None:
                 authorized = await self.client.connect()
@@ -1515,14 +1519,14 @@ class PyrogramAccountClient(AccountClient):
             )
         )
 
-    async def upload_story(self, story_info: dict[str, Any], caption: str = "") -> None:
+    async def upload_story(self, story_info: dict[str, Any], caption: str = "") -> int:
         from pyrogram import raw
 
         media_bytes = story_info.get("bytes", b"")
         is_video = story_info.get("is_video", False)
         mime = story_info.get("mime_type", "image/jpeg")
         if not media_bytes:
-            return
+            raise ValueError("Story media is empty")
         file_id = random.randint(1, 2 ** 63 - 1)
         chunk_size = 512 * 1024
         parts = 0
@@ -1550,18 +1554,29 @@ class PyrogramAccountClient(AccountClient):
         else:
             input_media = raw.types.InputMediaUploadedPhoto(file=input_file)
         peer = await self.client.resolve_peer("me")
-        await self._with_flood_wait(
+        publication_random_id = int(story_info.get("random_id") or random.randint(1, 2 ** 63 - 1))
+        response = await self._with_flood_wait(
             lambda: self.client.invoke(
                 raw.functions.stories.SendStory(
                     peer=peer,
                     media=input_media,
                     privacy_rules=[raw.types.InputPrivacyValueAllowAll()],
-                    random_id=random.randint(1, 2 ** 63 - 1),
+                    random_id=publication_random_id,
                     pinned=True,
                     caption=caption,
                 )
             )
         )
+        for update in getattr(response, "updates", []):
+            story = getattr(update, "story", None)
+            story_id = getattr(story, "id", None)
+            if isinstance(story_id, int) and story_id > 0:
+                return story_id
+            if getattr(update, "random_id", None) == publication_random_id:
+                mapped_id = getattr(update, "id", None)
+                if isinstance(mapped_id, int) and mapped_id > 0:
+                    return mapped_id
+        raise RuntimeError("Telegram accepted the request but returned no story ID; retry with the same random_id")
 
     async def pin_active_stories(self) -> int:
         """Pin active own stories, including ones uploaded before pinned=True was used."""
@@ -1750,7 +1765,9 @@ class TelethonAccountClient(AccountClient):
                 raise RuntimeError(f"No working proxy for {self.account.id}")
 
             session = self._session_ref(StringSession)
-            fingerprint = FingerprintGenerator().params_for_account(self.account)
+            fingerprint = FingerprintGenerator(
+                str(self.config.data_dir / "fingerprints.json")
+            ).params_for_account(self.account)
             self.client = TelegramClient(
                 session,
                 self.config.api_id,
@@ -1760,6 +1777,7 @@ class TelethonAccountClient(AccountClient):
                 system_version=fingerprint["system_version"],
                 app_version=fingerprint["app_version"],
                 lang_code=fingerprint["lang_code"],
+                system_lang_code=fingerprint.get("system_lang_code", fingerprint["lang_code"]),
             )
             try:
                 get_proxy_diagnostics().trace_client_lifecycle(
@@ -2418,14 +2436,11 @@ class TelethonAccountClient(AccountClient):
         return False
 
     async def set_birthday(self, day: int, month: int, year: int | None = None) -> None:
-        try:
-            from telethon.tl.functions.account import UpdateBirthdayRequest
-            from telethon.tl.types import Birthday
-            await self._with_flood_wait(
-                lambda: self.client(UpdateBirthdayRequest(birthday=Birthday(day=day, month=month, year=year)))
-            )
-        except Exception:
-            pass
+        from telethon.tl.functions.account import UpdateBirthdayRequest
+        from telethon.tl.types import Birthday
+        await self._with_flood_wait(
+            lambda: self.client(UpdateBirthdayRequest(birthday=Birthday(day=day, month=month, year=year)))
+        )
 
     async def pin_active_stories(self) -> int:
         try:
@@ -2467,14 +2482,14 @@ class TelethonAccountClient(AccountClient):
         except Exception:
             return 0
 
-    async def upload_story(self, story_info: dict[str, Any], caption: str = "") -> None:
-        pass
+    async def upload_story(self, story_info: dict[str, Any], caption: str = "") -> int:
+        raise NotImplementedError("Story publication is not implemented for Telethon; use a Kurigram session")
 
     async def download_profile_music(self, target: str) -> dict[str, Any] | None:
         return None
 
-    async def set_profile_music(self, music_bytes: bytes, meta: dict[str, Any]) -> None:
-        pass
+    async def set_profile_music(self, music_meta: dict[str, Any]) -> None:
+        raise NotImplementedError("Profile music is not implemented for Telethon; use a Kurigram session")
 
     async def set_profile_photos(self, paths: list[Path]) -> None:
         from telethon.tl.functions.photos import UploadProfilePhotoRequest

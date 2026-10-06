@@ -17,6 +17,12 @@ class TaskRunner:
         self.tasks: dict[str, asyncio.Task] = {}
         self.stop_events: dict[str, asyncio.Event] = {}
         self.log = logging.getLogger("tasks")
+        # Persisted 'running' records have no live task after a process restart.
+        for snapshot in self.snapshots():
+            if snapshot.status == "running":
+                snapshot.status = "interrupted"
+                snapshot.detail = "Previous process ended before completion"
+                self._save_snapshot(snapshot)
 
     def start(self, name: str, coro_factory: Callable[[asyncio.Event], Awaitable[Any]]) -> str:
         active = next((task for task in self.tasks.values() if not task.done()), None)
@@ -62,13 +68,14 @@ class TaskRunner:
         except asyncio.TimeoutError:
             task.cancel()
             try:
-                await task
+                await asyncio.wait_for(asyncio.shield(task), timeout=8)
             except asyncio.CancelledError:
                 pass
-        finally:
-            self._save_snapshot(
-                TaskSnapshot(id=task_id, name=task.get_name(), status="stopped", detail="Stopped by user")
-            )
+            except asyncio.TimeoutError:
+                self._save_snapshot(TaskSnapshot(id=task_id, name=task.get_name(), status="stop-timeout", detail="Cleanup is still running"))
+                raise RuntimeError("Task cleanup did not finish; session remains busy") from None
+        # wrapper owns the terminal state. Do not overwrite failed/done with
+        # 'stopped' merely because completion happened during a stop request.
         return True
 
     async def stop_by_name_prefix(self, prefix: str) -> int:

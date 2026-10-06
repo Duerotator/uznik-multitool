@@ -153,9 +153,13 @@ class AccountService:
                     self._delete_owned_session_file(account)
 
             deleted = len(removed)
+            removed_ids.extend(account.id for account in removed)
             return kept
 
+        removed_ids: list[str] = []
         self._update(mutate)
+        from modules.account_cleanup import cleanup_removed_accounts
+        cleanup_removed_accounts(self.config, removed_ids)
         return deleted
 
     def deduplicate_accounts(self, delete_sessions: bool = True) -> int:
@@ -185,9 +189,13 @@ class AccountService:
                     self._delete_owned_session_file(account)
 
             deleted = len(removed)
+            removed_ids.extend(account.id for account in removed)
             return kept
 
+        removed_ids: list[str] = []
         self._update(mutate)
+        from modules.account_cleanup import cleanup_removed_accounts
+        cleanup_removed_accounts(self.config, removed_ids)
         return deleted
 
     def find_duplicate_user_ids(self) -> dict[int, list[AccountRecord]]:

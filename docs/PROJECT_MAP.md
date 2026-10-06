@@ -25,10 +25,17 @@
   `profile_customizer.load_profile_plan` — загрузка и миграция старых JSON.
 - `app/modules/accounts.py`, `session_*.py`, `account_security.py`, `direct_access.py`
   — аккаунты, импорт, проверка, безопасность и Telegram Web.
+- `app/modules/device_catalog.py`, `fingerprint_generator.py`, `auth_controller.py`
+  — модели/ОС новой авторизации и постоянные параметры MTProto-подключений;
+  `data/fingerprints.json` — локальное хранилище, не часть репозитория.
 - `app/modules/email_inbox.py`, `email_mailbox.py`, `imports/emails/README.md`
   — HTTP / TLS IMAP / POP3, список ящиков и локальные привязки без паролей.
 - `app/modules/profile_*.py`, `scrape_cache.py`, `app/utils/profile_generator.py`
   — парсинг, архив, применение, истории и генерация профилей.
+- `app/modules/story_publication.py` — подтверждения публикаций отдельных медиа;
+  `account_cleanup.py` — очистка привязок и браузерного состояния при удалении.
+- `app/modules/resumable_jobs.py`, `local_backup.py` — возобновляемые пакеты
+  и зашифрованные копии; секция `Tasks / Backups`, руководство `docs/RECOVERY.md`.
 - `app/modules/giveaway_service.py`, `raffle_*.py` — desktop-участие в розыгрышах.
 - `app/modules/proxy_manager.py`, `async_proxy_manager.py`, `vpn_gateway.py`
   — пользовательские прокси и необязательный локальный Xray.
