@@ -82,6 +82,24 @@ class LocalBackup:
                 for index, (name, source) in enumerate(files):
                     if source == output:
                         continue
+                    if name == "data/accounts.json":
+                        # Capture a canonical reference while the source machine
+                        # can still resolve Windows 8.3 aliases. On another PC a
+                        # lexical prefix comparison cannot expand RUNNER~1.
+                        data = json.loads(source.read_text(encoding="utf-8-sig"))
+                        session_root = self.roots["data"] / "sessions"
+                        for account in data.get("accounts", []):
+                            ref = account.get("session_ref")
+                            if not ref or not Path(ref).is_absolute():
+                                continue
+                            try:
+                                relative = Path(ref).resolve().relative_to(session_root)
+                            except ValueError:
+                                continue  # External sessions are not managed here.
+                            account["session_ref"] = str(session_root / relative)
+                        snapshot = stage / "accounts-snapshot.json"
+                        snapshot.write_text(json.dumps(data), encoding="utf-8")
+                        source = snapshot
                     with source.open("rb") as stream:
                         is_sqlite = stream.read(16) == b"SQLite format 3\0"
                     if is_sqlite:

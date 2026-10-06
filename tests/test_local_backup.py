@@ -26,7 +26,7 @@ class BackupTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve()
         self.config = SimpleNamespace(data_dir=self.root / "data", import_dir=self.root / "imports", env_file=self.root / ".env")
         self.config.data_dir.mkdir()
         self.config.import_dir.mkdir()
@@ -158,6 +158,29 @@ class BackupTests(unittest.TestCase):
         self.assertEqual(str(other.data_dir / "sessions/pyrogram/fixture.json"), restored["session_ref"])
         self.assertNotIn("source_path", restored["metadata"])
         self.assertIn(other.data_dir.as_posix(), other.env_file.read_text())
+
+    def test_backup_canonicalizes_managed_session_reference_without_editing_source(self):
+        canonical = self.config.data_dir / "sessions/pyrogram/fixture.json"
+        canonical.parent.mkdir(parents=True)
+        canonical.write_text('{"session_string": "fixture"}')
+        # On GitHub's Windows runner the temporary directory contains RUNNER~1;
+        # the service's root resolves to runneradmin. Windows is case-insensitive.
+        old_ref = str(Path(self.temp.name) / "data/sessions/pyrogram/fixture.json")
+        if os.name == "nt":
+            old_ref = old_ref.upper()
+        self.accounts.write_text(json.dumps({"accounts": [{"session_ref": old_ref}]}))
+        original = self.accounts.read_bytes()
+        self.service.create(self.archive, PASSWORD)
+        self.assertEqual(original, self.accounts.read_bytes())
+        decrypted = self.root / "payload.zip"
+        self.service._decrypt(self.archive, PASSWORD, decrypted)
+        with zipfile.ZipFile(decrypted) as bundle:
+            archived = json.loads(bundle.read("data/accounts.json"))["accounts"][0]
+        self.assertEqual(str(canonical), archived["session_ref"])
+        receiver = SimpleNamespace(data_dir=self.root / "other/data", import_dir=self.root / "other/imports", env_file=self.root / "other/.env")
+        LocalBackup(receiver).restore(self.archive, PASSWORD)
+        restored = json.loads((receiver.data_dir / "accounts.json").read_text())["accounts"][0]
+        self.assertEqual(str(receiver.data_dir / "sessions/pyrogram/fixture.json"), restored["session_ref"])
 
     def test_incomplete_rollback_reports_recovery_and_attempts_other_files(self):
         self.service.create(self.archive, PASSWORD)
