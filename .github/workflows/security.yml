@@ -28,7 +28,7 @@ jobs:
       # Low findings (e.g. subprocess imports and handled exceptions) remain visible.
       - run: python -m bandit -r app scripts -f json -o bandit.json --exit-zero
       - run: python -m bandit -r app scripts -ll -ii
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         if: always()
         with:
           name: bandit-report
@@ -59,7 +59,7 @@ jobs:
       - name: Audit actual installed application packages
         if: always()
         run: python -m pip_audit --path .venv/Lib/site-packages --format json --output pip-audit.json
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         if: always()
         with:
           name: dependency-audit
