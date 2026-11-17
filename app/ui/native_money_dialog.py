@@ -23,8 +23,22 @@ class NativeMoneyDialog(QDialog):
             (QPalette.PlaceholderText,TOKENS.muted)):
             palette.setColor(role,QColor(color))
         self.setPalette(palette)
-        outer=QVBoxLayout(self);scroll=QScrollArea();scroll.setWidgetResizable(True);outer.addWidget(scroll)
-        body=QWidget();scroll.setWidget(body);layout=QVBoxLayout(body);layout.setContentsMargins(24,24,24,24);layout.setSpacing(12)
+        self.setStyleSheet(
+            f'QDialog {{ background: {TOKENS.panel}; color: {TOKENS.text}; }}'
+            f'QScrollArea#nativeMoneyScroll, QWidget#nativeMoneyBody {{ background: {TOKENS.panel}; border: 0; }}'
+            f'QLabel {{ color: {TOKENS.text}; }}'
+            f'QCheckBox {{ color: {TOKENS.text}; spacing: 8px; }}'
+            f'QCheckBox:disabled {{ color: {TOKENS.muted}; }}'
+            f'QLineEdit, QComboBox {{ background: {TOKENS.background}; color: {TOKENS.text}; border: 1px solid {TOKENS.border}; border-radius: 8px; padding: 7px 10px; }}'
+            f'QComboBox QAbstractItemView {{ background: {TOKENS.panel_secondary}; color: {TOKENS.text}; selection-background-color: #1d4f8c; }}'
+            f'QPushButton {{ background: {TOKENS.panel_secondary}; color: {TOKENS.text}; border: 1px solid {TOKENS.border}; border-radius: 8px; padding: 8px 12px; }}'
+            f'QPushButton:hover {{ background: #263140; }}'
+            f'QPushButton:disabled {{ background: #161b22; color: #64748b; border-color: {TOKENS.border}; }}'
+            f'QScrollBar:vertical {{ background: {TOKENS.background}; width: 10px; }}'
+            f'QScrollBar::handle:vertical {{ background: {TOKENS.border}; min-height: 24px; border-radius: 4px; }}'
+        )
+        outer=QVBoxLayout(self);scroll=QScrollArea();scroll.setObjectName('nativeMoneyScroll');scroll.setWidgetResizable(True);outer.addWidget(scroll)
+        body=QWidget();body.setObjectName('nativeMoneyBody');scroll.setWidget(body);layout=QVBoxLayout(body);layout.setContentsMargins(24,24,24,24);layout.setSpacing(12)
         layout.addWidget(self.label('Native Money · '+report['account_id']))
         layout.addWidget(self.label('Mainnet, один обычный перевод. Карусель/send-all/сбор не включены. Реальный API ещё не прошёл live-приёмку.'))
         self.status=self.label('');layout.addWidget(self.status)

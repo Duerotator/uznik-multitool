@@ -94,8 +94,8 @@ class CarouselMoneyWorkspace:
             out = dict(defaults)
         return out
 
-    async def review(self,reference,limits,*,scope_ids,ui_context,confirmed=False,scope_check=lambda:True):
-        require(confirmed is True and scope_check())
+    async def review(self,reference,limits,*,scope_ids,ui_context,confirmed=False,scope_check=lambda:True,end_at_wallet_x=False):
+        require(confirmed is True and scope_check() and type(end_at_wallet_x) is bool)
         require(isinstance(limits,dict) and set(limits)=={'fee','debit','daily'})
         is_prod=getattr(self.native.executor,'factory',None) is create_client
         row,nodes,event=self._base(reference,scope_ids,ui_context) if is_prod else (None,None,None)
@@ -113,7 +113,19 @@ class CarouselMoneyWorkspace:
             plans=db.execute("SELECT topology FROM money_carousels WHERE state NOT IN ('cancelled','completed') LIMIT 1001").fetchall()
         require(len(plans)<=1000 and not any({n['id'] for n in nodes}&{n['account_id'] for n in json.loads(p['topology'])} for p in plans),
             'Есть незавершённый план: сначала проверьте его исходные intents; повторный запуск запрещён')
-        source_ids={n['id'] for n in nodes[:-1]};keys={}
+        terminal_external=None
+        if end_at_wallet_x:
+            from modules.wallet_x import WalletXVault
+            wx_st=WalletXVault(self.money.config.data_dir).status()
+            require(wx_st.get('configured') and wx_st.get('wallet'),'Сначала создайте или импортируйте Wallet X перед завершением карусели в Wallet X')
+            wx_addr=wx_st['wallet']['address']
+            route_nodes=nodes[:-1] if (len(nodes)>=3 and nodes[-1]['id']==nodes[0]['id']) else nodes
+            source_ids={n['id'] for n in route_nodes}
+            terminal_external={'account_id':'__wallet_x__','address':wx_addr}
+        else:
+            route_nodes=nodes
+            source_ids={n['id'] for n in route_nodes[:-1]}
+        keys={}
         for ident in source_ids:
             context,_=self.money.scope(ident,scope_ids,ui_context)
             try: keys[ident]=self.native._key(ident,context)
@@ -123,56 +135,61 @@ class CarouselMoneyWorkspace:
         addresses={ident:key[0]['address'] for ident,key in keys.items()}
         require(addresses[nodes[0]['id']]==row['address'],'Funding address не совпадает с локальным ключом первого аккаунта')
         require(len(set(addresses.values()))==len(addresses),'Разные аккаунты используют один финансовый адрес; проверьте импортированные ключи')
-        terminal=nodes[-1]
-        if terminal['id'] not in addresses:
-            # Terminal needs no signer; explicit read-only lookup, never force/prepare.
-            target_addr=None
-            try:
-                async with asyncio.timeout(20):
-                    first=self.money.accounts.get_account(nodes[0]['id'])
-                    async with self.native.executor.factory(self.money.config,first) as client:
-                        require((await client.get_me()).get('user_id')==first.user_id)
-                        require(scope_check())
-                        target=await client.native_money_recipient(terminal['username'],terminal['user_id'],prepare_address=False)
-                        require(scope_check())
-                        target_addr=normalize_address(target.get('address'),'mainnet').raw
-            except ValueError as exc:
-                if not scope_check():
-                    raise
+        if end_at_wallet_x:
+            require(terminal_external['address'] not in set(addresses.values()),'Адрес Wallet X совпадает с адресом узла маршрута')
+            topology=[{'account_id':n['id'],'address':addresses[n['id']]} for n in route_nodes]+[{'account_id':'__wallet_x__','address':terminal_external['address']}]
+        else:
+            terminal=route_nodes[-1]
+            if terminal['id'] not in addresses:
+                # Terminal needs no signer; explicit read-only lookup, never force/prepare.
+                target_addr=None
                 try:
-                    t_ctx,_=self.money.scope(terminal['id'],scope_ids,ui_context)
-                    target_addr=self.native._key(terminal['id'],t_ctx)[0]['address']
-                except Exception:
-                    raise exc
-            except Exception as exc:
-                require(scope_check())
-                try:
-                    t_ctx,_=self.money.scope(terminal['id'],scope_ids,ui_context)
-                    target_addr=self.native._key(terminal['id'],t_ctx)[0]['address']
-                except Exception:
-                    raise ValueError('Не удалось получить адрес конечного аккаунта '+terminal['id']) from exc
-            addresses[terminal['id']]=target_addr
-            require(addresses[terminal['id']] not in {value for key,value in addresses.items() if key!=terminal['id']},
-                'Конечный аккаунт использует адрес другого узла маршрута')
+                    async with asyncio.timeout(20):
+                        first=self.money.accounts.get_account(route_nodes[0]['id'])
+                        async with self.native.executor.factory(self.money.config,first) as client:
+                            require((await client.get_me()).get('user_id')==first.user_id)
+                            require(scope_check())
+                            target=await client.native_money_recipient(terminal['username'],terminal['user_id'],prepare_address=False)
+                            require(scope_check())
+                            target_addr=normalize_address(target.get('address'),'mainnet').raw
+                except ValueError as exc:
+                    if not scope_check():
+                        raise
+                    try:
+                        t_ctx,_=self.money.scope(terminal['id'],scope_ids,ui_context)
+                        target_addr=self.native._key(terminal['id'],t_ctx)[0]['address']
+                    except Exception:
+                        raise exc
+                except Exception as exc:
+                    require(scope_check())
+                    try:
+                        t_ctx,_=self.money.scope(terminal['id'],scope_ids,ui_context)
+                        target_addr=self.native._key(terminal['id'],t_ctx)[0]['address']
+                    except Exception:
+                        raise ValueError('Не удалось получить адрес конечного аккаунта '+terminal['id']) from exc
+                addresses[terminal['id']]=target_addr
+                require(addresses[terminal['id']] not in {value for key,value in addresses.items() if key!=terminal['id']},
+                    'Конечный аккаунт использует адрес другого узла маршрута')
+            topology=[{'account_id':n['id'],'address':addresses[n['id']]} for n in route_nodes]
         require(scope_check() and self._key_hash(source_ids)==key_hash)
         require(self._base(reference,scope_ids,ui_context)[0]==row,'Funding изменился во время review')
-        topology=[{'account_id':n['id'],'address':addresses[n['id']]} for n in nodes]
         credentials={}
-        for before,after in zip(nodes,nodes[1:]):
-            identity,anchor=keys[before['id']]
-            policy=make_policy(account=before['id'],account_context=identity['context'],ui_context=ui_context,
-                network='mainnet',source=identity['address'],targets=[addresses[after['id']]],scope='transit_only',
+        for before,after in zip(topology,topology[1:]):
+            identity,anchor=keys[before['account_id']]
+            policy=make_policy(account=before['account_id'],account_context=identity['context'],ui_context=ui_context,
+                network='mainnet',source=identity['address'],targets=[after['address']],scope='transit_only',
                 reserve_nano='0',fee_cap_nano=limits['fee'],transfer_debit_cap_nano=limits['debit'],
                 daily_reservation_cap_nano=limits['daily'],confirmed=True,allow_high_caps=is_prod)
-            credentials[before['id']]={'policy':policy,'identity':dict(identity),'anchor':anchor}
+            credentials[before['account_id']]={'policy':policy,'identity':dict(identity),'anchor':anchor}
         require(nano(event['net_credit_nano'])<=nano(limits['debit']) and nano(event['net_credit_nano'])<=nano(limits['daily']),
             'Пополнение превышает выбранный debit/day cap')
         token=secrets.token_urlsafe(32);hashed=hashlib.sha256(token.encode()).hexdigest();expires=self.money.clock()+(1800 if is_prod else 180)
         approval={'version':1,'draft_revision':reference['revision'],'ui_context':ui_context,'route':topology,
+            'terminal_external':terminal_external,
             'limits':limits,'key_fingerprint':key_hash,'policy_revisions':{ident:{'id':entry['policy'].id,
                 'revision':entry['policy'].revision,'key_revision':entry['identity']['revision']} for ident,entry in credentials.items()}}
         snapshot={'reference':dict(reference),'ui_context':ui_context,'scope_ids':frozenset(scope_ids),
-            'nodes':topology,'credentials':credentials,'source_ids':source_ids,'key_hash':key_hash,'base_hash':digest(row),
+            'nodes':topology,'terminal_external':terminal_external,'credentials':credentials,'source_ids':source_ids,'key_hash':key_hash,'base_hash':digest(row),
             'approval_hash':digest(approval),'expires':expires}
         with self.money.db() as db:
             db.execute('UPDATE carousel_ui_reviews SET used=1 WHERE draft=? AND used=0',(reference['id'],))
@@ -181,6 +198,7 @@ class CarouselMoneyWorkspace:
         self.reviews={k:v for k,v in self.reviews.items() if v['expires']>self.money.clock() and v['reference']['id']!=reference['id']}
         self.reviews[hashed]=snapshot
         return {'token':token,'funding_id':reference['id'],'expires':expires,'route':topology,
+            'end_at_wallet_x':end_at_wallet_x,
             'fee_cap_nano':limits['fee'],'debit_cap_nano':limits['debit'],'daily_cap_nano':limits['daily'],
             'net_nano':event['net_credit_nano'],'enabled':self.native.executor.allow(),
             'confirmation':'RUN '+reference['id'],'verification':'local_review_not_chain_proof'}
@@ -219,7 +237,7 @@ class CarouselMoneyWorkspace:
             require(changed.rowcount==1,'Review уже использован; повторная отправка запрещена')
         # Consume before plan creation/await: no browser/GUI retry can re-arm it.
         self.reviews.pop(hashed,None)
-        plan=self.carousel.create(saved['nodes'],network='mainnet',scope_ids=scope_ids,ui_context=ui_context,confirmed=True)
+        plan=self.carousel.create(saved['nodes'],network='mainnet',scope_ids=scope_ids,ui_context=ui_context,confirmed=True,terminal_external=saved.get('terminal_external'))
         with self.money.db() as db: db.execute('UPDATE carousel_ui_reviews SET plan=? WHERE token_hash=?',(plan['id'],hashed))
         try:
             progress({'phase':'armed','plan_id':plan['id'],'total':len(saved['nodes'])-1,'ordinal':0})

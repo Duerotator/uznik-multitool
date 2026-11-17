@@ -15,8 +15,8 @@ Uznik MultiTool — приложение с доступом к Telegram-акк�
 | `data/browser_profiles/` | Постоянные профили Chromium с авторизацией Telegram Web |
 | `data/passkeys/` | Материалы ключей доступа; требуют защиты как пароль |
 | `data/secret_vault/`, `data/marketapp_credentials/` | Зашифрованные хранилища 2FA-паролей аккаунтов и токена MarketApp |
-| `data/financial_keys/vault.sqlite3` | Зашифрованное хранилище TON/WalletTg ключей, защищённое DPAPI / мастер-паролем |
-| `data/finance_money.sqlite3`, `data/assets_readonly.sqlite3` | Локальный журнал финансовых намерений/карусели, бюджеты и кэш read-only TON-активов |
+| `data/financial_keys/vault.sqlite3`, `data/financial_keys/wallet_x.sqlite3` | Зашифрованные хранилища TON/WalletTg ключей аккаунтов и независимого Master Wallet X (DPAPI / мастер-пароль) |
+| `data/finance_money.sqlite3`, `data/wallet_x.sqlite3`, `data/rent_jobs.sqlite3`, `data/assets_readonly.sqlite3` | Локальный журнал финансовых намерений/карусели, операции Wallet X, задачи аренды MarketApp и кэш read-only TON-активов |
 | `data/wallet_addresses.json`, `data/wallet_addresses.txt` | Экспортированная сводка адресов кошельков аккаунтов |
 | `data/profile_recipes.sqlite3`, `data/task_history.sqlite3`, `data/warmup_state.sqlite3` | Базы рецептов профилей, истории задач и состояния прогрева/ограничений |
 | `imports/emails/accounts.txt` | Ваш список почтовых логинов и паролей; хранится в открытом текстовом виде |
@@ -63,7 +63,7 @@ CLI-администрирование доступно через `scripts/mana
 | Розыгрыши / Mini Apps | Сайтам выбранного розыгрыша передаются данные Telegram WebApp и запросы участия; это сторонние сервисы, не только Telegram |
 | Внешний OCR | При использовании SolveCaptcha передаются изображение капчи и API-ключ этому сервису; локальный OCR не требует этого ключа |
 | TON / WalletTg / TonCenter | Публичные запросы чтения/эмуляции/отправки BOC на `toncenter.com` / `testnet.toncenter.com` (только публичные адреса и подписанные внешние сообщения; сид-фраза остаётся локальной); для нативных переводов mainnet нужны явные флаги `TGB_FINANCE_ENABLE_NATIVE=1` и `TGB_FINANCE_ENABLE_MAINNET=1` |
-| MarketApp | При явном подтверждении чтение каталога/аренды на `api.marketapp.org` с токеном из выделенного vault или `MARKETAPP_API_TOKEN` |
+| MarketApp | При явном подтверждении чтение каталога подарков/юзернеймов и подготовка транзакций аренды (`pay`/`extend`/`cancel`/`tonconnect`) на `api.marketapp.org` с токеном из выделенного vault или `MARKETAPP_API_TOKEN` |
 | Загрузка ресурсов | Указанному вами источнику отправляется запрос на скачивание ресурсов |
 
 Внешние интеграции настраиваются пользователем; участие, сообщения, финансовые
@@ -94,7 +94,7 @@ CLI-администрирование доступно через `scripts/mana
 - `app/modules/direct_access.py`, `session_onboarding.py` — браузер и авторизация.
 - `app/modules/email_inbox.py`, `email_mailbox.py` — чтение почтовых кодов.
 - `app/modules/ai_companion.py`, `raffle_*.py`, `vpn_gateway.py` — внешние интеграции.
-- `app/modules/financial_vault.py`, `wallet_tg_codec.py`, `money_*.py`, `marketapp_*.py` — финансы и MarketApp.
+- `app/modules/financial_vault.py`, `wallet_tg_codec.py`, `wallet_x.py`, `money_*.py`, `marketapp_*.py`, `rent_orchestrator.py` — финансы, Master Wallet X и MarketApp.
 - `.github/workflows/` — команды публичных проверок (Bandit, TruffleHog, pip/npm аудит, CodeQL, тесты) и подготовки релиза.
 
 Проверяйте результат workflow именно для скачанного коммита: значок в README

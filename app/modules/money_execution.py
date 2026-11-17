@@ -10,6 +10,7 @@ import base64
 import hashlib
 import os
 import secrets
+from types import SimpleNamespace
 import uuid
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -50,8 +51,9 @@ def enabled():
 
 
 class NativeMoneyExecutor:
-    def __init__(self,money,vault,*,reader=None,emulator=None,codec=None,client_factory=create_client,allow=enabled):
+    def __init__(self,money,vault,*,reader=None,emulator=None,codec=None,client_factory=create_client,allow=enabled,http_client=None):
         self.money,self.vault,self.factory,self.allow=money,vault,client_factory,allow
+        self.http_client=http_client
         self.codec=codec or WalletTgCodec(clock=money.clock)
         self.reader=reader or TonCenterWalletReader(codec=self.codec,clock=money.clock)
         self.emulator=emulator or TonCenterEmulator(codec=self.codec,clock=money.clock)
@@ -79,11 +81,27 @@ class NativeMoneyExecutor:
         identity=dict(identity)
         require(isinstance(policy.targets,tuple) and bool(policy.targets),'Immutable local policy snapshot required')
         source=self.money.accounts.get_account(policy.account)
-        target=self.money.accounts.get_account(target_account_id)
+        is_external_terminal = (target_account_id == '__wallet_x__' and carousel_step is not None)
         context,ui=self.money.scope(source.id,scope_ids,ui_context)
-        target_context,_=self.money.scope(target.id,scope_ids,ui_context)
-        require(source.id!=target.id and isinstance(target.username,str) and bool(target.username))
-        username=target.username
+        if is_external_terminal:
+            require(len(policy.targets)==1,'External Wallet X carousel terminal requires exact single target')
+            target=SimpleNamespace(id='__wallet_x__',user_id=0,username='__wallet_x__')
+            target_context=ui
+            username='__wallet_x__'
+            with self.money.db() as db:
+                _,plan_nodes,_=carousel_step.carousel._load(db,carousel_step.ident,scope_ids,ui_context,carousel_step.revision,owned=True)
+                require(
+                    carousel_step.ordinal == len(plan_nodes) - 2
+                    and plan_nodes[-1].get('external') is True
+                    and plan_nodes[-1].get('account_id') == '__wallet_x__'
+                    and plan_nodes[-1].get('address') == policy.targets[0],
+                    'Carousel external terminal is not bound to this Wallet X step',
+                )
+        else:
+            target=self.money.accounts.get_account(target_account_id)
+            target_context,_=self.money.scope(target.id,scope_ids,ui_context)
+            require(source.id!=target.id and isinstance(target.username,str) and bool(target.username))
+            username=target.username
         require(context==policy.account_context and ui==policy.ui_context and identity['account']==source.id
                 and identity['user_id']==source.user_id and identity['context']==context
                 and identity['network']==policy.network and identity['address']==policy.source)
@@ -95,8 +113,9 @@ class NativeMoneyExecutor:
             require(self.allow() and scope_check())
             require(expiry-self.money.clock()>=30,'Signed request validity window exhausted')
             require(self.money.scope(source.id,scope_ids,ui_context)==(context,ui))
-            require(self.money.scope(target.id,scope_ids,ui_context)==(target_context,ui)
-                    and self.money.accounts.get_account(target.id).username==username)
+            if not is_external_terminal:
+                require(self.money.scope(target.id,scope_ids,ui_context)==(target_context,ui)
+                        and self.money.accounts.get_account(target.id).username==username)
             if transit is not None:
                 with self.money.db() as db:
                     snapshot=carousel_step.snapshot(self.money,db,policy,target.id,scope_ids,ui_context,intent=ident) if carousel_step else funding_snapshot(
@@ -148,7 +167,9 @@ class NativeMoneyExecutor:
                     require(state.get('availability')=='ready' and state.get('address')==policy.source
                             and state.get('public_key')==identity['public_key'],'Telegram source wallet/key mismatch')
                     phase='recipient'
-                    if is_prod:
+                    if is_external_terminal:
+                        recipient={'address':policy.targets[0]}
+                    elif is_prod:
                         try: recipient=await client.native_money_recipient(username,target.user_id,prepare_address=False)
                         except Exception as exc:
                             if not _is_wallet_unavailable(exc): raise
@@ -240,15 +261,19 @@ class NativeMoneyExecutor:
                         except Exception as exc:
                             if not _is_wallet_unavailable(exc): raise
                             cur_min=minimum
-                        try: cur_rec=await client.native_money_recipient(username,target.user_id,prepare_address=False)
-                        except Exception as exc:
-                            if not _is_wallet_unavailable(exc): raise
+                        if is_external_terminal:
                             cur_rec={'address':destination}
+                        else:
+                            try: cur_rec=await client.native_money_recipient(username,target.user_id,prepare_address=False)
+                            except Exception as exc:
+                                if not _is_wallet_unavailable(exc): raise
+                                cur_rec={'address':destination}
                         require(cur_min==minimum,'Transfer minimum changed')
                         require(cur_rec.get('address')==destination)
                     else:
                         require(await client.native_money_minimum()==minimum,'Transfer minimum changed')
-                        require((await client.native_money_recipient(username,target.user_id,prepare_address=False)).get('address')==destination)
+                        if not is_external_terminal:
+                            require((await client.native_money_recipient(username,target.user_id,prepare_address=False)).get('address')==destination)
                     check();require(expiry-self.money.clock()>=30 and 0<=self.money.clock()-latest['checked_at']<=30)
                     with self.money.db() as db:
                         db.execute("UPDATE native_commitments SET seqno=NULL WHERE network=? AND source=? AND intent!=? AND intent IN (SELECT id FROM intents WHERE state IN ('operator_not_sent','cancelled'))", (policy.network, policy.source, ident))
@@ -281,57 +306,63 @@ class NativeMoneyExecutor:
                         require(db.execute('SELECT state FROM intents WHERE id=?',(ident,)).fetchone()['state']=='uncertain')
                         db.execute("UPDATE native_commitments SET stage='dispatching',boc_hash=? WHERE intent=?",(hashlib.sha256(boc).hexdigest(),ident))
                     phase='dispatch'
-                    if is_prod:
-                        dispatched = False
+                    async def broadcast_signed_boc():
+                        check()
+                        require(observed['public_key']==identity['public_key'] and latest['public_key']==identity['public_key'],
+                            'On-chain public key mismatch before sendBoc broadcast')
+                        if hasattr(self.codec, 'inspect_external'):
+                            decoded_boc = self.codec.inspect_external(
+                                external_boc=signed['external_boc'],
+                                signing_public_key=identity['public_key'],
+                                network=policy.network,
+                            )
+                            expected_amount = '0' if send_all else plan['amount_nano']
+                            require(
+                                decoded_boc.get('signature_valid') is True
+                                and decoded_boc.get('source') == policy.source
+                                and decoded_boc.get('destination') == destination
+                                and decoded_boc.get('destination') in policy.targets
+                                and decoded_boc.get('amount_nano') == expected_amount
+                                and decoded_boc.get('mode') == plan['send_mode'],
+                                'Signed BOC target/amount/signature mismatch before sendBoc broadcast',
+                            )
+                        import httpx
+                        from modules.money_chain_read import MoneyReadError, bounded_json
+                        host='toncenter.com' if policy.network=='mainnet' else 'testnet.toncenter.com'
+                        tonapi_host='tonapi.io' if policy.network=='mainnet' else 'testnet.tonapi.io'
+                        async def send_via(http):
+                            try:
+                                resp=await bounded_json(http,'POST',f'https://{host}/api/v2/sendBoc',body={'boc':signed['external_boc']})
+                                require(resp.get('ok') is True,'TON Center sendBoc rejected transaction: '+str(resp.get('error')))
+                            except (MoneyReadError, httpx.HTTPError, TimeoutError) as boc_exc:
+                                if isinstance(boc_exc, MoneyReadError) and not boc_exc.retryable:
+                                    raise NativeExecutionError(f'TON Center sendBoc HTTP error: {boc_exc}') from None
+                                try:
+                                    fallback_resp = await http.post(
+                                        f'https://{tonapi_host}/v2/blockchain/message',
+                                        json={'boc': signed['external_boc']},
+                                        headers={'Accept': 'application/json'},
+                                        follow_redirects=False,
+                                    )
+                                    require(fallback_resp.status_code == 200, f'sendBoc fallback HTTP {fallback_resp.status_code}')
+                                except (httpx.HTTPError, TimeoutError) as fb_exc:
+                                    raise NativeExecutionError(f'sendBoc fallback failed ({type(boc_exc).__name__}/{type(fb_exc).__name__})') from None
+                        if self.http_client is not None:
+                            await send_via(self.http_client)
+                        else:
+                            async with httpx.AsyncClient(timeout=httpx.Timeout(30,connect=10),trust_env=False,follow_redirects=False) as http:
+                                await send_via(http)
+
+                    if is_external_terminal:
+                        await broadcast_signed_boc()
+                    elif is_prod:
                         try:
                             async with asyncio.timeout(25):
                                 await client.native_money_send(username,target.user_id,destination,boc,random_id,admission_check=check)
-                            dispatched = True
                         except Exception as send_exc:
                             if _is_blocked_send_abort(send_exc) or not (_is_wallet_unavailable(send_exc) or wallet_region_unavailable):
                                 raise
-                            check()
-                            require(observed['public_key']==identity['public_key'] and latest['public_key']==identity['public_key'],
-                                'On-chain public key mismatch before sendBoc fallback')
-                            if hasattr(self.codec, 'inspect_external'):
-                                decoded_boc = self.codec.inspect_external(
-                                    external_boc=signed['external_boc'],
-                                    signing_public_key=identity['public_key'],
-                                    network=policy.network,
-                                )
-                                expected_amount = '0' if send_all else plan['amount_nano']
-                                require(
-                                    decoded_boc.get('signature_valid') is True
-                                    and decoded_boc.get('source') == policy.source
-                                    and decoded_boc.get('destination') == destination
-                                    and decoded_boc.get('destination') in policy.targets
-                                    and decoded_boc.get('amount_nano') == expected_amount
-                                    and decoded_boc.get('mode') == plan['send_mode'],
-                                    'Signed BOC target/amount/signature mismatch before sendBoc fallback',
-                                )
-                            import httpx
-                            from modules.money_chain_read import MoneyReadError, bounded_json
-                            host='toncenter.com' if policy.network=='mainnet' else 'testnet.toncenter.com'
-                            tonapi_host='tonapi.io' if policy.network=='mainnet' else 'testnet.tonapi.io'
-                            async with httpx.AsyncClient(timeout=httpx.Timeout(30,connect=10),trust_env=False,follow_redirects=False) as http:
-                                try:
-                                    resp=await bounded_json(http,'POST',f'https://{host}/api/v2/sendBoc',body={'boc':signed['external_boc']})
-                                    require(resp.get('ok') is True,'TON Center sendBoc rejected transaction: '+str(resp.get('error')))
-                                    dispatched = True
-                                except (MoneyReadError, httpx.HTTPError, TimeoutError) as boc_exc:
-                                    if isinstance(boc_exc, MoneyReadError) and not boc_exc.retryable:
-                                        raise NativeExecutionError(f'TON Center sendBoc HTTP error: {boc_exc}') from None
-                                    try:
-                                        fallback_resp = await http.post(
-                                            f'https://{tonapi_host}/v2/blockchain/message',
-                                            json={'boc': signed['external_boc']},
-                                            headers={'Accept': 'application/json'},
-                                            follow_redirects=False,
-                                        )
-                                        require(fallback_resp.status_code == 200, f'sendBoc fallback HTTP {fallback_resp.status_code}')
-                                        dispatched = True
-                                    except (httpx.HTTPError, TimeoutError) as fb_exc:
-                                        raise NativeExecutionError(f'sendBoc fallback failed ({type(boc_exc).__name__}/{type(fb_exc).__name__})') from None
+                            await broadcast_signed_boc()
                     else:
                         await client.native_money_send(username,target.user_id,destination,boc,random_id,admission_check=check)
                     with self.money.db() as db:

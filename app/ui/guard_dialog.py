@@ -1,4 +1,5 @@
 """Review cached Guard evidence; callbacks never revoke sessions."""
+from datetime import datetime, timezone
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QFont, QPalette
 from PySide6.QtWidgets import QCheckBox, QDialog, QHBoxLayout, QLabel, QMessageBox, QPushButton, QScrollArea, QVBoxLayout, QWidget
@@ -18,6 +19,17 @@ class GuardDialog(QDialog):
                             (QPalette.Button, TOKENS.panel_secondary), (QPalette.ButtonText, TOKENS.text)):
             palette.setColor(role, QColor(color))
         self.setPalette(palette)
+        self.setStyleSheet(
+            f"QDialog {{ background: {TOKENS.panel}; color: {TOKENS.text}; }}"
+            f"QScrollArea#guardScroll, QWidget#guardBody {{ background: {TOKENS.panel}; border: 0; }}"
+            f"QScrollArea#guardScroll {{ border: 1px solid {TOKENS.border}; border-radius: 8px; }}"
+            f"QLabel {{ color: {TOKENS.text}; }}"
+            f"QCheckBox {{ color: {TOKENS.text}; spacing: 8px; }}"
+            f"QCheckBox:disabled {{ color: {TOKENS.muted}; }}"
+            f"QPushButton {{ background: {TOKENS.primary}; color: #f8fbff; border: 0; border-radius: 8px; padding: 8px 12px; }}"
+            f"QPushButton:hover {{ background: #3a92e8; }}"
+            f"QPushButton:disabled {{ background: #1c222b; color: #64748b; border: 1px solid {TOKENS.border}; }}"
+        )
         layout = QVBoxLayout(self)
         layout.setContentsMargins(24, 24, 24, 24)
         layout.setSpacing(16)
@@ -28,8 +40,10 @@ class GuardDialog(QDialog):
         layout.addWidget(self.status)
         layout.addWidget(self.label("Read-only. Unknown does not mean hostile; Open acc may create a legitimate authorization. Select only sessions you recognize. Device names are not proof of ownership. Nothing here revokes sessions or protects the phone number."))
         self.scroll = QScrollArea()
+        self.scroll.setObjectName("guardScroll")
         self.scroll.setWidgetResizable(True)
         self.body = QWidget()
+        self.body.setObjectName("guardBody")
         self.rows = QVBoxLayout(self.body)
         self.rows.setSpacing(12)
         self.scroll.setWidget(self.body)
@@ -75,6 +89,12 @@ class GuardDialog(QDialog):
         self.busy(False)
         self.message.setText(str(error))
 
+    @staticmethod
+    def _format_time(value):
+        if isinstance(value, (int, float)) and value > 0:
+            return datetime.fromtimestamp(float(value), timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        return str(value or "unknown")
+
     def render(self, report):
         self.report = report
         self.heading.setText("Guard · "+report["account_id"])
@@ -91,7 +111,7 @@ class GuardDialog(QDialog):
         if snapshot:
             self.rows.addWidget(self.label(f"Telegram owner: {snapshot['owner_id']} · 2FA: {'on' if snapshot['twofa_enabled'] else 'off'} · Recovery: {'set' if snapshot['recovery_email_set'] else 'not observed'}"))
             if snapshot["password_reset_pending"]:
-                self.rows.addWidget(self.label(f"ATTENTION: pending 2FA password reset, deadline (Unix): {snapshot['password_reset_deadline']}. This is not an account deletion check."))
+                self.rows.addWidget(self.label(f"ATTENTION: pending 2FA password reset, deadline: {self._format_time(snapshot['password_reset_deadline'])}. This is not an account deletion check."))
             self.rows.addWidget(self.label("Current MTProto authorization is excluded below. This list contains other authorizations only."))
             trusted = set(report.get("baseline") or [])
             for row in snapshot["sessions"]:
@@ -116,7 +136,7 @@ class GuardDialog(QDialog):
         active = [row for row in report["events"] if row["active"]]
         self.rows.addWidget(self.label("Active conditions: "+(", ".join(sorted({row["kind"] for row in active})) or "none listed — not a safety guarantee")))
         for event in report["events"][:30]:
-            self.rows.addWidget(self.label(f"{'Active' if event['active'] else 'Resolved'} · {event['kind']} · first {int(event['first_seen'])}, last {int(event['last_seen'])}"))
+            self.rows.addWidget(self.label(f"{'Active' if event['active'] else 'Resolved'} · {event['kind']} · first {self._format_time(event['first_seen'])}, last {self._format_time(event['last_seen'])}"))
         self.rows.addStretch()
         self.busy(False)
 

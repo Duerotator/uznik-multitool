@@ -1,4 +1,5 @@
 """Public addresses only; displaying a record never fetches a live balance."""
+from datetime import datetime, timezone
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QFont, QPalette
 from PySide6.QtWidgets import QComboBox, QDialog, QFormLayout, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPushButton, QVBoxLayout
@@ -19,6 +20,15 @@ class AssetDialog(QDialog):
                             (QPalette.Button, TOKENS.panel_secondary), (QPalette.ButtonText, TOKENS.text)):
             palette.setColor(role, QColor(color))
         self.setPalette(palette)
+        self.setStyleSheet(
+            f"QDialog {{ background: {TOKENS.panel}; color: {TOKENS.text}; }}"
+            f"QLabel {{ color: {TOKENS.text}; }}"
+            f"QLineEdit, QComboBox {{ background: {TOKENS.background}; color: {TOKENS.text}; border: 1px solid {TOKENS.border}; border-radius: 8px; padding: 8px 10px; }}"
+            f"QComboBox QAbstractItemView {{ background: {TOKENS.panel_secondary}; color: {TOKENS.text}; selection-background-color: #1d4f8c; }}"
+            f"QPushButton {{ background: {TOKENS.primary}; color: #f8fbff; border: 0; border-radius: 8px; padding: 8px 12px; }}"
+            f"QPushButton:hover {{ background: #3a92e8; }}"
+            f"QPushButton:disabled {{ background: #1c222b; color: #64748b; border: 1px solid {TOKENS.border}; }}"
+        )
         layout = QVBoxLayout(self)
         layout.setContentsMargins(24, 24, 24, 24)
         layout.setSpacing(16)
@@ -68,19 +78,33 @@ class AssetDialog(QDialog):
         result.setTextInteractionFlags(Qt.TextSelectableByMouse)
         return result
 
+    @staticmethod
+    def _format_time(value):
+        if isinstance(value, (int, float)) and value > 0:
+            return datetime.fromtimestamp(float(value), timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        return str(value or "never")
+
     def render(self, report):
         if report["network"] != self.network.currentData():
             return
         self.report = report
         binding, observation = report["binding"], report["observation"]
         self.address.setText(binding["friendly"] if binding else "")
-        self.source.setCurrentIndex(self.source.findData(binding["source"]) if binding else 0)
+        if binding:
+            source_value = binding.get("source")
+            idx = self.source.findData(source_value)
+            if idx < 0 and source_value:
+                self.source.addItem(str(source_value), source_value)
+                idx = self.source.findData(source_value)
+            self.source.setCurrentIndex(max(0, idx))
+        else:
+            self.source.setCurrentIndex(0)
         self.state.setText(f"Balance status: {report['status']} · Chain: {report['chain_state']}\n"
                            f"Account link: {report['account_link']} · Money: unknown · Signer: unknown · Contract type: unknown")
         tx_lt = (observation.get("last_transaction") or {}).get("lt", "unknown") if observation else None
         self.observation.setText((f"Last observed native TON: {observation['balance_native']} TON\n"
             f"Provider: {observation['provider']} · Verification: provider_reported, not a chain proof\n"
-            f"Read time (Unix): {report['checked_at']} · Provider sync: {observation['source_sync_time']}\n"
+            f"Read time: {self._format_time(report['checked_at'])} · Provider sync: {self._format_time(observation['source_sync_time']) if isinstance(observation.get('source_sync_time'), (int, float)) else observation['source_sync_time']}\n"
             f"Block seqno: {observation['block_seqno']} · Last transaction LT: {tx_lt}"
             if observation else "Balance: unknown — no successful provider observation for this binding.")+
             (f"\nLast error: {report['error']} — previous amount is not current." if report.get("error") else ""))

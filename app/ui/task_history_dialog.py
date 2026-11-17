@@ -1,4 +1,5 @@
 """Metadata history; explicit resume of supported read-only jobs only."""
+from datetime import datetime, timezone
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QFont, QPalette, QColor
 from core.design_tokens import TOKENS
@@ -16,6 +17,15 @@ class TaskHistoryDialog(QDialog):
                 (QPalette.Button,TOKENS.panel_secondary), (QPalette.ButtonText,TOKENS.text)):
             palette.setColor(role,QColor(color))
         self.setPalette(palette)
+        self.setStyleSheet(
+            f"QDialog {{ background: {TOKENS.panel}; color: {TOKENS.text}; }}"
+            f"QLabel {{ color: {TOKENS.text}; }}"
+            f"QComboBox {{ background: {TOKENS.background}; color: {TOKENS.text}; border: 1px solid {TOKENS.border}; border-radius: 8px; padding: 8px 10px; }}"
+            f"QComboBox QAbstractItemView {{ background: {TOKENS.panel_secondary}; color: {TOKENS.text}; selection-background-color: #1d4f8c; }}"
+            f"QPushButton {{ background: {TOKENS.primary}; color: #f8fbff; border: 0; border-radius: 8px; padding: 8px 12px; }}"
+            f"QPushButton:hover {{ background: #3a92e8; }}"
+            f"QPushButton:disabled {{ background: #1c222b; color: #64748b; border: 1px solid {TOKENS.border}; }}"
+        )
         self.setWindowTitle("Task history / safe resume")
         self.resize(700, 460)
         layout = QVBoxLayout(self)
@@ -54,11 +64,17 @@ class TaskHistoryDialog(QDialog):
         self.busy(False)
         self.choose()
 
+    @staticmethod
+    def _format_time(value):
+        if isinstance(value, (int, float)) and value > 0:
+            return datetime.fromtimestamp(float(value), timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        return str(value or "unknown")
+
     def choose(self):
         row = self.items.currentData()
         self.resume.setEnabled(bool(row and row["resumable"]))
         self.detail.setText((f"Source: {row['source']}\nStatus: {row['status']}\nProgress: {row['completed']}/{row['total']} · errors {row['errors']}\n"
-            f"Error kind: {row.get('error_kind') or 'none recorded'}\nUpdated (Unix): {int(row['updated'])}\n{row['resume_reason']}\nCompletion is not independent verification of external state.") if row else "No recorded tasks. Legacy tasks.json is not imported or replayed.")
+            f"Error kind: {row.get('error_kind') or 'none recorded'}\nUpdated: {self._format_time(row['updated'])}\n{row['resume_reason']}\nCompletion is not independent verification of external state.") if row else "No recorded tasks. Legacy tasks.json is not imported or replayed.")
 
     def busy(self, value):
         self.items.setEnabled(not value)

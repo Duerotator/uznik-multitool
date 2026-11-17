@@ -3,6 +3,10 @@ from PySide6.QtCore import QThread, Signal, Qt
 from PySide6.QtGui import QColor, QFont, QPalette
 from PySide6.QtWidgets import (QDialog, QFileDialog, QInputDialog, QLabel, QLineEdit,
                                QMessageBox, QPushButton, QTabWidget, QVBoxLayout, QWidget)
+try:
+    import shiboken6
+except ImportError:  # pragma: no cover
+    shiboken6 = None
 
 from core.design_tokens import TOKENS
 from core.secret_vault import VaultError, get_vault
@@ -45,6 +49,17 @@ class VaultDialog(QDialog):
                             (QPalette.Button, TOKENS.panel_secondary), (QPalette.ButtonText, TOKENS.text)):
             palette.setColor(role, QColor(color))
         self.setPalette(palette)
+        self.setStyleSheet(
+            f"QDialog {{ background: {TOKENS.panel}; color: {TOKENS.text}; }}"
+            f"QTabWidget::pane {{ background: {TOKENS.panel}; border: 1px solid {TOKENS.border}; border-radius: 8px; }}"
+            f"QTabWidget QWidget#vaultTabPage {{ background: {TOKENS.panel}; color: {TOKENS.text}; }}"
+            f"QTabBar::tab {{ background: {TOKENS.panel_secondary}; color: {TOKENS.muted}; border: 1px solid {TOKENS.border}; border-bottom: 0; padding: 7px 14px; border-top-left-radius: 7px; border-top-right-radius: 7px; margin-right: 4px; }}"
+            f"QTabBar::tab:selected {{ background: #1d4f8c; color: #ffffff; border-color: #4b8fd8; }}"
+            f"QLabel {{ color: {TOKENS.text}; }}"
+            f"QPushButton {{ background: {TOKENS.primary}; color: #f8fbff; border: 0; border-radius: 8px; padding: 8px 12px; }}"
+            f"QPushButton:hover {{ background: #3a92e8; }}"
+            f"QPushButton:disabled {{ background: #1c222b; color: #64748b; border: 1px solid {TOKENS.border}; }}"
+        )
         layout = QVBoxLayout(self)
         layout.setContentsMargins(24, 24, 24, 24)
         layout.setSpacing(16)
@@ -56,6 +71,7 @@ class VaultDialog(QDialog):
         tabs = QTabWidget()
         layout.addWidget(tabs, 1)
         master = QWidget()
+        master.setObjectName("vaultTabPage")
         general = QVBoxLayout(master)
         general.setContentsMargins(16, 16, 16, 16)
         general.setSpacing(12)
@@ -66,8 +82,9 @@ class VaultDialog(QDialog):
         self.button(general, "Verify backup…", self.verify)
         self.button(general, "Restore into an uninitialized vault…", self.restore)
         general.addStretch()
-        tabs.addTab(master, "Vault & backups")
+        tabs.addTab(master, "Vault && backups")
         selected = QWidget()
+        selected.setObjectName("vaultTabPage")
         actions = QVBoxLayout(selected)
         actions.setContentsMargins(16, 16, 16, 16)
         actions.setSpacing(12)
@@ -108,8 +125,25 @@ class VaultDialog(QDialog):
         return QMessageBox.question(self, "Confirm local credential change", text,
                                     QMessageBox.Yes | QMessageBox.No, QMessageBox.No) == QMessageBox.Yes
 
+    def _worker_running(self):
+        worker = self.worker
+        if worker is None:
+            return False
+        if shiboken6 is not None and not shiboken6.isValid(worker):
+            self.worker = None
+            return False
+        try:
+            return bool(worker.isRunning())
+        except RuntimeError:
+            self.worker = None
+            return False
+
+    def _clear_worker(self, worker):
+        if self.worker is worker:
+            self.worker = None
+
     def run(self, operation):
-        if self.worker and self.worker.isRunning():
+        if self._worker_running():
             return
         for button in self.buttons:
             button.setEnabled(False)
@@ -117,10 +151,12 @@ class VaultDialog(QDialog):
         def work():
             result = operation()
             return {"status": self.vault.status(), "result": result}
-        self.worker = _VaultWorker(work, self)
-        self.worker.completed.connect(self.complete)
-        self.worker.finished.connect(self.worker.deleteLater)
-        self.worker.start()
+        worker = _VaultWorker(work, self)
+        self.worker = worker
+        worker.completed.connect(self.complete)
+        worker.finished.connect(lambda w=worker: self._clear_worker(w))
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
 
     def complete(self, payload, error):
         for button in self.buttons:
@@ -191,7 +227,7 @@ class VaultDialog(QDialog):
             self.run(lambda: AccountSecretManager(self.config).resolve_pending(self.account_ids, decision, confirmed=True))
 
     def closeEvent(self, event):
-        if self.worker and self.worker.isRunning():
+        if self._worker_running():
             self.message.setText("Wait for the local operation to finish before closing.")
             event.ignore()
         else:
@@ -200,7 +236,7 @@ class VaultDialog(QDialog):
     def done(self, result):
         # Escape/reject does not necessarily pass through closeEvent. Do not
         # destroy a live QThread or abandon a credential migration mid-write.
-        if self.worker and self.worker.isRunning():
+        if self._worker_running():
             self.message.setText("Wait for the local operation to finish before closing.")
             return
         super().done(result)

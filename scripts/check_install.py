@@ -17,7 +17,7 @@ from pathlib import Path
 # Keep this in sync with the application imports and config/requirements.txt.
 REQUIRED_MODULES = (
     "pyrogram", "kuricrypt", "telethon", "cryptg", "PySide6.QtWidgets", "dotenv",
-    "httpx", "socks", "python_socks", "gdown", "psutil", "playwright.sync_api",
+    "httpx", "socksio", "socks", "python_socks", "gdown", "psutil", "playwright.sync_api",
     "PIL", "numpy", "zxingcpp", "ddddocr", "onnxruntime", "cv2",
     "cbor2", "cryptography.hazmat.primitives.asymmetric.ec",
 )

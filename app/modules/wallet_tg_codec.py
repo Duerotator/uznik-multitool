@@ -56,7 +56,7 @@ class WalletTgCodec:
             result=subprocess.run([str(self.node),'--max-old-space-size=128',str(HELPER)],
                 input=json.dumps(payload,separators=(',',':')).encode(),capture_output=True,
                 timeout=10,env=env,check=False,creationflags=subprocess.CREATE_NO_WINDOW if os.name=='nt' else 0)
-            if result.returncode != 0 or len(result.stdout)>65536:
+            if result.returncode != 0 or len(result.stdout)>262144:
                 err_text=(result.stderr or b'').decode('ascii',errors='ignore').strip().splitlines()
                 detail=err_text[-1][:120] if err_text else ''
                 if detail.startswith('WalletTg codec rejected input:'):
@@ -129,6 +129,86 @@ class WalletTgCodec:
             'amount_nano':'0','intent_id':intent_id,'channel':'external','mode':130}
         if deploy: request['deploy']=True
         return {'request':request,'codec':self._run(request),'production_signing':False,'broadcast_supported':False}
+
+    def wallet_x_prepare(self, *, network, anchor_public_key, seqno, valid_until, messages, deploy=False, allow_deploy_drain=False):
+        _uint(seqno); _uint(valid_until)
+        if not 30 <= valid_until - self.clock() <= 300:
+            raise WalletCodecError('Wallet X request needs a fresh 30–300 second expiry')
+        if type(deploy) is not bool or (deploy and seqno != 0):
+            raise WalletCodecError('Initial Wallet X deployment requires seqno=0')
+        if not isinstance(messages, (list, tuple)) or not 1 <= len(messages) <= 16:
+            raise WalletCodecError('Wallet X supports 1 to 16 outgoing messages per transaction')
+        self.derive(anchor_public_key, network)
+        source_addr = self.derive(anchor_public_key, network)['source']
+        normalized = []
+        for item in messages:
+            if not isinstance(item, dict):
+                raise WalletCodecError('Invalid Wallet X message entry')
+            dest = normalize_address(item.get('destination'), network).raw
+            if dest == source_addr:
+                raise WalletCodecError('Wallet X cannot send to its own address')
+            bounce = item.get('bounce', False)
+            if type(bounce) is not bool:
+                raise WalletCodecError('Explicit boolean bounce required')
+            mode = item.get('mode', 3)
+            amt = item.get('amount_nano')
+            is_drain = (mode == 130 and len(messages) == 1 and amt == '0')
+            if is_drain and deploy and not allow_deploy_drain:
+                raise WalletCodecError('Initial deployment drain requires explicit allow_deploy_drain=True')
+            if mode != 3 and not is_drain:
+                raise WalletCodecError('Wallet X outgoing mode must be 3 or single-message 130 drain')
+            if not is_drain and (not isinstance(amt, str) or not re.fullmatch('[1-9][0-9]{0,14}', amt) or int(amt) > 10**15):
+                raise WalletCodecError('Wallet X amount_nano must be positive integer string up to 10^15')
+            entry = {'destination': dest, 'amount_nano': amt, 'mode': mode, 'bounce': bounce}
+            comment = item.get('comment')
+            payload_b64 = item.get('payload_b64')
+            state_init_b64 = item.get('state_init_b64')
+            if comment:
+                if payload_b64:
+                    raise WalletCodecError('Message cannot combine text comment with raw payload BOC')
+                if not isinstance(comment, str) or len(comment.encode('utf-8')) > 120 or comment.startswith('accmanager:'):
+                    raise WalletCodecError('Wallet X comment invalid or uses reserved accmanager: prefix')
+                entry['comment'] = comment
+            elif payload_b64:
+                if not isinstance(payload_b64, str) or len(payload_b64) > 32768:
+                    raise WalletCodecError('Invalid Wallet X payload BOC')
+                entry['payload_b64'] = payload_b64
+            if state_init_b64:
+                if not isinstance(state_init_b64, str) or len(state_init_b64) > 32768:
+                    raise WalletCodecError('Invalid Wallet X StateInit BOC')
+                entry['state_init_b64'] = state_init_b64
+            normalized.append(entry)
+        request = {
+            'op': 'wallet-x-prepare',
+            'network': network,
+            'anchor_public_key': anchor_public_key,
+            'seqno': seqno,
+            'valid_until': valid_until,
+            'messages': normalized,
+        }
+        if deploy:
+            request['deploy'] = True
+        return {'request': request, 'codec': self._run(request)}
+
+    def wallet_x_emulate(self, *, network, anchor_public_key, seqno, valid_until, messages, deploy=False, allow_deploy_drain=False):
+        prepared = self.wallet_x_prepare(
+            network=network, anchor_public_key=anchor_public_key, seqno=seqno,
+            valid_until=valid_until, messages=messages, deploy=deploy, allow_deploy_drain=allow_deploy_drain,
+        )
+        result = self._run({**prepared['request'], 'op': 'wallet-x-emulate'})
+        if result.get('signature_valid') is not False or result.get('broadcastable') is not False:
+            raise WalletCodecError('Pre-sign emulation must never contain a valid signature')
+        return {'request': prepared['request'], 'codec': result}
+
+    def wallet_x_attach(self, *, request, signature_hex, signing_public_key):
+        _hex(signature_hex, 64)
+        _hex(signing_public_key, 32)
+        return self._run({
+            **request,
+            'op': 'wallet-x-attach',
+            'signature': signature_hex,
+            'signing_public_key': signing_public_key,
+        })
 
     def inspect_state(self, *, network, anchor_public_key, code_boc, data_boc, implementation_boc):
         self.derive(anchor_public_key,network)

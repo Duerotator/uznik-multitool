@@ -22,6 +22,17 @@ class ProfileReviewDialog(QDialog):
                             (QPalette.Button, TOKENS.panel_secondary), (QPalette.ButtonText, TOKENS.text)):
             palette.setColor(role, QColor(color))
         self.setPalette(palette)
+        self.setStyleSheet(
+            f"QDialog {{ background: {TOKENS.panel}; color: {TOKENS.text}; }}"
+            f"QLabel {{ color: {TOKENS.text}; }}"
+            f"QCheckBox {{ color: {TOKENS.text}; spacing: 8px; }}"
+            f"QCheckBox:disabled {{ color: {TOKENS.muted}; }}"
+            f"QComboBox {{ background: {TOKENS.background}; color: {TOKENS.text}; border: 1px solid {TOKENS.border}; border-radius: 8px; padding: 8px 10px; }}"
+            f"QComboBox QAbstractItemView {{ background: {TOKENS.panel_secondary}; color: {TOKENS.text}; selection-background-color: #1d4f8c; }}"
+            f"QPushButton {{ background: {TOKENS.primary}; color: #f8fbff; border: 0; border-radius: 8px; padding: 8px 14px; }}"
+            f"QPushButton:hover {{ background: #3a92e8; }}"
+            f"QPushButton:disabled {{ background: #1c222b; color: #64748b; border: 1px solid {TOKENS.border}; }}"
+        )
         self.resize(820, 620)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 16, 16, 16)
@@ -69,6 +80,7 @@ class ProfileReviewDialog(QDialog):
         layout.addWidget(self.confirmed)
         buttons = QHBoxLayout()
         self.preview_button = QPushButton("Load comparison previews")
+        self.preview_button.setMinimumWidth(210)
         self.save_button = QPushButton("Save local receipts")
         self.save_button.setProperty("class", "primary")
         close = QPushButton("Close")

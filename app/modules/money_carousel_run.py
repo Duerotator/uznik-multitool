@@ -124,8 +124,14 @@ class MoneyCarouselRunner:
             require(plan['network']=='mainnet' and all(h['intent'] is None for h in hops),
                 'Only a fresh owned plan can start; linked intents require original journal review')
             row=db.execute('SELECT nodes FROM money_funding_drafts WHERE id=?',(funding_ref.get('id'),)).fetchone()
-            require(row and [n['id'] for n in json.loads(row['nodes'])]==[n['account_id'] for n in nodes],
-                'Funding route must exactly match the reviewed plan')
+            draft_ids=[n['id'] for n in json.loads(row['nodes'])] if row else []
+            plan_ids=[n['account_id'] for n in nodes]
+            if nodes and nodes[-1].get('external') is True and nodes[-1].get('account_id')=='__wallet_x__':
+                alt_ids=draft_ids[:-1] if (len(draft_ids)>=3 and draft_ids[-1]==draft_ids[0]) else draft_ids
+                route_ok=bool(row) and (plan_ids[:-1]==draft_ids or plan_ids[:-1]==alt_ids)
+            else:
+                route_ok=bool(row) and draft_ids==plan_ids
+            require(route_ok,'Funding route must exactly match the reviewed plan')
         frozen=self._credentials(nodes,credentials,scope_ids,ui_context)
         funding_ref=dict(funding_ref);scope_ids=frozenset(scope_ids)
         phase='admission';step=None
@@ -227,10 +233,14 @@ class MoneyCarouselRunner:
             plan, nodes, hops = self.carousel._load(db, ident, scope_ids, ui_context, revision, owned=False)
             require(plan['network'] == 'mainnet' and plan['state'] not in {'cancelled', 'completed'}, 'Plan is not resumable')
             row = db.execute('SELECT nodes FROM money_funding_drafts WHERE id=?', (funding_ref.get('id'),)).fetchone()
-            require(
-                row and [n['id'] for n in json.loads(row['nodes'])] == [n['account_id'] for n in nodes],
-                'Funding route must exactly match the reviewed plan',
-            )
+            draft_ids = [n['id'] for n in json.loads(row['nodes'])] if row else []
+            plan_ids = [n['account_id'] for n in nodes]
+            if nodes and nodes[-1].get('external') is True and nodes[-1].get('account_id') == '__wallet_x__':
+                alt_ids = draft_ids[:-1] if (len(draft_ids) >= 3 and draft_ids[-1] == draft_ids[0]) else draft_ids
+                route_ok = bool(row) and (plan_ids[:-1] == draft_ids or plan_ids[:-1] == alt_ids)
+            else:
+                route_ok = bool(row) and draft_ids == plan_ids
+            require(route_ok, 'Funding route must exactly match the reviewed plan')
         frozen = self._credentials(nodes, credentials, scope_ids, ui_context)
         funding_ref = dict(funding_ref)
         scope_ids = frozenset(scope_ids)

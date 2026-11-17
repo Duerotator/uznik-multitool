@@ -1,7 +1,7 @@
 'use strict';
 // Local public-data codec, NOT imported by index.js or served as a web asset.
 // Protocol reference: ton-blockchain/tg-wallet-contract @ 1a29ae5d90e03c3d585d3e42e6ecef691d727a3c.
-const {beginCell, Cell, Address, contractAddress, internal, external, loadMessage, loadMessageRelaxed, storeMessage, storeMessageRelaxed} = require('@ton/core');
+const {beginCell, Cell, Address, contractAddress, internal, external, loadMessage, loadMessageRelaxed, loadStateInit, storeMessage, storeMessageRelaxed} = require('@ton/core');
 const {createPublicKey, verify} = require('node:crypto');
 if (require('@ton/core/package.json').version !== '0.63.1') throw new Error('Unsupported core version');
 
@@ -13,6 +13,7 @@ const SAFE_ERROR_MESSAGES = new Set([
   'Unknown initial implementation', 'Unknown WalletTg implementation', 'Unsupported WalletTg storage',
   'Unknown operation', 'Only external pre-sign emulation supported', 'Invalid signature',
   'Invalid external message', 'Invalid external payload', 'Codec input too large',
+  'Invalid WalletX messages', 'Invalid WalletX comment', 'Invalid WalletX StateInit',
 ]);
 function errorKind(err) {
   if (!err) return 'Unknown error';
@@ -71,6 +72,67 @@ function prepare(p) {
   const payload=beginCell().storeUint(opcode,32).storeUint(owner.subwallet_id,32).storeUint(p.valid_until,32).storeUint(p.seqno,32).storeUint(p.mode,8).storeRef(message).endCell();
   return {owner,message,payload,opcode};
 }
+function prepareWalletX(p) {
+  const owner = identity(p);
+  uint32(p.seqno); uint32(p.valid_until);
+  if (Object.hasOwn(p,'deploy') && (p.deploy!==true || p.seqno!==0)) throw new Error('Invalid initial deployment');
+  if (!Array.isArray(p.messages) || p.messages.length < 1 || p.messages.length > 16) throw new Error('Invalid WalletX messages');
+  const items = [];
+  for (const m of p.messages) {
+    if (!m || typeof m !== 'object' || Array.isArray(m)) throw new Error('Invalid WalletX messages');
+    const allowedKeys = new Set(['destination','amount_nano','mode','bounce','comment','payload_b64','state_init_b64']);
+    for (const k of Object.keys(m)) {
+      if (!allowedKeys.has(k)) throw new Error('Unexpected fields');
+    }
+    if (typeof m.destination!=='string' || !/^(0|-1):[0-9a-f]{64}$/.test(m.destination) || m.destination===owner.source) throw new Error('Invalid recipient');
+    if (typeof m.bounce !== 'boolean') throw new Error('Invalid WalletX messages');
+    const isDrain = m.mode === 130 && p.messages.length === 1 && m.amount_nano === '0';
+    if (m.mode !== 3 && !isDrain) throw new Error('Unsupported channel/mode');
+    if (!isDrain && (typeof m.amount_nano!=='string' || !/^[1-9][0-9]{0,14}$/.test(m.amount_nano) || BigInt(m.amount_nano) > 1000000000000000n)) {
+      throw new Error('Invalid bounded amount');
+    }
+    let body = undefined;
+    if (Object.hasOwn(m,'comment') && m.comment !== null && m.comment !== '') {
+      if (Object.hasOwn(m,'payload_b64') && m.payload_b64) throw new Error('Invalid WalletX messages');
+      if (typeof m.comment!=='string' || Buffer.byteLength(m.comment,'utf8') > 120 || m.comment.startsWith('accmanager:')) {
+        throw new Error('Invalid WalletX comment');
+      }
+      body = m.comment;
+    } else if (Object.hasOwn(m,'payload_b64') && m.payload_b64 !== null && m.payload_b64 !== '') {
+      body = cell(m.payload_b64);
+    }
+    let init = undefined;
+    if (Object.hasOwn(m,'state_init_b64') && m.state_init_b64 !== null && m.state_init_b64 !== '') {
+      try {
+        init = loadStateInit(cell(m.state_init_b64).beginParse());
+      } catch (_) {
+        throw new Error('Invalid WalletX StateInit');
+      }
+    }
+    const outgoing = internal({to: Address.parseRaw(m.destination), value: BigInt(m.amount_nano), bounce: m.bounce, init, body});
+    const msgCell = beginCell().store(storeMessageRelaxed(outgoing)).endCell();
+    items.push({mode: m.mode, cell: msgCell});
+  }
+  let opcode, payload;
+  if (items.length === 1) {
+    opcode = 0x63896e75;
+    payload = beginCell().storeUint(opcode,32).storeUint(owner.subwallet_id,32).storeUint(p.valid_until,32).storeUint(p.seqno,32).storeUint(items[0].mode,8).storeRef(items[0].cell).endCell();
+  } else {
+    opcode = 0x73896e75;
+    const chunks = [];
+    let i = 0;
+    while (items.length - i > 4) { chunks.push(items.slice(i, i + 3)); i += 3; }
+    chunks.push(items.slice(i));
+    let nextChunk = null;
+    for (let c = chunks.length - 1; c >= 0; c--) {
+      const b = beginCell().storeMaybeRef(nextChunk);
+      for (const it of chunks[c]) { b.storeUint(it.mode,8).storeRef(it.cell); }
+      nextChunk = b.endCell();
+    }
+    payload = beginCell().storeUint(opcode,32).storeUint(owner.subwallet_id,32).storeUint(p.valid_until,32).storeUint(p.seqno,32).storeUint(items.length,8).storeMaybeRef(nextChunk).endCell();
+  }
+  return {owner, items, payload, opcode};
+}
 function run(p) {
   if(p && p.op==='inspect-initial') {
     exact(p,['op','network','anchor_public_key','implementation_boc']);
@@ -101,20 +163,81 @@ function run(p) {
     const outer=loadMessage(envelope.beginParse());
     if (!outer || outer.info.type!=='external-in' || !Address.isAddress(outer.info.dest)) throw new Error('Invalid external message');
     const bs=outer.body.beginParse();
-    if (bs.remainingBits < 512 + 136 || bs.remainingRefs !== 1) throw new Error('Invalid external payload');
+    if (bs.remainingBits < 512 + 136 || bs.remainingRefs < 1) throw new Error('Invalid external payload');
     const signature=bs.loadBuffer(64);
     const payloadCell=bs.asCell();
     const key=createPublicKey({key:Buffer.concat([Buffer.from('302a300506032b6570032100','hex'),publicKey]),format:'der',type:'spki'});
     if (!verify(null,payloadCell.hash(),key,signature)) throw new Error('Invalid signature');
     const ps=payloadCell.beginParse();
-    const opcode=ps.loadUint(32), subwalletId=ps.loadUint(32), validUntil=ps.loadUint(32), seqno=ps.loadUint(32), mode=ps.loadUint(8);
-    const innerCell=ps.loadRef();
-    if (ps.remainingBits || ps.remainingRefs || opcode!==0x63896e75 || subwalletId!==SUBWALLET[p.network]) throw new Error('Invalid external payload');
-    const inner=loadMessageRelaxed(innerCell.beginParse());
-    if (!inner || inner.info.type!=='internal' || !Address.isAddress(inner.info.dest)) throw new Error('Invalid external payload');
-    return {source:outer.info.dest.toRawString(),subwallet_id:subwalletId,opcode,valid_until:validUntil,seqno,mode,
-      destination:inner.info.dest.toRawString(),amount_nano:inner.info.value.coins.toString(),
-      signature_valid:true,payload_hash:payloadCell.hash().toString('hex')};
+    const opcode=ps.loadUint(32), subwalletId=ps.loadUint(32), validUntil=ps.loadUint(32), seqno=ps.loadUint(32);
+    if (subwalletId!==SUBWALLET[p.network]) throw new Error('Invalid external payload');
+    if (opcode===0x63896e75) {
+      const mode=ps.loadUint(8), innerCell=ps.loadRef();
+      if (ps.remainingBits || ps.remainingRefs) throw new Error('Invalid external payload');
+      const inner=loadMessageRelaxed(innerCell.beginParse());
+      if (!inner || inner.info.type!=='internal' || !Address.isAddress(inner.info.dest)) throw new Error('Invalid external payload');
+      return {source:outer.info.dest.toRawString(),subwallet_id:subwalletId,opcode,valid_until:validUntil,seqno,mode,
+        destination:inner.info.dest.toRawString(),amount_nano:inner.info.value.coins.toString(),
+        signature_valid:true,payload_hash:payloadCell.hash().toString('hex')};
+    }
+    if (opcode===0x73896e75) {
+      const declaredLen=ps.loadUint(8);
+      let head=ps.loadMaybeRef();
+      if (!head || ps.remainingBits || ps.remainingRefs || declaredLen < 1 || declaredLen > 255) throw new Error('Invalid external payload');
+      const msgs=[];
+      let total=0n;
+      while (head !== null) {
+        const s=head.beginParse();
+        head=s.loadMaybeRef();
+        const chunkCount=s.remainingRefs;
+        if (chunkCount < 1 || (head !== null && chunkCount > 3) || (head === null && chunkCount > 4)) throw new Error('Invalid external payload');
+        for (let i=0;i<chunkCount;i++) {
+          const mMode=s.loadUint(8), innerCell=s.loadRef();
+          const inner=loadMessageRelaxed(innerCell.beginParse());
+          if (!inner || inner.info.type!=='internal' || !Address.isAddress(inner.info.dest)) throw new Error('Invalid external payload');
+          const amt=inner.info.value.coins;
+          total += amt;
+          msgs.push({mode:mMode,destination:inner.info.dest.toRawString(),amount_nano:amt.toString()});
+        }
+        if (s.remainingBits || s.remainingRefs) throw new Error('Invalid external payload');
+      }
+      if (msgs.length !== declaredLen) throw new Error('Invalid external payload');
+      return {source:outer.info.dest.toRawString(),subwallet_id:subwalletId,opcode,valid_until:validUntil,seqno,
+        mode:msgs[0].mode,destination:msgs[0].destination,amount_nano:total.toString(),messages:msgs,
+        signature_valid:true,payload_hash:payloadCell.hash().toString('hex')};
+    }
+    throw new Error('Invalid external payload');
+  }
+  if (p && ['wallet-x-prepare','wallet-x-emulate','wallet-x-attach'].includes(p.op)) {
+    const base=['op','network','anchor_public_key','seqno','valid_until','messages'].concat(Object.hasOwn(p,'deploy')?['deploy']:[]);
+    exact(p,p.op==='wallet-x-attach'?base.concat(['signature','signing_public_key']):base);
+    const {owner, items, payload, opcode}=prepareWalletX(p);
+    const result={source:owner.source,subwallet_id:owner.subwallet_id,trampoline_hash:CODE_HASH,opcode,
+      payload_hash:payload.hash().toString('hex'),payload_boc:payload.toBoc().toString('base64'),
+      message_hashes:items.map(it=>it.cell.hash().toString('hex')),message_count:items.length};
+    if (p.deploy) {
+      result.initial_data_hash=owner.init.data.hash().toString('hex');
+      result.initial_next_data_hash=beginCell().storeUint(0,8).storeUint(1,32).storeUint(owner.subwallet_id,32).storeBuffer(hex(p.anchor_public_key,32)).endCell().hash().toString('hex');
+    }
+    if (p.op==='wallet-x-emulate') {
+      const body=beginCell().storeBuffer(Buffer.alloc(64)).storeSlice(payload.beginParse()).endCell();
+      const envelope=beginCell().store(storeMessage(external({to:Address.parseRaw(owner.source),body,init:p.deploy?owner.init:undefined}),{forceRef:true})).endCell();
+      result.unsigned_external_boc=envelope.toBoc().toString('base64');
+      result.unsigned_body_hash=body.hash().toString('hex');
+      result.signature_valid=false;result.broadcastable=false;
+    }
+    if (p.op==='wallet-x-attach') {
+      const signature=hex(p.signature,64),publicKey=hex(p.signing_public_key,32);
+      const key=createPublicKey({key:Buffer.concat([Buffer.from('302a300506032b6570032100','hex'),publicKey]),format:'der',type:'spki'});
+      if (!verify(null,payload.hash(),key,signature)) throw new Error('Invalid signature');
+      const body=beginCell().storeBuffer(signature).storeSlice(payload.beginParse()).endCell();
+      result.signed_body_boc=body.toBoc().toString('base64');
+      result.signed_body_hash=body.hash().toString('hex');
+      const envelope=beginCell().store(storeMessage(external({to:Address.parseRaw(owner.source),body,init:p.deploy?owner.init:undefined}),{forceRef:true})).endCell();
+      result.external_boc=envelope.toBoc().toString('base64');
+      result.external_cell_hash=envelope.hash().toString('hex');
+    }
+    return result;
   }
   const fields=FIELDS.concat(Object.hasOwn(p,'deploy')?['deploy']:[],Object.hasOwn(p,'allow_high_caps')?['allow_high_caps']:[]);
   exact(p,p && ['attach','drain-attach'].includes(p.op)?fields.concat(['signature','signing_public_key']):fields);
@@ -153,7 +276,7 @@ function run(p) {
 module.exports={run};
 if(require.main===module) {
   let input=''; process.stdin.setEncoding('utf8');
-  process.stdin.on('data',chunk=>{input+=chunk;if(Buffer.byteLength(input)>65536){process.stderr.write('Codec input too large\n');process.exit(1);}});
+  process.stdin.on('data',chunk=>{input+=chunk;if(Buffer.byteLength(input)>262144){process.stderr.write('WalletTg codec rejected input: Codec input too large\n');process.exit(1);}});
   process.stdin.on('end',()=>{try{process.stdout.write(JSON.stringify(run(JSON.parse(input))));}
     catch(err){process.stderr.write(`WalletTg codec rejected input: ${errorKind(err)}\n`);process.exitCode=1;}});
 }

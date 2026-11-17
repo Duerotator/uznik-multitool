@@ -4,7 +4,7 @@ import math
 import re
 from PySide6.QtCore import Qt,QTimer
 from PySide6.QtGui import QFont,QColor,QPalette,QTextOption
-from PySide6.QtWidgets import QApplication,QComboBox,QDialog,QFormLayout,QInputDialog,QLabel,QLineEdit,QListWidget,QMessageBox,QProgressBar,QPushButton,QScrollArea,QSizePolicy,QTextEdit,QVBoxLayout,QWidget
+from PySide6.QtWidgets import QApplication,QCheckBox,QComboBox,QDialog,QFormLayout,QHBoxLayout,QInputDialog,QLabel,QLineEdit,QListWidget,QMessageBox,QProgressBar,QPushButton,QScrollArea,QSizePolicy,QTextEdit,QVBoxLayout,QWidget
 
 from core.design_tokens import TOKENS
 from core.ton_address import format_nano
@@ -46,6 +46,10 @@ class CarouselFundingDialog(QDialog):
             'QDialog {background:'+TOKENS.panel+';color:'+TOKENS.text+';}'
             'QWidget#carouselContent,QScrollArea {background:'+TOKENS.panel+';border:0;}'
             'QLabel {color:'+TOKENS.text+';}'
+            'QCheckBox {color:'+TOKENS.text+';spacing:8px;}'
+            'QCheckBox:disabled {color:'+TOKENS.muted+';}'
+            'QCheckBox::indicator {width:16px;height:16px;border:1px solid '+TOKENS.border+';border-radius:4px;background:'+TOKENS.background+';}'
+            'QCheckBox::indicator:checked {background:'+TOKENS.primary+';border-color:#4b8fd8;}'
             'QListWidget {background:'+TOKENS.background+';color:'+TOKENS.text+';border:1px solid '+TOKENS.border+';border-radius:8px;}'
             'QListWidget::item {padding:5px;}'
             'QComboBox,QPushButton {background:'+TOKENS.panel_secondary+';color:'+TOKENS.text+';border:1px solid '+TOKENS.border+';border-radius:8px;padding:8px;}'
@@ -74,7 +78,17 @@ class CarouselFundingDialog(QDialog):
         for a in accounts:
             self.last.addItem('@'+(a['username'] or '?'),a['id']);self.last.setItemData(self.last.count()-1,a['id'],Qt.ToolTipRole)
         self.last.setCurrentIndex(self.last.findData(selected[0]))
-        form.addRow('Первый аккаунт A',self.first);form.addRow('Конечный аккаунт X',self.last);layout.addLayout(form)
+        form.addRow('Первый аккаунт A',self.first);form.addRow('Конечный аккаунт X',self.last)
+        self.end_at_wallet_x=QCheckBox('Вернуть остаток в Master Wallet X (конечная точка X)')
+        self.end_at_wallet_x.toggled.connect(self._on_wallet_x_option_changed)
+        form.addRow(self.end_at_wallet_x)
+        wx_row=QHBoxLayout();wx_row.setContentsMargins(0,0,0,0);wx_row.setSpacing(8)
+        self.start_from_wallet_x=QCheckBox('Пополнить 1-й шаг из Wallet X (TON):')
+        self.start_from_wallet_x.toggled.connect(self._on_wallet_x_option_changed)
+        self.wallet_x_amount=QLineEdit('0.35');self.wallet_x_amount.setMaxLength(16);self.wallet_x_amount.setFixedWidth(96)
+        wx_row.addWidget(self.start_from_wallet_x);wx_row.addWidget(self.wallet_x_amount);wx_row.addStretch(1)
+        form.addRow(wx_row)
+        layout.addLayout(form)
         self.route=QListWidget();self.route.setWordWrap(True);self.route.setTextElideMode(Qt.ElideNone)
         self.route.setMinimumHeight(140);self.route.setMaximumHeight(260);layout.addWidget(self.route,1)
         self.instruction=WrappedInstruction();layout.addWidget(self.instruction)
@@ -85,6 +99,10 @@ class CarouselFundingDialog(QDialog):
             self.copy_uq=QPushButton('Копировать UQ-адрес 1-го аккаунта (TON)')
             self.copy_uq.clicked.connect(self.copy_uq_address)
             layout.addWidget(self.copy_uq)
+        self.fund_via_wallet_x=QPushButton('Пополнить 1-й шаг из Wallet X…')
+        self.fund_via_wallet_x.setEnabled(False)
+        self.fund_via_wallet_x.clicked.connect(self.fund_from_wallet_x_clicked)
+        layout.addWidget(self.fund_via_wallet_x)
         layout.addWidget(self.label('Хеш пополнения — необязательно.\nНужен, если поступлений несколько.'))
         self.tx=QLineEdit();self.tx.setPlaceholderText('Хеш транзакции');self.tx.setToolTip('Необязательный хеш пополнения: 64 символа');self.tx.setMaxLength(64);layout.addWidget(self.tx)
         budgets=QFormLayout();budgets.setRowWrapPolicy(QFormLayout.WrapLongRows);budgets.setLabelAlignment(Qt.AlignLeft|Qt.AlignVCenter);self.limits={};self.limit_labels={}
@@ -117,31 +135,46 @@ class CarouselFundingDialog(QDialog):
         label=QLabel(text);label.setTextFormat(Qt.PlainText);label.setWordWrap(True)
         label.setSizePolicy(QSizePolicy.Ignored,QSizePolicy.Preferred);return label
 
+    def _on_wallet_x_option_changed(self,*args):
+        if self.review and not self.running:
+            self.clear_review()
+        self.render_route()
+        self.busy(self.running)
+
     def ids(self):
         first,last=self.first.currentData(),self.last.currentData()
         ordered=[first]+[i for i in self.selected if i!=first]
+        if getattr(self,'end_at_wallet_x',None) and self.end_at_wallet_x.isChecked():
+            return ordered
         return ordered+[last] if last==first else [i for i in ordered if i!=last]+[last]
 
     def render_route(self,*args):
         if self.report: return
         self.route.clear()
         route_ids=self.ids()
+        if getattr(self,'start_from_wallet_x',None) and self.start_from_wallet_x.isChecked():
+            self.route.addItem('0. Master Wallet X (источник пополнения)\nID: __wallet_x__')
         for index,ident in enumerate(route_ids):
             u=self.accounts[ident].get('username') or '?'
             uq=self.accounts[ident].get('uq_address')
             suffix=('\nUQ: '+uq) if uq else ''
             self.route.addItem(str(index+1)+'. @'+u+'\nID: '+ident+suffix)
+        end_x=bool(getattr(self,'end_at_wallet_x',None) and self.end_at_wallet_x.isChecked())
+        if end_x:
+            self.route.addItem(f'{len(route_ids)+1}. Master Wallet X (конечная точка X)\nID: __wallet_x__')
         if getattr(self,'_has_uq',False) and route_ids:
             first_a=self.accounts[route_ids[0]]
             no_u=sum(1 for ident in self.selected if not self.accounts.get(ident,{}).get('username'))
             extra=f' (пропущено без @username: {no_u} акк.)' if no_u else ''
+            end_note=' с возвратом в Master Wallet X' if end_x else ' с возвратом на A'
+            pts=len(route_ids)+(1 if end_x else 0)
             self.instruction.setText(
-                f'Маршрут: {len(self.selected)} акк. с @username → {len(route_ids)} точек с возвратом на A{extra}.\n'
-                f'Сначала нажмите внизу «Зафиксировать маршрут»! После фиксации станет активна кнопка копирования @{first_a.get("username") or "?"}'
+                f'Маршрут: {len(self.selected)} акк. с @username → {pts} точек{end_note}{extra}.\n'
+                f'Сначала нажмите внизу «Зафиксировать маршрут»! После фиксации станет активна кнопка пополнения через Wallet X или копирования @{first_a.get("username") or "?"}'
                 + (f'\nUQ-адрес 1-го аккаунта: {first_a["uq_address"]}' if first_a.get('uq_address') else '')
             )
         else:
-            self.instruction.setText('После фиксации появится точный @ первого аккаунта для пополнения.')
+            self.instruction.setText('После фиксации появится точный @ первого аккаунта и кнопка пополнения через Master Wallet X.')
 
     def render(self,report):
         self.report=report;self.review=None;self.copy_snapshot=None;self.route.clear()
@@ -173,7 +206,15 @@ class CarouselFundingDialog(QDialog):
 
     def busy(self,value):
         self.running=value;enabled=self.valid and not value
-        self.first.setEnabled(enabled and self.report is None);self.last.setEnabled(enabled and self.report is None)
+        end_x=bool(getattr(self,'end_at_wallet_x',None) and self.end_at_wallet_x.isChecked())
+        self.first.setEnabled(enabled and self.report is None);self.last.setEnabled(enabled and self.report is None and not end_x)
+        if hasattr(self,'end_at_wallet_x'):
+            self.end_at_wallet_x.setEnabled(enabled and not self.execution_started)
+        if hasattr(self,'start_from_wallet_x'):
+            self.start_from_wallet_x.setEnabled(enabled and not self.execution_started and not self.review)
+            self.wallet_x_amount.setEnabled(enabled and not self.execution_started and not self.review and self.start_from_wallet_x.isChecked())
+        if hasattr(self,'fund_via_wallet_x'):
+            self.fund_via_wallet_x.setEnabled(enabled and not self.execution_started and not self.review and self.report is not None and self.report['state'] in {'awaiting_funding','needs_review'} and not self.report.get('stale_context'))
         self.tx.setEnabled(enabled and self.report is not None and not self.execution_started and not self.review)
         for field in self.limits.values(): field.setEnabled(enabled and not self.execution_started)
         inspection=self.execution_started and self.report is not None and self.report['state']!='cancelled'
@@ -257,9 +298,16 @@ class CarouselFundingDialog(QDialog):
     def render_review(self,review):
         self.review=review;self.route.clear()
         self._show_limits({key:review[field] for key,field in {'fee':'fee_cap_nano','debit':'debit_cap_nano','daily':'daily_cap_nano'}.items()})
-        for i,node in enumerate(review['route']): self.route.addItem(str(i+1)+'. @'+(self.accounts[node['account_id']]['username'] or '?')+'\nID: '+node['account_id']+'\n'+node['address'])
+        for i,node in enumerate(review['route']):
+            if node['account_id']=='__wallet_x__':
+                self.route.addItem(f"{i+1}. Master Wallet X (конечная точка X)\nID: __wallet_x__\n{node['address']}")
+            else:
+                uname=(self.accounts.get(node['account_id'],{}).get('username') or '?')
+                self.route.addItem(f"{i+1}. @{uname}\nID: {node['account_id']}\n{node['address']}")
+        last_id=review['route'][-1]['account_id']
+        last_label='Master Wallet X' if last_id=='__wallet_x__' else last_id
         self.instruction.setText('Пополнение проверено. Не переводите повторно: перед запуском проверьте адреса всего маршрута и конечный X.')
-        self.message.setText('К запуску: '+format_nano(review['net_nano'])+' native; X = '+review['route'][-1]['account_id']+
+        self.message.setText('К запуску: '+format_nano(review['net_nano'])+' native; X = '+last_label+
             '. Потолок комиссий/шаг '+format_nano(review['fee_cap_nano'])+' (НЕ оценка). Review 180 секунд. Будут реальные последовательные переводы; неизвестный исход остановит цепочку.\n'+
             ('' if review['enabled'] else 'Запуск выключен: требуются TGB_FINANCE_ENABLE_NATIVE=1 и TGB_FINANCE_ENABLE_MAINNET=1.'))
         self.progress.setRange(0,len(review['route'])-1);self.progress.setValue(0);self.busy(False)
@@ -342,8 +390,10 @@ class CarouselFundingDialog(QDialog):
         elif self.review:
             reviewed=dict(self.review)
             first,last=reviewed['route'][0]['account_id'],reviewed['route'][-1]['account_id']
+            first_lbl='@'+(self.accounts.get(first,{}).get('username') or '?')
+            last_lbl='Master Wallet X' if last=='__wallet_x__' else '@'+str(self.accounts.get(last,{}).get('username') or '?')
             prompt=('Реальные переводы · mainnet · шагов: '+str(len(reviewed['route'])-1)+
-                '\nA: @'+(self.accounts[first]['username'] or '?')+'\nX: @'+(self.accounts[last]['username'] or '?')+
+                '\nA: '+first_lbl+'\nX: '+last_lbl+
                 '\nПополнение: '+format_nano(reviewed['net_nano'])+' native'+
                 '\nПотолок комиссий на шаг: '+format_nano(reviewed['fee_cap_nano'])+
                 '\nРасход на шаг: '+format_nano(reviewed['debit_cap_nano'])+
@@ -367,11 +417,51 @@ class CarouselFundingDialog(QDialog):
             if QMessageBox.question(self,'Подготовить маршрут','Проверить локальные ключи/лимиты и подготовить маршрут к запуску? Без подписи/перевода.',QMessageBox.Yes|QMessageBox.No,QMessageBox.Yes)!=QMessageBox.Yes: return
             cleaned_limits=self._clean_limits()
             self.busy(True);self.message.setText('Проверяю локальные ключи и лимиты. Подписи/перевода нет.')
-            self.request('review',{'reference':{k:self.report[k] for k in ('id','revision')},'limits':cleaned_limits})
+            self.request('review',{'reference':{k:self.report[k] for k in ('id','revision')},'limits':cleaned_limits,'end_at_wallet_x':bool(getattr(self,'end_at_wallet_x',None) and self.end_at_wallet_x.isChecked())})
         else:
             if QMessageBox.question(self,'Проверить поступление','Подключить только первый аккаунт и прочитать Telegram/TON Center? Без подписи, перевода и автоповторов. Нажатие не является подтверждением оплаты.',QMessageBox.Yes|QMessageBox.No,QMessageBox.No)!=QMessageBox.Yes: return
             self.busy(True);self.message.setText('Проверяю первый аккаунт и поступление, без подписи/перевода. Общий таймаут до 65 секунд; Stop прерывает ожидание. Автоматических повторов нет.')
             self.request('check',{'id':self.report['id'],'revision':self.report['revision'],'tx_hash':self.tx.text().strip() or None})
+
+    def fund_from_wallet_x_clicked(self):
+        if not self.valid or self.running or not self.report:
+            return
+        amt=(self.wallet_x_amount.text() if hasattr(self,'wallet_x_amount') else '0.35').strip().replace(',','.')
+        if not amt:
+            self.message.setText('Укажите сумму TON для пополнения первого аккаунта из Wallet X.');return
+        self.busy(True)
+        self.message.setText(f'Готовлю перевод {amt} TON из Master Wallet X на 1-й шаг маршрута…')
+        self.request('preview-wallet-x',{'id':self.report['id'],'revision':self.report['revision'],'amount_ton':amt})
+
+    def confirm_wallet_x_funding(self,preview):
+        self.busy(False)
+        if not self.valid or not preview or not self.report:
+            return
+        expected=preview['expected_confirmation']
+        self._confirming_dialog=True
+        try:
+            phrase,ok=QInputDialog.getText(
+                self,
+                'Пополнить 1-й шаг из Master Wallet X',
+                f"Аккаунт A: {preview.get('node0_account_id')}\n"
+                f"Адрес (UQ): {preview.get('destination_uq')}\n"
+                f"Сумма: {format_nano(preview['amount_nano'])} TON\n"
+                f"Оценка комиссии: ~{format_nano(preview['estimated_fee_nano'])} TON\n"
+                f"Для отправки введите точно:\n{expected}",
+                text=expected,
+            )
+        finally:
+            self._confirming_dialog=False
+        if not ok or (phrase or '').strip()!=expected:
+            self.message.setText('Пополнение из Wallet X отменено.');return
+        self.busy(True)
+        self.message.setText('Отправляю TON из Master Wallet X и проверяю поступление…')
+        self.request('execute-wallet-x',{
+            'id':self.report['id'],
+            'revision':self.report['revision'],
+            'review_token':preview['review_token'],
+            'confirmation':expected,
+        })
 
     def cancel_draft(self):
         if self.valid and self.running:

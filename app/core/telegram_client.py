@@ -1778,10 +1778,17 @@ class PyrogramAccountClient(AccountClient):
         buttons = _normalize_pyrogram_buttons(getattr(message, "reply_markup", None))
         chat = getattr(message, "chat", None)
         forward_origin = getattr(message, "forward_origin", None)
-        forward_chat = getattr(forward_origin, "chat", None) or getattr(message, "forward_from_chat", None)
-        forward_message_id = getattr(forward_origin, "message_id", None) or getattr(
-            message, "forward_from_message_id", None
-        )
+        if forward_origin is not None:
+            forward_chat = getattr(forward_origin, "chat", None) or getattr(
+                forward_origin, "sender_chat", None
+            )
+            forward_message_id = getattr(forward_origin, "message_id", None)
+        elif not hasattr(message, "forward_origin"):
+            forward_chat = getattr(message, "forward_from_chat", None)
+            forward_message_id = getattr(message, "forward_from_message_id", None)
+        else:
+            forward_chat = None
+            forward_message_id = None
         forward_username = str(getattr(forward_chat, "username", "") or "").lstrip("@")
         forward_post_link: str | None = None
         if forward_username and forward_message_id:
@@ -1987,6 +1994,10 @@ class PyrogramAccountClient(AccountClient):
 
         resolved = coerce_chat_id(target) if isinstance(target, str) and target.lstrip("-").isdigit() else target
         user = await self._with_flood_wait(lambda: self.client.get_users(resolved))
+        if isinstance(user, (list, tuple)):
+            user = user[0] if user else None
+        if user is None or getattr(user, "id", None) is None:
+            raise RuntimeError(f"Telegram user not found: {target}")
         peer = await self.client.resolve_peer(user.id)
         full = await self._with_flood_wait(
             lambda: self.client.invoke(raw.functions.users.GetFullUser(id=peer))

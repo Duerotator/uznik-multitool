@@ -22,6 +22,21 @@ class ProfileStudioDialog(QDialog):
                 (QPalette.Button, TOKENS.panel_secondary), (QPalette.ButtonText, TOKENS.text)):
             palette.setColor(role, QColor(color))
         self.setPalette(palette)
+        self.setStyleSheet(
+            f"QDialog {{ background: {TOKENS.panel}; color: {TOKENS.text}; }}"
+            f"QTabWidget::pane {{ background: {TOKENS.panel}; border: 1px solid {TOKENS.border}; border-radius: 8px; }}"
+            f"QScrollArea#studioScroll, QWidget#studioEditor, QWidget#studioReview {{ background: {TOKENS.panel}; border: 0; }}"
+            f"QTabBar::tab {{ background: {TOKENS.panel_secondary}; color: {TOKENS.muted}; border: 1px solid {TOKENS.border}; border-bottom: 0; padding: 7px 14px; border-top-left-radius: 7px; border-top-right-radius: 7px; margin-right: 4px; }}"
+            f"QTabBar::tab:selected {{ background: #1d4f8c; color: #ffffff; border-color: #4b8fd8; }}"
+            f"QLabel {{ color: {TOKENS.text}; }}"
+            f"QCheckBox {{ color: {TOKENS.text}; spacing: 8px; }}"
+            f"QCheckBox:disabled {{ color: {TOKENS.muted}; }}"
+            f"QLineEdit, QComboBox, QSpinBox, QPlainTextEdit {{ background: {TOKENS.background}; color: {TOKENS.text}; border: 1px solid {TOKENS.border}; border-radius: 8px; padding: 6px 10px; }}"
+            f"QComboBox QAbstractItemView {{ background: {TOKENS.panel_secondary}; color: {TOKENS.text}; selection-background-color: #1d4f8c; }}"
+            f"QPushButton {{ background: {TOKENS.primary}; color: #f8fbff; border: 0; border-radius: 8px; padding: 8px 12px; }}"
+            f"QPushButton:hover {{ background: #3a92e8; }}"
+            f"QPushButton:disabled {{ background: #1c222b; color: #64748b; border: 1px solid {TOKENS.border}; }}"
+        )
         layout = QVBoxLayout(self)
         layout.setContentsMargins(24, 24, 24, 24)
         layout.setSpacing(16)
@@ -30,8 +45,10 @@ class ProfileStudioDialog(QDialog):
         self.tabs = QTabWidget()
         layout.addWidget(self.tabs, 1)
         scroll = QScrollArea()
+        scroll.setObjectName("studioScroll")
         scroll.setWidgetResizable(True)
         editor = QWidget()
+        editor.setObjectName("studioEditor")
         form = QFormLayout(editor)
         form.setSpacing(12)
         scroll.setWidget(editor)
@@ -69,6 +86,7 @@ class ProfileStudioDialog(QDialog):
         self.save_button = QPushButton("Save local recipe…")
         form.addRow(self.save_button)
         review = QWidget()
+        review.setObjectName("studioReview")
         review_layout = QVBoxLayout(review)
         self.preview_text = QPlainTextEdit()
         self.preview_text.setReadOnly(True)

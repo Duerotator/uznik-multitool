@@ -27,7 +27,7 @@ class RequirementsTests(unittest.TestCase):
 
     def test_application_external_imports_have_explicit_dependencies(self):
         providers = {
-            "PIL": "pillow", "PySide6": "pyside6", "pyrogram": "kurigram",
+            "PIL": "pillow", "PySide6": "pyside6", "shiboken6": "pyside6", "pyrogram": "kurigram",
             "telethon": "telethon", "dotenv": "python-dotenv", "socks": "pysocks",
             "python_socks": "python-socks", "zxingcpp": "zxing-cpp", "cv2": "opencv-python",
         }
@@ -53,7 +53,8 @@ class RequirementsTests(unittest.TestCase):
         self.assertIn("kuricrypt", requirements)
         self.assertIn("cryptg", requirements)
         self.assertIn("python-socks", requirements)
-        for forbidden in ("pyrogram", "pyrofork", "tgcrypto", "tgcrypto-pyrofork", "socksio", "solvecaptcha-python", "fastapi", "uvicorn", "python-telegram-bot"):
+        self.assertIn("[socks]", requirements["httpx"])
+        for forbidden in ("pyrogram", "pyrofork", "tgcrypto", "tgcrypto-pyrofork", "solvecaptcha-python", "fastapi", "uvicorn", "python-telegram-bot"):
             self.assertNotIn(forbidden, requirements)
 
     def test_ocr_cpu_dependencies_and_platform_specific_opencv(self):

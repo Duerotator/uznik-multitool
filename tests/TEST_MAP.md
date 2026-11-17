@@ -85,9 +85,16 @@
 - `test_profile_apply.py` — применение профилей, рецепты, привязки и публикации историй.
 - `test_financial_vault.py`, `test_financial_backup.py` — шифрование DPAPI, контекст
   записей, портативные резервные копии и CLI `scripts/manage_financial_vault.py`.
-- `test_marketapp_catalog.py` — парсинг, фильтрация и CLI `scripts/marketapp_catalog.py`.
-- `test_wallet_tg_codec.py`, `test_wallet_tg_custody.py` — Node/@ton/core кодек
-  (`app/ui/finance/wallet_tg_codec.cjs`), подписи, ротация и хранение мнемоник.
+- `test_marketapp_catalog.py`, `test_rent_orchestrator.py` — парсинг подарков/юзернеймов,
+  единицы секунд/GRAM, `SendTxSchema`, CLI `scripts/marketapp_catalog.py`, пакетный скан/видимость
+  и возобновляемый конвейер аренды без двойной оплаты.
+- `test_wallet_tg_codec.py`, `test_wallet_tg_custody.py`, `test_wallet_x.py` — Node/@ton/core
+  кодек (`app/ui/finance/wallet_tg_codec.cjs`, включая bulk `0x73896e75`), подписи,
+  ротация/хранение мнемоник, изолированный Master Wallet X (`send_all`, батч-пополнение,
+  сверка/восстановление seqno) и завершение карусели в Wallet X.
+- `test_phase4_ui.py` — offscreen-проверки Phase 4 Qt UI (глобальный QSS тёмной темы,
+  очистка ghost-виджетов `_clear_layout`, безопасные теги телефонов, защита `_VaultWorker`,
+  `WalletXDialog`, `CarouselFundingDialog` X-переключатели, modeless `MarketappDialog`).
 - `test_money_policy.py`, `test_money_credit.py`, `test_money_funding.py`,
   `test_money_chain_read.py`, `test_money_emulation.py`, `test_money_deployment.py`,
   `test_money_execution.py`, `test_money_native.py`, `test_money_reconciliation.py`,

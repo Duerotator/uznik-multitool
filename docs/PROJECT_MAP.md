@@ -13,7 +13,7 @@
   `guard_dialog.py` (Security Guard), `task_history_dialog.py`, `profile_studio_dialog.py`,
   `profile_review_dialog.py`, `captcha_support_dialog.py`, `marketapp_dialog.py`,
   `marketapp_credentials_dialog.py`, `asset_dialog.py`, `native_money_dialog.py`,
-  `carousel_funding_dialog.py`.
+  `carousel_funding_dialog.py`, `wallet_x_dialog.py` (Master Wallet X).
 - `app/ui/finance/` — Node.js / `@ton/core` кодек `wallet_tg_codec.cjs` и сборка
   TON Connect / UI-активов (`package.json`, `package-lock.json`, `index.js`, `dist/money.js`).
 - `toolbox.bat`, `scripts/toolbox.py` — меню вспомогательных desktop-утилит;
@@ -54,18 +54,20 @@
 - `app/modules/giveaway_service.py`, `raffle_*.py`, `captcha_support.py`
   — desktop-участие в розыгрышах и поддержка ручных/OCR капч.
 - `app/modules/marketapp_*.py` (`marketapp_catalog.py`, `marketapp_credentials.py`,
-  `marketapp_browser.py`, `marketapp_rentals.py`) — локальный каталог, аренда и
-  выделенное хранилище токена MarketApp.
+  `marketapp_browser.py`, `marketapp_rentals.py`), `rent_orchestrator.py` — локальный
+  каталог подарков и юзернеймов MarketApp, выделенное хранилище токена и возобновляемый
+  конвейер аренды (`data/rent_jobs.sqlite3`).
 - `app/modules/financial_vault.py`, `financial_backup.py`, `asset_registry.py`,
-  `ton_readonly.py`, `wallet_tg_codec.py`, `wallet_tg_custody.py`, `wordlist_en.txt`,
+  `ton_readonly.py`, `wallet_tg_codec.py`, `wallet_tg_custody.py`, `wallet_x.py`, `wordlist_en.txt`,
   `finance_money.py`, `money_*.py` (`money_workspace.py`, `money_policy.py`,
   `money_native.py`, `money_native_tl.py`, `money_native_transport.py`,
   `money_send_transport.py`, `money_chain_read.py`, `money_emulation.py`,
   `money_execution.py`, `money_credit.py`, `money_funding.py`, `money_transit.py`,
   `money_reconciliation.py`, `money_recovery.py`, `money_rewards.py`,
   `money_carousel.py`, `money_carousel_run.py`, `money_carousel_workspace.py`)
-  — локальный финансовый vault, read-only реестр TON-активов, кодек WalletTg,
-  нативные переводы, сверка/восстановление и карусель пополнения.
+  — локальный финансовый vault, независимый Master Wallet X (`data/financial_keys/wallet_x.sqlite3`,
+  `data/wallet_x.sqlite3`), read-only реестр TON-активов, кодек WalletTg, нативные переводы,
+  сверка/восстановление и карусель пополнения (включая старт/возврат через Wallet X).
 - `app/modules/proxy_manager.py`, `async_proxy_manager.py`, `vpn_gateway.py`,
   `webshare_source.py` — пользовательские прокси и необязательный локальный Xray.
 - `app/modules/chat_actions.py`, `warmup_engine.py`, `warmup_policy.py`,

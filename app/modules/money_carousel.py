@@ -55,7 +55,10 @@ class MoneyCarousel:
     def _scope(self,nodes,scope_ids,ui_context):
         require(hex_id(ui_context,64),'Exact current group/filter context required')
         result=[]
-        for node in nodes:
+        for idx,node in enumerate(nodes):
+            if idx==len(nodes)-1 and len(nodes)>=2 and node.get('external') is True and node.get('account_id')=='__wallet_x__':
+                result.append(dict(node))
+                continue
             try: context,ui=self.money.scope(node['account_id'],scope_ids,ui_context)
             except (FinanceError,KeyError,LookupError):
                 raise CarouselError('Account removed/disabled/outside current filters') from None
@@ -64,20 +67,34 @@ class MoneyCarousel:
             result.append({**node,'context':context})
         return result
 
-    def create(self,nodes,*,network,scope_ids,ui_context,confirmed=False):
+    def create(self,nodes,*,network,scope_ids,ui_context,confirmed=False,terminal_external=None):
         require(confirmed is True,'Explicit local plan confirmation required')
         require(network in ('mainnet','testnet') and isinstance(nodes,list) and 2<=len(nodes)<=502)
+        if terminal_external is not None:
+            require(isinstance(terminal_external,dict) and set(terminal_external)=={'account_id','address'}
+                    and terminal_external['account_id']=='__wallet_x__','Unsupported external carousel terminal')
+            try: ext_addr=normalize_address(terminal_external['address'],network).raw
+            except (ValueError,TypeError): raise CarouselError('Invalid external Wallet X terminal address') from None
+        else:
+            ext_addr=None
         topology=[]
-        for node in nodes:
+        for idx,node in enumerate(nodes):
             require(isinstance(node,dict) and set(node)=={'account_id','address'})
             require(isinstance(node['account_id'],str) and re.fullmatch('[A-Za-z0-9_.:-]{1,160}',node['account_id']))
             try: address=normalize_address(node['address'],network).raw
             except (ValueError,TypeError): raise CarouselError('Invalid declared wallet address') from None
-            topology.append({'account_id':node['account_id'],'address':address})
-        # A final return to A is allowed, but repeated intermediates/alias addresses are not.
-        unique=topology[:-1] if topology[-1]==topology[0] else topology
+            entry={'account_id':node['account_id'],'address':address}
+            if ext_addr is not None and idx==len(nodes)-1:
+                require(node['account_id']=='__wallet_x__' and address==ext_addr,'External terminal does not match topology tail')
+                entry['external']=True
+            topology.append(entry)
+        # A final return to A or external Wallet X is allowed, but repeated intermediates/alias addresses are not.
+        is_ext_tail = bool(topology[-1].get('external'))
+        unique=topology[:-1] if (topology[-1]==topology[0] or is_ext_tail) else topology
         require(len({n['account_id'] for n in unique})==len(unique)
                 and len({n['address'] for n in unique})==len(unique),'Duplicate/aliased intermediate accounts')
+        if is_ext_tail:
+            require(topology[-1]['address'] not in {n['address'] for n in unique},'External terminal address conflicts with route sender')
         require(all(a['address']!=b['address'] for a,b in zip(topology,topology[1:])))
         topology=self._scope(topology,scope_ids,ui_context)
         ident,revision=uuid.uuid4().hex,uuid.uuid4().hex

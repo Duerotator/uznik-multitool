@@ -79,7 +79,7 @@ from modules.sleep_scheduler import SleepScheduler
 from modules.spamblock import SpamBlockService
 from modules.telegram_codes import TelegramCodeScanResult, TelegramCodeService
 from utils.avatar_pack_downloader import download_google_drive_avatar_pack
-from utils.phone_region import format_phone_with_region, phone_group_name
+from utils.phone_region import detect_phone_region, extract_phone, phone_group_name
 from utils.profile_generator import export_plan_text_files, split_unknown_avatars, write_profile_plan
 
 
@@ -157,6 +157,7 @@ class UiSignals(QObject):
     task_history_event = Signal(object)
     native_money_event = Signal(object)
     carousel_funding_event = Signal(object)
+    wallet_x_event = Signal(object)
 
 
 class ButtonRow(QWidget):
@@ -252,9 +253,9 @@ class Section(QWidget):
 
 
 class AccountTableModel(QAbstractTableModel):
-    HEADERS = ["Added", "Phone / Region", "Spamblock", "Login Mail", "Cloud Password", "Username", "VPN", "Sleep", "Reg", "Profile"]
+    HEADERS = ["Added", "Phone / Region", "Spamblock", "Login Mail", "Cloud 2FA", "Username", "VPN", "Sleep", "Reg", "Profile"]
     STATUS_COLUMNS = {2, 3, 4, 5, 6, 7, 8, 9}
-    FIXED_WIDTHS = {0: 142, 2: 118, 3: 122, 4: 140, 6: 72, 7: 82, 8: 92, 9: 72}
+    FIXED_WIDTHS = {0: 114, 1: 164, 2: 118, 3: 82, 4: 84, 6: 138, 7: 78, 8: 70, 9: 56}
     STATUS_COLORS = {
         "ok": QColor("#45d483"),
         "bad": QColor("#ff6b6b"),
@@ -442,6 +443,7 @@ class QtDesktopApp(QMainWindow):
         self.signals.task_history_event.connect(self.on_task_history_event)
         self.signals.native_money_event.connect(self.on_native_money_event)
         self.signals.carousel_funding_event.connect(self.on_carousel_funding_event)
+        self.signals.wallet_x_event.connect(self.on_wallet_x_event)
 
     def _build_layout(self) -> None:
         root = QWidget()
@@ -586,7 +588,7 @@ class QtDesktopApp(QMainWindow):
         self.filter_country = QComboBox()
         self.filter_country.addItem("All countries", "any")
         for option in country_options(self.accounts.list_accounts()):
-            self.filter_country.addItem(f"{option['label']} ({option['count']})", option["value"])
+            self.filter_country.addItem(f"{option['value']} ({option['count']})", option["value"])
         self.filter_spamblock = QComboBox()
         self.filter_spamblock.addItem("Any spamblock", "any")
         for value, label in (("clear", "Clear"), ("limited", "Limited"), ("forever", "Forever"), ("unknown", "Unknown")):
@@ -657,7 +659,7 @@ class QtDesktopApp(QMainWindow):
         header = self.table.horizontalHeader()
         header.setDefaultAlignment(Qt.AlignCenter)
         header.setSectionResizeMode(0, QHeaderView.Fixed)
-        header.setSectionResizeMode(1, QHeaderView.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.Fixed)
         header.setSectionResizeMode(2, QHeaderView.Fixed)
         header.setSectionResizeMode(3, QHeaderView.Fixed)
         header.setSectionResizeMode(4, QHeaderView.Fixed)
@@ -1340,6 +1342,7 @@ class QtDesktopApp(QMainWindow):
     def _add_label(self, layout: QVBoxLayout, text: str) -> None:
         label = QLabel(text)
         label.setProperty("class", "fieldLabel")
+        label.setWordWrap(True)
         layout.addWidget(label)
 
     def _add_line_with_paste(
@@ -1382,6 +1385,8 @@ class QtDesktopApp(QMainWindow):
             widget = item.widget()
             child_layout = item.layout()
             if widget is not None:
+                widget.hide()
+                widget.setParent(None)
                 widget.deleteLater()
             elif child_layout is not None:
                 self._clear_layout(child_layout)
@@ -1393,6 +1398,79 @@ class QtDesktopApp(QMainWindow):
                 color: #e9f0f8;
                 font-family: "Segoe UI";
                 font-size: 13px;
+            }
+            QDialog {
+                background: #171c24;
+                color: #e9f0f8;
+                font-family: "Segoe UI";
+                font-size: 13px;
+            }
+            QDialog QScrollArea, QDialog QScrollArea > QWidget > QWidget {
+                background: #171c24;
+                border: 0;
+            }
+            QTabWidget::pane {
+                background: #171c24;
+                border: 1px solid #2c3542;
+                border-radius: 8px;
+                padding: 4px;
+            }
+            QTabBar::tab {
+                background: #1f2630;
+                color: #93a1b4;
+                border: 1px solid #2c3542;
+                border-bottom: 0;
+                padding: 7px 14px;
+                border-top-left-radius: 7px;
+                border-top-right-radius: 7px;
+                margin-right: 4px;
+            }
+            QTabBar::tab:selected {
+                background: #1d4f8c;
+                color: #ffffff;
+                border-color: #4b8fd8;
+            }
+            QTabBar::tab:hover:!selected {
+                background: #263140;
+                color: #e9f0f8;
+            }
+            QCheckBox {
+                color: #e9f0f8;
+                spacing: 8px;
+            }
+            QCheckBox:disabled {
+                color: #93a1b4;
+            }
+            QCheckBox::indicator {
+                width: 16px;
+                height: 16px;
+                border: 1px solid #3a4553;
+                border-radius: 4px;
+                background: #0f151d;
+            }
+            QCheckBox::indicator:checked {
+                background: #2f73bc;
+                border-color: #4b8fd8;
+            }
+            QCheckBox::indicator:disabled {
+                background: #171c24;
+                border-color: #2c3542;
+            }
+            QListWidget, QPlainTextEdit, QTextEdit, QSpinBox, QDoubleSpinBox {
+                background: #0f151d;
+                color: #e9f0f8;
+                border: 1px solid #3a4553;
+                border-radius: 8px;
+                padding: 6px 8px;
+                selection-background-color: #2f73bc;
+            }
+            QListWidget::item {
+                padding: 5px 6px;
+                border-radius: 4px;
+            }
+            QListWidget::item:selected {
+                background: #1d4f8c;
+                color: #ffffff;
             }
             QScrollArea#sidebarScroll {
                 background: #171c24;
@@ -1513,6 +1591,15 @@ class QtDesktopApp(QMainWindow):
             QPushButton[class="danger"]:hover {
                 background: #a8453a;
             }
+            QPushButton:disabled,
+            QPushButton[class="primary"]:disabled,
+            QPushButton[class="secondary"]:disabled,
+            QPushButton[class="smallButton"]:disabled,
+            QPushButton[class="danger"]:disabled {
+                background: #1c222b;
+                color: #64748b;
+                border: 1px solid #2c3542;
+            }
             QPushButton[class="sectionButton"] {
                 text-align: left;
                 background: #171c24;
@@ -1542,7 +1629,8 @@ class QtDesktopApp(QMainWindow):
             QPushButton[groupTab="true"] {
                 background: #1f2630;
                 border: 1px solid #3a4553;
-                min-width: 130px;
+                min-width: 82px;
+                padding: 6px 12px;
                 font-weight: 600;
             }
             QPushButton[groupTab="true"][active="true"] {
@@ -1747,7 +1835,7 @@ class QtDesktopApp(QMainWindow):
         for account in accounts:
             values = [
                 self.format_added(account.created_at),
-                format_phone_with_region(account.phone, account.label),
+                self._format_phone_cell(account.phone, account.label),
                 self.spamblock_status(account),
                 self.login_mail_status(account),
                 self.cloud_password_status(account),
@@ -1798,10 +1886,7 @@ class QtDesktopApp(QMainWindow):
             self.remove_group_button.setVisible(selected > 0 and self.active_group() != "inbox")
         self._set_status_pill(
             self.proxy_pill,
-            (
-                f"VPN exits: {self.proxy_active_count}/{self.proxy_total_count} online"
-                f"  ·  assigned {assigned}/{len(accounts)}"
-            ),
+            f"VPN: {self.proxy_active_count}/{self.proxy_total_count} online · {assigned}/{len(accounts)}",
             "ok" if self.proxy_active_count else "warn",
         )
         from modules.marketapp_rentals import fingerprint
@@ -1813,6 +1898,12 @@ class QtDesktopApp(QMainWindow):
             active_task=self.current_task_id,
             proxy_pool={"active": self.proxy_active_count, "total": self.proxy_total_count},
         )
+        wx_dlg = getattr(self, "_wallet_x_dialog", None)
+        if wx_dlg is not None and wx_dlg.isVisible():
+            wx_dlg.refresh_selected_scope()
+        mk_dlg = getattr(self, "_marketapp_dialog", None)
+        if mk_dlg is not None and mk_dlg.isVisible():
+            mk_dlg.refresh_selection_scope()
 
     def refresh_proxy_dashboard(self) -> None:
         from modules.proxy_manager import ProxyPool
@@ -1913,6 +2004,17 @@ class QtDesktopApp(QMainWindow):
             return "limited"
         return "unknown"
 
+    @staticmethod
+    def _format_phone_cell(phone: str | None, fallback: str | None = None) -> str:
+        digits = extract_phone(phone) or extract_phone(fallback)
+        if not digits:
+            return "none"
+        region = detect_phone_region(digits)
+        if not region:
+            return f"+{digits}"
+        tag = "TON" if region.country == "Fragment" else region.country
+        return f"[{tag}] +{digits}"
+
     def username_status(self, account) -> str:
         username = account.username or account.metadata.get("applied_username")
         return f"@{username}" if username else "none"
@@ -1926,7 +2028,9 @@ class QtDesktopApp(QMainWindow):
             from urllib.parse import urlparse
             parsed = urlparse(proxy)
             port_part = f":{parsed.port}" if parsed.port else ""
-            base = f"{parsed.scheme or 'socks5'}://{parsed.hostname or '?'}{port_part}"
+            scheme = (parsed.scheme or "socks5").lower()
+            host_port = f"{parsed.hostname or '?'}{port_part}"
+            base = host_port if scheme in {"socks5", "socks5h"} else f"{scheme}://{host_port}"
             if latency is not None:
                 return f"{base} ({latency}s)"
             return base
@@ -2687,7 +2791,7 @@ class QtDesktopApp(QMainWindow):
             event.set()
 
     def _financial_dialog_active(self) -> bool:
-        for attr in ("_carousel_funding_dialog", "_native_money_dialog"):
+        for attr in ("_carousel_funding_dialog", "_native_money_dialog", "_wallet_x_dialog"):
             dlg = getattr(self, attr, None)
             if dlg is not None and dlg.isVisible():
                 return True
@@ -4363,7 +4467,16 @@ class QtDesktopApp(QMainWindow):
             QMessageBox.warning(self, "Backup in progress", "Wait for the disk transaction to finish before closing the application.")
             event.ignore()
             return
-        if self.current_task_name in {"carousel-run", "carousel-resume", "native-money:execute", "native-money:deploy-uninit"}:
+        if self.current_task_name in {
+            "carousel-run",
+            "carousel-resume",
+            "native-money:execute",
+            "native-money:deploy-uninit",
+            "wallet-x-withdraw",
+            "wallet-x-batch",
+            "wallet-x-carousel",
+            "rent-pipeline",
+        }:
             if not self.confirm(
                 "Financial operation in progress",
                 "A financial transfer is currently running. Closing does not cancel an already-signed broadcast.\n"
@@ -4399,7 +4512,8 @@ class QtDesktopApp(QMainWindow):
         self._add_button_row(layout, [("Watch selected (3 passes)", lambda: self.check_security_guard(watch=True), "secondary")])
 
     def _build_money_section(self, layout: QVBoxLayout) -> None:
-        self._add_button_row(layout, [("Массово создать кошельки (группа/выбранные)", self.batch_provision_wallets, "primary")])
+        self._add_button_row(layout, [("Master Wallet X (пополнение / вывод)…", self.open_wallet_x, "primary")])
+        self._add_button_row(layout, [("Массово создать кошельки (группа/выбранные)", self.batch_provision_wallets, "secondary")])
         self._add_button_row(layout, [("Список / экспорт адресов кошельков…", self.export_wallet_addresses, "secondary")])
         self._add_button_row(layout, [("Money · карусель…", self.open_carousel_funding, "secondary")])
         self._add_button_row(layout, [("Public assets (read-only)…", self.open_public_assets, "secondary")])
@@ -4407,7 +4521,7 @@ class QtDesktopApp(QMainWindow):
         self._add_button_row(layout, [("Money · open browser…", self.open_money_browser, "secondary")])
 
     def _build_gifts_section(self, layout: QVBoxLayout) -> None:
-        self._add_button_row(layout, [("Gift rental catalog…", self.open_marketapp, "secondary")])
+        self._add_button_row(layout, [("MarketApp · аренда подарков и 1-клик…", self.open_marketapp, "primary")])
         self._add_button_row(layout, [("Marketapp credentials…", self.open_marketapp_credentials, "secondary")])
 
     def review_story_publications(self) -> None:
@@ -4706,6 +4820,214 @@ class QtDesktopApp(QMainWindow):
             if timer: timer.stop()
             self._carousel_funding_guard.clear();dialog.invalidate_scope()
 
+    def _get_wallet_x_service(self):
+        from modules.wallet_x import WalletXService
+        service = getattr(self, "_wallet_x_service", None)
+        if service is None:
+            service = self._wallet_x_service = WalletXService(self.config, accounts=self.accounts)
+        return service
+
+    def open_wallet_x(self) -> None:
+        dialog = getattr(self, "_wallet_x_dialog", None)
+        if dialog and dialog.isVisible():
+            dialog.refresh_selected_scope()
+            dialog.raise_()
+            dialog.activateWindow()
+            return
+        from ui.wallet_x_dialog import WalletXDialog
+        service = self._get_wallet_x_service()
+        status = service.status()
+        intents = service.recent_intents()
+        dialog = self._wallet_x_dialog = WalletXDialog(
+            status,
+            self._request_wallet_x,
+            self,
+            selected_accounts=lambda: list(self.selected_account_ids()),
+            on_close_lock=lambda: service.lock(),
+        )
+        dialog.render_intents(intents)
+        dialog.show()
+
+    def _request_wallet_x(self, action: str, values: dict) -> None:
+        dialog = getattr(self, "_wallet_x_dialog", None)
+        service = self._get_wallet_x_service()
+        if action == "stop-batch":
+            ev = getattr(self, "_wallet_x_stop", None)
+            if isinstance(ev, threading.Event):
+                ev.set()
+            if self.current_task_name in {"wallet-x-batch", "wallet-x-withdraw"}:
+                self.stop_task()
+            return
+
+        phrase_buf = None
+        if isinstance(values.get("phrase_buf"), bytearray):
+            phrase_buf = bytearray(values["phrase_buf"])
+
+        async def run():
+            from modules.wallet_x import WalletXError
+            try:
+                if action == "create-wallet":
+                    res = await asyncio.to_thread(
+                        service.create_wallet,
+                        network=values.get("network", "mainnet"),
+                        confirmed=bool(values.get("confirmed")),
+                    )
+                    intents = await asyncio.to_thread(service.recent_intents)
+                    self.signals.wallet_x_event.emit({
+                        "dialog": dialog,
+                        "action": action,
+                        "status": res,
+                        "intents": intents,
+                        "created_mnemonic": res.get("mnemonic_phrase"),
+                    })
+                elif action == "import-wallet":
+                    try:
+                        phrase_text = (phrase_buf or b"").decode("utf-8")
+                        res = await asyncio.to_thread(
+                            service.import_wallet,
+                            phrase_text,
+                            confirmed=bool(values.get("confirmed")),
+                            replace_existing=bool(values.get("replace_existing")),
+                        )
+                    finally:
+                        phrase_text = ""
+                        if phrase_buf is not None:
+                            phrase_buf[:] = bytes(len(phrase_buf))
+                    intents = await asyncio.to_thread(service.recent_intents)
+                    self.signals.wallet_x_event.emit({"dialog": dialog, "action": action, "status": res, "intents": intents})
+                elif action == "unlock":
+                    res = await asyncio.to_thread(service.unlock, confirmed=bool(values.get("confirmed")))
+                    self.signals.wallet_x_event.emit({"dialog": dialog, "action": action, "status": res})
+                elif action == "lock":
+                    res = await asyncio.to_thread(service.lock)
+                    self.signals.wallet_x_event.emit({"dialog": dialog, "action": action, "status": res})
+                elif action == "export-mnemonic":
+                    phrase = await asyncio.to_thread(service.export_mnemonic, confirmed=bool(values.get("confirmed")))
+                    self.signals.wallet_x_event.emit({"dialog": dialog, "action": action, "mnemonic": phrase})
+                elif action == "delete-wallet":
+                    res = await asyncio.to_thread(
+                        service.delete_wallet,
+                        confirmation=values.get("confirmation", ""),
+                        confirmed=bool(values.get("confirmed")),
+                    )
+                    self.signals.wallet_x_event.emit({"dialog": dialog, "action": action, "status": res, "intents": []})
+                elif action == "refresh-chain":
+                    chain = await service.refresh_chain(include_history=bool(values.get("include_history", True)))
+                    intents = await asyncio.to_thread(service.recent_intents)
+                    self.signals.wallet_x_event.emit({"dialog": dialog, "action": action, "chain": chain, "intents": intents})
+                elif action == "preview-withdraw":
+                    preview = await service.preview_external_send(
+                        values["destination"],
+                        amount_ton=values.get("amount_ton"),
+                        send_all=bool(values.get("send_all")),
+                        comment=values.get("comment", ""),
+                        bounce=bool(values.get("bounce")),
+                        fee_cap_ton=values.get("fee_cap_ton", "0.2"),
+                        confirmed=bool(values.get("confirmed")),
+                    )
+                    self.signals.wallet_x_event.emit({"dialog": dialog, "action": action, "preview": preview})
+                elif action == "preview-batch":
+                    scope_ids = {a.id for a in self.group_accounts()}
+                    preview = await service.preview_batch_fund(
+                        values["account_ids"],
+                        mode=values.get("mode", "fixed"),
+                        amount_ton=values.get("amount_ton"),
+                        target_balance_ton=values.get("target_balance_ton"),
+                        fee_cap_ton=values.get("fee_cap_ton", "0.05"),
+                        comment=values.get("comment", ""),
+                        scope_ids=scope_ids,
+                        confirmed=bool(values.get("confirmed")),
+                    )
+                    self.signals.wallet_x_event.emit({"dialog": dialog, "action": action, "batch_preview": preview})
+                elif action in {"reconcile", "recover"}:
+                    if action == "reconcile":
+                        res = await service.reconcile_intent(values["intent_id"])
+                    else:
+                        res = await service.recover_stale_intent(values["intent_id"], confirmation=values["confirmation"])
+                    intents = await asyncio.to_thread(service.recent_intents)
+                    chain = await service.refresh_chain(include_history=True)
+                    self.signals.wallet_x_event.emit({"dialog": dialog, "action": action, "chain": chain, "intents": intents, "intent_result": res})
+                else:
+                    raise ValueError(f"Unsupported Wallet X action: {action}")
+            except Exception as exc:
+                msg = str(exc) if isinstance(exc, (WalletXError, ValueError)) else f"Wallet X error ({type(exc).__name__})"
+                self.signals.wallet_x_event.emit({"dialog": dialog, "action": action, "error": msg})
+
+        if action in {"execute-withdraw", "execute-batch"}:
+            if self.foreground_task_busy() or self._task_start_pending:
+                if dialog:
+                    dialog.fail("Finish or stop the active foreground task first.")
+                return
+            stop_ev = self._wallet_x_stop = threading.Event()
+            task_name = "wallet-x-withdraw" if action == "execute-withdraw" else "wallet-x-batch"
+            async def fg_runner(stop):
+                try:
+                    if action == "execute-withdraw":
+                        res = await service.execute_reviewed(values["review_token"], confirmation=values["confirmation"])
+                    else:
+                        def on_batch_prog(ev):
+                            self.signals.wallet_x_event.emit({"dialog": dialog, "action": "batch-progress", "progress": ev})
+                        async def stop_watcher():
+                            while not stop.is_set() and not stop_ev.is_set():
+                                await asyncio.sleep(0.2)
+                            stop_ev.set()
+                        watcher = asyncio.create_task(stop_watcher())
+                        try:
+                            res = await service.execute_batch_fund(
+                                values["review_token"],
+                                confirmation=values["confirmation"],
+                                stop_event=stop_ev,
+                                progress=on_batch_prog,
+                            )
+                        finally:
+                            stop_ev.set()
+                            watcher.cancel()
+                    intents = await asyncio.to_thread(service.recent_intents)
+                    chain = await service.refresh_chain(include_history=True)
+                    self.signals.wallet_x_event.emit({"dialog": dialog, "action": action, "result": res, "intents": intents, "chain": chain})
+                    return f"Wallet X {action} done"
+                except Exception as exc:
+                    msg = str(exc) if isinstance(exc, ValueError) else f"Wallet X transfer failed ({type(exc).__name__})"
+                    intents = await asyncio.to_thread(service.recent_intents)
+                    self.signals.wallet_x_event.emit({"dialog": dialog, "action": action, "error": msg, "intents": intents})
+                    raise
+            self.start_managed_task(task_name, fg_runner)
+            return
+
+        self.worker.submit(run())
+
+    def on_wallet_x_event(self, payload: dict) -> None:
+        dialog = getattr(self, "_wallet_x_dialog", None)
+        if not dialog or dialog is not payload.get("dialog") or not dialog.isVisible():
+            return
+        if "intents" in payload and payload["intents"] is not None:
+            dialog.render_intents(payload["intents"])
+        if payload.get("error"):
+            dialog.fail(payload["error"])
+            return
+        action = payload.get("action")
+        if action == "batch-progress":
+            dialog.render_batch_progress(payload["progress"])
+        elif action == "export-mnemonic":
+            dialog.show_exported_mnemonic(payload["mnemonic"])
+        elif action == "preview-withdraw":
+            dialog.render_withdraw_preview(payload["preview"])
+        elif action == "preview-batch":
+            dialog.render_batch_preview(payload["batch_preview"])
+        elif action == "execute-batch":
+            if "chain" in payload:
+                dialog.render_chain(payload["chain"])
+            dialog.render_batch_done(payload["result"])
+        elif action == "execute-withdraw":
+            if "chain" in payload:
+                dialog.render_chain(payload["chain"])
+            res = payload.get("result") or {}
+            dialog.busy(False, f"Вывод выполнен ({res.get('state', 'submitted')}); intent {str(res.get('id', ''))[:8]}.")
+        elif "chain" in payload:
+            dialog.render_chain(payload["chain"])
+        elif "status" in payload:
+            dialog.render_status(payload["status"], intents=payload.get("intents"), created_mnemonic=payload.get("created_mnemonic"))
+
     def open_carousel_funding(self):
         try:
             if self.foreground_task_busy() or self._task_start_pending: raise ValueError('Сначала завершите текущую операцию')
@@ -4763,9 +5085,9 @@ class QtDesktopApp(QMainWindow):
             args={'scope_ids':ids,'ui_context':context}
             if action=='create': dialog.render(service.create(values['ids'],confirmed=True,**args));return
             if action=='cancel': dialog.render(service.cancel(values['id'],values['revision'],confirmation=values['confirmation'],**args));return
-            if action not in {'check','review','run','inspect','provision-route','deploy-uninit','resume'}: raise ValueError('Unknown funding action')
+            if action not in {'check','review','run','inspect','provision-route','deploy-uninit','resume','preview-wallet-x','execute-wallet-x'}: raise ValueError('Unknown funding action')
             workspace=None
-            if action in {'review','run','inspect','provision-route','deploy-uninit','resume'}:
+            if action in {'review','run','inspect','provision-route','deploy-uninit','resume','preview-wallet-x','execute-wallet-x'}:
                 from modules.money_carousel_workspace import CarouselMoneyWorkspace
                 from modules.money_workspace import NativeMoneyWorkspace
                 workspace=getattr(self,'_carousel_money_workspace',None)
@@ -4780,9 +5102,17 @@ class QtDesktopApp(QMainWindow):
                 try:
                     scope_check=lambda:guard.is_set() and not stop.is_set()
                     if action=='check': result=await service.check(values['id'],values['revision'],tx_hash=values.get('tx_hash'),confirmed=True,scope_check=scope_check,**args)
-                    elif action=='review': result=await workspace.review(values['reference'],values['limits'],confirmed=True,scope_check=scope_check,**args)
+                    elif action=='review': result=await workspace.review(values['reference'],values['limits'],confirmed=True,scope_check=scope_check,end_at_wallet_x=bool(values.get('end_at_wallet_x')),**args)
                     elif action=='provision-route': result=await workspace.auto_provision_route(values['reference'],confirmed=True,scope_check=scope_check,**args)
                     elif action=='deploy-uninit': result=await workspace.deploy_uninit_node(values['reference'],limits=values['limits'],confirmed=True,scope_check=scope_check,**args)
+                    elif action=='preview-wallet-x':
+                        wx=self._get_wallet_x_service()
+                        result=await wx.preview_carousel_funding(values['id'],values['revision'],amount_ton=values['amount_ton'],scope_ids=ids,ui_context=context,money_service=service.money,native_workspace=workspace.native,auto_provision_first=True,confirmed=True)
+                    elif action=='execute-wallet-x':
+                        wx=self._get_wallet_x_service()
+                        await wx.execute_carousel_funding(values['review_token'],confirmation=values['confirmation'])
+                        self.signals.log_message.emit('Master Wallet X отправил стартовый перевод для карусели; сверяю поступление.',self.active_group())
+                        result=await service.check(values['id'],values['revision'],tx_hash=None,confirmed=True,scope_check=scope_check,**args)
                     elif action=='resume':
                         result=await workspace.resume(values['id'],confirmation=values['confirmation'],scope_check=scope_check,
                             progress=lambda event:self.signals.carousel_funding_event.emit({'guard':guard,'kind':'progress','result':event}),**args)
@@ -4794,7 +5124,8 @@ class QtDesktopApp(QMainWindow):
                 except (Exception, asyncio.CancelledError) as exc:
                     self.signals.carousel_funding_event.emit({'guard':guard,'kind':action,'error':str(exc) if isinstance(exc,ValueError) else 'Операция карусели остановлена ('+type(exc).__name__+')'})
                     raise
-            self.start_managed_task('carousel-funding-check' if action=='check' else 'carousel-'+action,runner)
+            task_label='wallet-x-carousel' if action=='execute-wallet-x' else ('carousel-funding-check' if action=='check' else 'carousel-'+action)
+            self.start_managed_task(task_label,runner)
         except Exception as exc:
             dialog.busy(False);dialog.message.setText(str(exc) if isinstance(exc,ValueError) else 'Funding action failed ('+type(exc).__name__+')');dialog.show_status()
 
@@ -4805,6 +5136,10 @@ class QtDesktopApp(QMainWindow):
         if not self._carousel_funding_guard.is_set(): return
         kind=payload.get('kind','check')
         if kind=='progress': dialog.render_progress(payload['result']);return
+        if kind=='preview-wallet-x':
+            if payload.get('error'): dialog.busy(False);dialog.message.setText(payload['error']);dialog.show_status()
+            else: dialog.confirm_wallet_x_funding(payload['result'])
+            return
         if kind in {'run','resume'}: dialog.render_done(payload.get('result'),payload.get('error'));return
         if kind in {'provision-route','deploy-uninit'}:
             dialog.busy(False)
@@ -5140,63 +5475,224 @@ class QtDesktopApp(QMainWindow):
         from ui.marketapp_dialog import MarketappDialog
         dialog = getattr(self, "_marketapp_dialog", None)
         if dialog and dialog.isVisible():
+            dialog.refresh_selection_scope()
             dialog.raise_()
+            dialog.activateWindow()
             return
         self._marketapp_dialog = MarketappDialog(self._request_marketapp, self,
             selected_accounts=lambda: list(self.selected_account_ids()))
-        self._marketapp_dialog.open()
+        self._marketapp_dialog.show()
+
+    def _get_rent_orchestrator(self):
+        from modules.marketapp_browser import MarketappCatalogSession
+        from modules.marketapp_rentals import MarketappRentalService
+        from modules.rent_orchestrator import RentOrchestratorService
+        if not hasattr(self, "_marketapp_session"):
+            self._marketapp_session = MarketappCatalogSession(self.config)
+        if not hasattr(self, "_marketapp_rentals"):
+            self._marketapp_rentals = MarketappRentalService(
+                self.config,
+                reader=self._marketapp_session.reader,
+                accounts=self.accounts,
+                token_source=self._marketapp_session.token_source,
+            )
+        orchestrator = getattr(self, "_rent_orchestrator", None)
+        if orchestrator is None:
+            orchestrator = self._rent_orchestrator = RentOrchestratorService(
+                self.config,
+                rentals=self._marketapp_rentals,
+                reader=self._marketapp_session.reader,
+                accounts=self.accounts,
+                token_source=self._marketapp_session.token_source,
+            )
+        return orchestrator
 
     def _request_marketapp(self, payload, generation):
         from modules.marketapp_browser import MarketappCatalogSession
         from modules.marketapp_catalog import CatalogError
+        from modules.marketapp_rentals import MarketappRentalService, fingerprint
         if not hasattr(self, "_marketapp_session"):
             self._marketapp_session = MarketappCatalogSession(self.config)
         dialog = self._marketapp_dialog
         operation = payload.get("_action", "catalog")
+        if operation == "stop":
+            ev = getattr(self, "_marketapp_stop", None)
+            if isinstance(ev, threading.Event):
+                ev.set()
+            return
         request_payload = {key: value for key, value in payload.items() if key != "_action"}
-        from modules.marketapp_rentals import MarketappRentalService, fingerprint
         scope = {account.id for account in self.group_accounts()}
         context = fingerprint([self.active_group(), self.account_filter.to_dict()])
         self._marketapp_snapshot = (context, scope)
-        if operation != "catalog" and (self.foreground_task_busy() or self._task_start_pending):
-            dialog.render({"ok": False, "error": "Finish or stop the foreground task first"}, generation)
+        session_ops = {"scan", "visibility", "batch-scan", "batch-visibility", "rent-execute", "rent-resume", "batch-fund-execute"}
+        if operation in session_ops and (self.foreground_task_busy() or self._task_start_pending):
+            dialog.render({"ok": False, "error": "Finish or stop the foreground task first"}, generation, action=operation)
             return
+        stop_ev = self._marketapp_stop = threading.Event()
+        orchestrator = self._get_rent_orchestrator()
+
         async def request():
             try:
+                def check_scope() -> bool:
+                    snap_context, snap_scope = self._marketapp_snapshot
+                    return (
+                        snap_context == context
+                        and not self.foreground_task_busy()
+                        and not self._task_start_pending
+                        and (operation in {"rentals", "sync-workspace", "batch-scan", "batch-fund-quote", "batch-fund-execute", "tonconnect"} or request_payload.get("account_id") in snap_scope)
+                    )
+
                 if operation == "catalog":
                     result = {"ok": True, "catalog": await self._marketapp_session.fetch(request_payload)}
-                else:
-                    if not hasattr(self, "_marketapp_rentals"):
-                        self._marketapp_rentals = MarketappRentalService(self.config)
-                    def check_scope() -> bool:
-                        snap_context, snap_scope = self._marketapp_snapshot
-                        return (
-                            snap_context == context
-                            and not self.foreground_task_busy()
-                            and not self._task_start_pending
-                            and (operation == "rentals" or request_payload.get("account_id") in snap_scope)
+                elif operation == "usernames":
+                    page = await self._marketapp_session.reader.read_usernames(
+                        token=self._marketapp_session.token_source(),
+                        confirmed=True,
+                        limit=request_payload.get("limit", 20),
+                        sort_by=request_payload.get("sort_by", "price_per_day"),
+                        cursor=request_payload.get("cursor"),
+                        include_sellable=bool(request_payload.get("include_sellable")),
+                    )
+                    result = {"ok": True, "catalog": page}
+                elif operation == "sync-workspace":
+                    allow_scan = bool(request_payload.get("account_ids") and not self.foreground_task_busy() and not self._task_start_pending)
+                    ws = await orchestrator.sync_workspace(
+                        request_payload.get("account_ids"),
+                        scope_ids=scope,
+                        ui_context=context,
+                        include_gifts=True,
+                        include_usernames=True,
+                        include_rented=True,
+                        scan_accounts=allow_scan,
+                        check_balances=True,
+                        catalog_limit=request_payload.get("limit", 20),
+                        sort_by=request_payload.get("sort_by", "price_per_day"),
+                        include_sellable=bool(request_payload.get("include_sellable")),
+                        scope_check=check_scope if allow_scan else None,
+                        stop_event=stop_ev,
+                    )
+                    result = {"ok": True, "workspace": ws}
+                elif operation == "batch-scan":
+                    scan_res = await self._marketapp_rentals.sync_batch(
+                        request_payload.get("account_ids", []),
+                        scope_ids=scope,
+                        ui_context=context,
+                        confirmed=True,
+                        scope_check=check_scope,
+                        stop_event=stop_ev,
+                    )
+                    result = {"ok": True, "batch_scan": scan_res}
+                elif operation == "batch-visibility":
+                    res = await self._marketapp_rentals.set_account_visibility_all(
+                        request_payload["account_id"],
+                        visible=bool(request_payload["visible"]),
+                        confirmed=True,
+                        review_token=request_payload.get("review_token"),
+                        scope_ids=scope,
+                        ui_context=context,
+                        scope_check=check_scope,
+                        stop_event=stop_ev,
+                    )
+                    result = {"ok": True, **res}
+                elif operation == "rent-quote":
+                    q = await orchestrator.prepare_rent_pipeline(
+                        operation=request_payload["operation"],
+                        nft_address=request_payload.get("nft_address"),
+                        nft_addresses=request_payload.get("nft_addresses"),
+                        asset_kind=request_payload.get("asset_kind", "gift"),
+                        duration_days=request_payload.get("duration_days"),
+                        price_per_day=request_payload.get("price_per_day"),
+                        sale_during_rent=bool(request_payload.get("sale_during_rent")),
+                        account_id=request_payload.get("account_id"),
+                        nft_name=request_payload.get("nft_name"),
+                        auto_visible=bool(request_payload.get("auto_visible", True)),
+                        scope_ids=scope,
+                        ui_context=context,
+                    )
+                    result = {"ok": True, "quote": q}
+                elif operation in {"rent-execute", "rent-resume"}:
+                    wx = self._get_wallet_x_service()
+                    wx_arg = wx if wx.status().get("configured") else None
+                    def on_pipe_prog(ev):
+                        self.signals.marketapp_event.emit({"dialog": dialog, "generation": generation, "action": operation, "result": {"progress": ev}})
+                    if operation == "rent-execute":
+                        pipe = await orchestrator.execute_rent_pipeline(
+                            request_payload["job_id"],
+                            review_token=request_payload["review_token"],
+                            confirmation=request_payload["confirmation"],
+                            wallet_x=wx_arg,
+                            scope_ids=scope,
+                            ui_context=context,
+                            auto_visible=request_payload.get("auto_visible"),
+                            stop_event=stop_ev,
+                            progress=on_pipe_prog,
                         )
+                    else:
+                        pipe = await orchestrator.resume_rent_job(
+                            request_payload["job_id"],
+                            external_tx_submitted=bool(request_payload.get("external_tx_submitted")),
+                            scope_ids=scope,
+                            ui_context=context,
+                            auto_visible=request_payload.get("auto_visible"),
+                            stop_event=stop_ev,
+                            progress=on_pipe_prog,
+                        )
+                    result = {"ok": True, "pipeline": pipe, "jobs": orchestrator.list_jobs()}
+                elif operation == "tonconnect":
+                    tc = await self._marketapp_session.reader.submit_tonconnect(
+                        token=self._marketapp_session.token_source(),
+                        nft_address=request_payload["nft_address"],
+                        tonconnect_url=request_payload["tonconnect_url"],
+                        confirmed=True,
+                    )
+                    result = {"ok": True, "tonconnect": tc}
+                elif operation == "batch-fund-quote":
+                    wx = self._get_wallet_x_service()
+                    mode = request_payload.get("mode", "fixed")
+                    amt = request_payload.get("amount_ton")
+                    prev = await orchestrator.prepare_batch_rent_funding(
+                        wx,
+                        request_payload.get("account_ids", []),
+                        mode=mode,
+                        amount_ton=amt if mode == "fixed" else None,
+                        target_balance_ton=amt if mode == "top_up_to" else None,
+                        confirmed=True,
+                        scope_ids=scope,
+                        ui_context=context,
+                    )
+                    result = {"ok": True, "preview": prev}
+                elif operation == "batch-fund-execute":
+                    wx = self._get_wallet_x_service()
+                    bres = await orchestrator.execute_batch_rent_funding(
+                        wx,
+                        request_payload["review_token"],
+                        confirmation=request_payload["confirmation"],
+                        stop_event=stop_ev,
+                    )
+                    result = {"ok": True, "batch": bres}
+                else:
                     result = {"ok": True, **await self._marketapp_rentals.execute(operation, request_payload,
                         scope_ids=scope, ui_context=context,
                         scope_check=check_scope)}
-            except CatalogError as exc:
+            except (CatalogError, ValueError) as exc:
                 result = {"ok": False, "error": str(exc)}
             except NotImplementedError:
                 result = {"ok": False, "error": "Hosted gifts unsupported by this backend layer; no visibility change confirmed"}
-            except Exception:
-                result = {"ok": False, "error": "Visibility outcome unconfirmed. Refresh rentals and scan; do not retry blindly" if operation == "visibility" else "Catalog/rental operation unavailable; refresh explicitly"}
-            self.signals.marketapp_event.emit({"dialog": dialog, "generation": generation, "result": result})
+            except Exception as exc:
+                result = {"ok": False, "error": "Visibility outcome unconfirmed. Refresh rentals and scan; do not retry blindly" if operation == "visibility" else f"MarketApp operation error ({type(exc).__name__})"}
+            self.signals.marketapp_event.emit({"dialog": dialog, "generation": generation, "action": operation, "result": result})
+
         coroutine = request()
         try:
             self.worker.submit(coroutine)
         except Exception:
             coroutine.close()
-            self.signals.marketapp_event.emit({"dialog": dialog, "generation": generation,
+            self.signals.marketapp_event.emit({"dialog": dialog, "generation": generation, "action": operation,
                 "result": {"ok": False, "error": "Catalog worker unavailable; retry explicitly later"}})
 
     def on_marketapp_event(self, payload):
         if getattr(self, "_marketapp_dialog", None) is payload["dialog"]:
-            payload["dialog"].render(payload["result"], payload["generation"])
+            payload["dialog"].render(payload["result"], payload["generation"], action=payload.get("action"))
 
     def open_public_assets(self) -> None:
         selected = set(self.selected_account_ids())

@@ -39,6 +39,7 @@ class DesktopPackageTests(unittest.TestCase):
                 "profile_studio_dialog.py",
                 "task_history_dialog.py",
                 "vault_dialog.py",
+                "wallet_x_dialog.py",
             },
             {p.name for p in (APP / "ui").glob("*.py")},
         )
