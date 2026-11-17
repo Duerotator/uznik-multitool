@@ -42,25 +42,28 @@ FEMALE_FIRST_NAMES.extend([
     "Emily", "Hannah", "Megan", "Nicole", "Sophie", "Amelia", "Isla", "Leah",
 ])
 
-LAST_NAMES = [
+NEUTRAL_LAST_NAMES = [
     "Adams", "Allen", "Bailey", "Baker", "Bell", "Bennett", "Blake", "Brooks",
     "Brown", "Carter", "Cole", "Collins", "Cook", "Cooper", "Davis", "Evans",
     "Fisher", "Ford", "Foster", "Gray", "Green", "Hall", "Harris", "Hart",
     "Hill", "Howard", "Jackson", "James", "King", "Knight", "Lane", "Lewis",
     "Miller", "Morgan", "Murphy", "Nelson", "Parker", "Price", "Reed", "Ross",
     "Scott", "Shaw", "Smith", "Stone", "Taylor", "Turner", "Walker", "Ward",
-    "West", "White", "Wilson", "Wood", "Young", "Volkov", "Sokolov", "Orlov",
-    "Morozov", "Smirnov", "Ivanov", "Petrov", "Novikov", "Pavlov", "Romanov",
-]
-
-LAST_NAMES.extend([
-    "Kovalev", "Kovalenko", "Popov", "Vasiliev", "Nikolaev", "Alekseev",
-    "Stepanov", "Kozlov", "Kiselev", "Medvedev", "Kravchenko", "Bondarenko",
-    "Volkova", "Sokolova", "Orlova", "Morozova", "Smirnova", "Ivanova",
-    "Petrova", "Novikova", "Pavlova", "Romanova", "Makarova", "Egorova",
+    "West", "White", "Wilson", "Wood", "Young",
+    "Kovalenko", "Kravchenko", "Bondarenko",
     "Anderson", "Thompson", "Roberts", "Edwards", "Hughes", "Phillips",
     "Campbell", "Mitchell", "Morris", "Rogers", "Peterson", "Sanders",
-])
+]
+
+MALE_SLAVIC_LAST_NAMES = [
+    "Volkov", "Sokolov", "Orlov", "Morozov", "Smirnov", "Ivanov", "Petrov", "Novikov",
+    "Pavlov", "Romanov", "Kovalev", "Popov", "Vasiliev", "Nikolaev", "Alekseev",
+    "Stepanov", "Kozlov", "Kiselev", "Medvedev", "Makarov", "Egorov",
+]
+
+FEMALE_SLAVIC_LAST_NAMES = [f"{name}a" for name in MALE_SLAVIC_LAST_NAMES]
+
+LAST_NAMES = NEUTRAL_LAST_NAMES + MALE_SLAVIC_LAST_NAMES + FEMALE_SLAVIC_LAST_NAMES
 
 NICK_WORDS = [
     "nova", "pixel", "shift", "byte", "echo", "orbit", "wave", "metro",
@@ -86,7 +89,31 @@ BIO_PARTS = [
     "travel plans and clean inboxes",
     "music, work, and a little chaos",
     "just here for updates",
+    "code, design, midnight tea",
+    "gym, podcasts, short trips",
+    "always testing something new",
+    "film grain and quiet cafes",
+    "shipping ideas step by step",
+    "reading charts and saving links",
+    "minimal noise, max focus",
+    "digital notes & weekend hikes",
+    "кофе, музыка и прогулки",
+    "работа, спорт, путешествия",
+    "меньше шума — больше дела",
+    "заметки, книги и тишина",
+    "в сети по вечерам",
+    "проекты, дороги и хороший звук",
+    "тихий ритм и планы на осень",
+    "просто читаю и делюсь интересным",
 ]
+
+
+def _last_names_for(gender: str) -> list[str]:
+    if gender == "m":
+        return NEUTRAL_LAST_NAMES + MALE_SLAVIC_LAST_NAMES
+    if gender == "f":
+        return NEUTRAL_LAST_NAMES + FEMALE_SLAVIC_LAST_NAMES
+    return LAST_NAMES
 
 
 def write_profile_plan(
@@ -127,7 +154,7 @@ def generate_profile_plan(
             avatars = available_avatars
 
         first_name = rng.choice(first_names)
-        last_name = rng.choice(LAST_NAMES)
+        last_name = rng.choice(_last_names_for(gender))
         username = _make_unique_username(first_name, last_name, rng, used_usernames)
         bio = _make_bio(rng)
         avatar_path = rng.choice(avatars) if avatars else None

@@ -20,6 +20,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlsplit
+from urllib.request import url2pathname
 
 import httpx
 
@@ -70,6 +71,7 @@ TELEGRAM_DCS: tuple[tuple[str, int], ...] = (
     ("149.154.167.51", 443),   # DC2 Amsterdam
     ("149.154.175.50", 443),   # DC1 Miami
     ("149.154.175.100", 443),  # DC3 Miami
+    ("149.154.167.91", 443),   # DC4 Amsterdam
     ("91.108.56.130", 443),    # DC5 Singapore
 )
 
@@ -361,7 +363,73 @@ async def validate_proxy(
         return (False, 0.0)
     finally:
         if writer is not None:
-            writer.close()
+            try:
+                writer.close()
+            except OSError:
+                pass
+
+
+async def _screen_and_validate_proxy(
+    ip: str,
+    port: int,
+    protocol: str,
+    probe_timeout: float = SCREEN_TIMEOUT,
+    validate_timeout: float = VALIDATE_TIMEOUT,
+    auth: tuple[str, str] | None = None,
+) -> tuple[bool, bool, float]:
+    """Single-connection tunnel screen + MTProto req_pq_multi verification."""
+    handshake = _HANDSHAKES.get(protocol)
+    if handshake is None:
+        return (False, False, 0.0)
+    dst = TELEGRAM_DCS[0]
+    started = time.monotonic()
+    writer = None
+    tunnel_ok = False
+    try:
+        reader, writer = await asyncio.wait_for(asyncio.open_connection(ip, port), timeout=probe_timeout)
+        if protocol in {"socks5", "http"}:
+            connected = await handshake(reader, writer, dst, probe_timeout, auth)
+        else:
+            connected = await handshake(reader, writer, dst, probe_timeout)
+        if not connected:
+            return (False, False, 0.0)
+        tunnel_ok = True
+
+        nonce = secrets.token_bytes(16)
+        body = struct.pack("<I", 0xBE7E8EF1) + nonce
+        message_id = (int(time.time() * (1 << 32)) // 4) * 4
+        envelope = b"\x00" * 8 + struct.pack("<Q", message_id) + struct.pack("<I", len(body)) + body
+        writer.write(b"\xef" + bytes((len(envelope) // 4,)) + envelope)
+        await writer.drain()
+
+        length_byte = await asyncio.wait_for(reader.readexactly(1), timeout=validate_timeout)
+        if length_byte[0] == 0x7F:
+            words = int.from_bytes(
+                await asyncio.wait_for(reader.readexactly(3), timeout=validate_timeout), "little"
+            )
+        else:
+            words = length_byte[0]
+        if words <= 0 or words > 1024:
+            return (True, False, 0.0)
+        response = await asyncio.wait_for(reader.readexactly(words * 4), timeout=validate_timeout)
+        if len(response) < 40 or response[:8] != b"\x00" * 8:
+            return (True, False, 0.0)
+        body_len = struct.unpack_from("<I", response, 16)[0]
+        response_body = response[20:20 + body_len]
+        if len(response_body) < 20:
+            return (True, False, 0.0)
+        constructor = struct.unpack_from("<I", response_body, 0)[0]
+        if constructor != 0x05162463 or response_body[4:20] != nonce:
+            return (True, False, 0.0)
+        return (True, True, max(round(time.monotonic() - started, 3), 0.001))
+    except (OSError, asyncio.TimeoutError, asyncio.IncompleteReadError, struct.error):
+        return (tunnel_ok, False, 0.0)
+    finally:
+        if writer is not None:
+            try:
+                writer.close()
+            except OSError:
+                pass
 
 
 async def tcp_check(ip: str, port: int, timeout: float = 3.0) -> tuple[bool, float]:
@@ -394,12 +462,14 @@ class ProxyPool:
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(str(self.db_path), timeout=15.0)
-        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=15000")
         conn.execute("PRAGMA synchronous=NORMAL")
         return conn
 
     def _init_db(self) -> None:
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
         with closing(self._connect()) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS proxies (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -528,22 +598,31 @@ class ProxyPool:
 
     def _run(self, sql: str, params: Any = (), many: bool = False) -> None:
         try:
-            with closing(self._connect()) as conn:
+            with closing(self._connect()) as conn, conn:
                 if many:
                     conn.executemany(sql, params)
                 else:
                     conn.execute(sql, params)
-                conn.commit()
         except sqlite3.Error as exc:
-            logger.debug("DB write error: %s", exc)
+            logger.warning("Proxy DB write error (%s): %s", type(exc).__name__, exc)
+            raise
+
+    def _run_tx(self, operation: Callable[[sqlite3.Connection], Any]) -> Any:
+        try:
+            with closing(self._connect()) as conn, conn:
+                conn.execute("BEGIN IMMEDIATE")
+                return operation(conn)
+        except sqlite3.Error as exc:
+            logger.warning("Proxy DB transaction error (%s): %s", type(exc).__name__, exc)
+            raise
 
     def _query(self, sql: str, params: Any = ()) -> list[tuple]:
         try:
             with closing(self._connect()) as conn:
                 return conn.execute(sql, params).fetchall()
         except sqlite3.Error as exc:
-            logger.debug("DB read error: %s", exc)
-            return []
+            logger.warning("Proxy DB read error (%s): %s", type(exc).__name__, exc)
+            raise
 
     # -- async API --
 
@@ -554,15 +633,17 @@ class ProxyPool:
         protocol: str,
         username: str | None = None,
         password: str | None = None,
+        latency: float = 0.0,
     ) -> bool:
         await asyncio.to_thread(
             self._run,
-            "INSERT INTO proxies (ip, port, protocol, status, last_checked, username, password)"
-            " VALUES (?, ?, ?, 'active', ?, ?, ?)"
+            "INSERT INTO proxies (ip, port, protocol, latency, status, last_checked, username, password)"
+            " VALUES (?, ?, ?, ?, 'active', ?, ?, ?)"
             " ON CONFLICT(ip, port, protocol) DO UPDATE SET"
             " status='active', last_checked=excluded.last_checked, fails=0,"
+            " latency=CASE WHEN excluded.latency > 0 THEN excluded.latency ELSE proxies.latency END,"
             " username=excluded.username, password=excluded.password",
-            (ip, port, protocol, utc_now(), username, password),
+            (ip, port, protocol, latency, utc_now(), username, password),
         )
         return True
 
@@ -579,10 +660,10 @@ class ProxyPool:
         # Failed candidates belong in the temporary blacklist, not in the usable
         # proxy table. Keeping thousands of dead rows made pool totals misleading.
         bad = [(ip, port, proto, stamp) for ip, port, proto, ok, _ in rows if not ok]
-        async with self._lock:
+
+        def _tx(conn: sqlite3.Connection) -> None:
             if good:
-                await asyncio.to_thread(
-                    self._run,
+                conn.executemany(
                     "INSERT INTO proxies (ip, port, protocol, latency, last_checked, slow_pings, normal_pings, status, fails)"
                     " VALUES (?, ?, ?, ?, ?, ?, ?, 'active', 0)"
                     " ON CONFLICT(ip, port, protocol) DO UPDATE SET"
@@ -597,22 +678,20 @@ class ProxyPool:
                     " END,"
                     " fails=0",
                     good,
-                    True,
                 )
             if bad:
-                await asyncio.to_thread(
-                    self._run,
+                conn.executemany(
                     "INSERT INTO proxy_blacklist (ip, port, protocol, added_at) VALUES (?, ?, ?, ?)"
                     " ON CONFLICT(ip, port, protocol) DO UPDATE SET added_at=excluded.added_at",
                     bad,
-                    True,
                 )
-                await asyncio.to_thread(
-                    self._run,
+                conn.executemany(
                     "DELETE FROM proxies WHERE ip = ? AND port = ? AND protocol = ?",
                     [(ip, port, proto) for ip, port, proto, _stamp in bad],
-                    True,
                 )
+
+        async with self._lock:
+            await asyncio.to_thread(self._run_tx, _tx)
 
     async def store_gateway_results(
         self, rows: list[tuple[str, int, str, bool, float]],
@@ -638,26 +717,22 @@ class ProxyPool:
             if not ok
         ]
         endpoints = [(ip, port, proto) for ip, port, proto, _ok, _latency in rows]
-        async with self._lock:
-            existing_gateway = await asyncio.to_thread(
-                self._query,
+        current = set(endpoints)
+
+        def _tx(conn: sqlite3.Connection) -> None:
+            existing_gateway = conn.execute(
                 "SELECT ip, port, protocol FROM proxies"
                 " WHERE ip IN ('127.0.0.1', '::1') AND port BETWEEN ? AND ?",
                 (GATEWAY_PORT_MIN, GATEWAY_PORT_MAX),
-            )
-            current = set(endpoints)
-            retired = [entry for entry in existing_gateway if entry not in current]
+            ).fetchall()
+            retired = [entry for entry in existing_gateway if tuple(entry) not in current]
             if retired:
-                await asyncio.to_thread(
-                    self._run,
-                    "UPDATE proxies SET status='retired'"
-                    " WHERE ip = ? AND port = ? AND protocol = ?",
+                conn.executemany(
+                    "UPDATE proxies SET status='retired' WHERE ip = ? AND port = ? AND protocol = ?",
                     retired,
-                    True,
                 )
             if good:
-                await asyncio.to_thread(
-                    self._run,
+                conn.executemany(
                     "INSERT INTO proxies (ip, port, protocol, latency, last_checked, slow_pings, normal_pings, status, fails)"
                     " VALUES (?, ?, ?, ?, ?, ?, ?, 'active', 0)"
                     " ON CONFLICT(ip, port, protocol) DO UPDATE SET"
@@ -672,51 +747,48 @@ class ProxyPool:
                     " END,"
                     " fails=0",
                     good,
-                    True,
                 )
             if recovering:
-                await asyncio.to_thread(
-                    self._run,
+                conn.executemany(
                     "INSERT INTO proxies (ip, port, protocol, latency, last_checked, status, fails)"
                     " VALUES (?, ?, ?, 0, ?, 'recovering', 1)"
                     " ON CONFLICT(ip, port, protocol) DO UPDATE SET"
                     " last_checked=excluded.last_checked, status='recovering',"
                     " fails=proxies.fails+1",
                     recovering,
-                    True,
                 )
-            await asyncio.to_thread(
-                self._run,
+            conn.executemany(
                 "DELETE FROM proxy_blacklist WHERE ip = ? AND port = ? AND protocol = ?",
                 endpoints,
-                True,
             )
 
+        async with self._lock:
+            await asyncio.to_thread(self._run_tx, _tx)
+
     async def archive_non_gateway_entries(self) -> int:
-        """Move historical public-proxy rows out of the live pool.
+        """Move historical public-proxy rows out of the live pool atomically.
 
         VPN mode must never silently fall back to an old harvested endpoint.
         Keeping the rows in SQLite makes the switch reversible without keeping
         the legacy system active.
         """
         stamp = utc_now()
-        async with self._lock:
-            before = await asyncio.to_thread(
-                self._query,
-                "SELECT COUNT(*) FROM proxies WHERE NOT (ip IN ('127.0.0.1','::1') AND port BETWEEN 21000 AND 21999)",
-            )
-            await asyncio.to_thread(
-                self._run,
+
+        def _tx(conn: sqlite3.Connection) -> int:
+            conn.execute(
                 "INSERT INTO archived_proxies (ip,port,protocol,latency,last_checked,status,username,password,archived_at,archive_reason) "
                 "SELECT ip,port,protocol,latency,last_checked,status,username,password,?, 'vpn_gateway_migration' "
-                "FROM proxies WHERE NOT (ip IN ('127.0.0.1','::1') AND port BETWEEN 21000 AND 21999)",
-                (stamp,),
+                "FROM proxies WHERE NOT (ip IN ('127.0.0.1','::1') AND port BETWEEN ? AND ?)",
+                (stamp, GATEWAY_PORT_MIN, GATEWAY_PORT_MAX),
             )
-            await asyncio.to_thread(
-                self._run,
-                "DELETE FROM proxies WHERE NOT (ip IN ('127.0.0.1','::1') AND port BETWEEN 21000 AND 21999)",
+            deleted = conn.execute(
+                "DELETE FROM proxies WHERE NOT (ip IN ('127.0.0.1','::1') AND port BETWEEN ? AND ?)",
+                (GATEWAY_PORT_MIN, GATEWAY_PORT_MAX),
             )
-        return int(before[0][0]) if before else 0
+            return int(deleted.rowcount or 0)
+
+        async with self._lock:
+            return await asyncio.to_thread(self._run_tx, _tx)
 
     async def update_status(self, ip: str, port: int, protocol: str, status: str, latency: float) -> None:
         await asyncio.to_thread(
@@ -851,20 +923,27 @@ class ProxyPool:
             params.append(protocol)
         query += (
             " ORDER BY CASE WHEN status='active' THEN 0 ELSE 1 END,"
-            " CASE WHEN protocol='socks5' THEN 0 ELSE 1 END, latency ASC LIMIT ?"
+            " CASE WHEN protocol='socks5' THEN 0 ELSE 1 END,"
+            " CASE WHEN latency > 0 THEN 0 ELSE 1 END, latency ASC LIMIT ?"
         )
         params.append(max(limit, 1) * 4)
         rows = await asyncio.to_thread(self._query, query, tuple(params))
-        active, secondary = [], []
+        active_tested, active_untested, secondary_tested, secondary_untested = [], [], [], []
         for r in rows:
             entry = ProxyEntry(
                 ip=r[0], port=r[1], protocol=r[2], latency=r[3], last_checked=r[4],
                 status=r[5], username=r[6], password=r[7],
             )
-            (active if entry.status == "active" else secondary).append(entry)
-        random.shuffle(active)
-        random.shuffle(secondary)
-        return (active + secondary)[:limit]
+            tested = entry.latency is not None and entry.latency > 0
+            if entry.status == "active":
+                (active_tested if tested else active_untested).append(entry)
+            else:
+                (secondary_tested if tested else secondary_untested).append(entry)
+        random.shuffle(active_tested)
+        random.shuffle(active_untested)
+        random.shuffle(secondary_tested)
+        random.shuffle(secondary_untested)
+        return (active_tested + active_untested + secondary_tested + secondary_untested)[:limit]
 
     async def get_random_proxy(self, protocol: str | None = None) -> ProxyEntry | None:
         entries = await self.candidates(protocol=protocol, limit=1)
@@ -1010,26 +1089,9 @@ def parse_proxy_line(line: str, default_protocol: str) -> tuple[str, int, str] |
         return None
     line_lower = line.lower()
     protocol = default_protocol
-    if line_lower.startswith("tg://proxy"):
-        from urllib.parse import parse_qs, urlparse
-
-        parsed = urlparse(line)
-        params = parse_qs(parsed.query)
-        server = params.get("server", [None])[0]
-        port_str = params.get("port", [None])[0]
-        if server and port_str:
-            try:
-                port = int(port_str)
-                if 0 < port < 65536:
-                    return (server, port, "socks5")
-            except (ValueError, TypeError):
-                pass
+    if line_lower.startswith(("tg://proxy", "mtproto://")):
+        # MTProto relays speak MTProto obfuscation rather than SOCKS4/5/HTTP CONNECT.
         return None
-    if line_lower.startswith("mtproto://"):
-        protocol = "socks5"
-        line = line.split("://", 1)[1]
-        if "@" in line:
-            line = line.split("@", 1)[1]
     elif line_lower.startswith("socks5h://"):
         protocol = "socks5"
         line = line.split("://", 1)[1]
@@ -1184,7 +1246,7 @@ async def harvest_sources(
         try:
             checked = utc_now()
             if url.startswith("file://"):
-                path = Path(url[7:])
+                path = Path(url2pathname(urlsplit(url).path))
                 if not path.is_file():
                     stat["status"] = 404
                     state.update({
@@ -1239,7 +1301,7 @@ async def harvest_sources(
                     return
                 text = response.text
                 response_content = response.content
-                response_headers = response.headers
+                response_headers = {k.lower(): v for k, v in response.headers.items()}
 
             content_hash = hashlib.sha256(response_content).hexdigest()
             unchanged_content = content_hash == state.get("content_hash")
@@ -1249,7 +1311,8 @@ async def harvest_sources(
                 SOURCE_MAX_REFRESH_HOURS * 60,
             )
             state.update({
-                "etag": response_headers.get("etag", state.get("etag", "")),                "last_modified": response.headers.get("last-modified", state.get("last_modified", "")),
+                "etag": response_headers.get("etag", state.get("etag", "")),
+                "last_modified": response_headers.get("last-modified", state.get("last_modified", "")),
                 "content_hash": content_hash, "last_checked": checked,
                 "last_changed": state.get("last_changed", "") if unchanged_content else checked,
                 "next_check": (now + timedelta(minutes=delay)).isoformat(),
@@ -1269,7 +1332,7 @@ async def harvest_sources(
             else:
                 default_proto = "http"
             before = len(results)
-            content_type = response.headers.get("content-type", "")
+            content_type = response_headers.get("content-type", "")
             if _is_geonode_source(url) or content_type.startswith("application/json"):
                 _parse_json_response(text, default_proto, limits, seen, results, counts, blacklist)
                 for item in results[before:]:
@@ -1358,8 +1421,9 @@ async def harvest_and_validate(pool: ProxyPool, sources: list[str], max_concurre
     # Load webshare proxies (pre-verified, no need to probe)
     webshare_proxies: list[tuple[str, int, str]] = []
     try:
-        from modules.webshare_source import get_webshare_source
-        ws = get_webshare_source()
+        from modules.webshare_source import WebshareSource, get_webshare_source
+        ws_file = pool.db_path.parent / "webshare_accounts.json"
+        ws = WebshareSource(ws_file) if ws_file.exists() else get_webshare_source()
         ws_proxies = await ws.fetch()
         for ip, port, proto, user, password in ws_proxies:
             await pool.add(ip, port, proto, username=user, password=password)
@@ -1409,13 +1473,12 @@ async def harvest_and_validate(pool: ProxyPool, sources: list[str], max_concurre
         async with semaphore:
             if enough.is_set():
                 return
-            tunnel_ok, _ = await probe_proxy(ip, port, protocol, timeout=probe_timeout)
-            if tunnel_ok:
-                ok, latency = await validate_proxy(
-                    ip, port, protocol, timeout=VALIDATE_TIMEOUT
-                )
-            else:
-                ok, latency = False, 0.0
+            tunnel_ok, ok, latency = await _screen_and_validate_proxy(
+                ip, port, protocol,
+                probe_timeout=probe_timeout,
+                validate_timeout=VALIDATE_TIMEOUT,
+            )
+            if not tunnel_ok:
                 handshake_dead.append((ip, port, protocol))
         for source_url in provenance.get((ip, port, protocol), ()):
             source_stats[source_url]["valid" if ok else "dead"] += 1

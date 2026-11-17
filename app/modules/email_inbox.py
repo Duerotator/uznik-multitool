@@ -15,6 +15,13 @@ CODE_RE = re.compile(r"\b(\d{4,8})\b")
 log = logging.getLogger("email-inbox")
 
 
+def _mask_email(email: str) -> str:
+    local, sep, domain = email.partition("@")
+    if not sep or not local:
+        return "***"
+    return f"{local[0]}***@{domain}"
+
+
 @dataclass
 class InboxCode:
     code: str
@@ -66,7 +73,12 @@ class EmailInboxClient:
                         headers=headers,
                     )
                 except httpx.HTTPError as exc:
-                    log.warning("Inbox API request failed for %s (attempt %d): %s", email, attempts, exc)
+                    log.warning(
+                        "Inbox API request failed for %s (attempt %d): %s",
+                        _mask_email(email),
+                        attempts,
+                        type(exc).__name__,
+                    )
                     await asyncio.sleep(4)
                     continue
                 if response.status_code == 200:
@@ -78,9 +90,9 @@ class EmailInboxClient:
                     raise RuntimeError(f"Inbox API failed: HTTP {response.status_code} {response.text[:200]}")
                 elif attempts == 1 or attempts % 5 == 0:
                     remaining = max(0, int(deadline - time.time()))
-                    log.info("Waiting for email code for %s (%ss remaining)", email, remaining)
+                    log.info("Waiting for email code for %s (%ss remaining)", _mask_email(email), remaining)
                 await asyncio.sleep(4)
-        raise TimeoutError(f"No email code received for {email} within {int(self.timeout)} seconds.")
+        raise TimeoutError(f"No email code received within {int(self.timeout)} seconds.")
 
 
 def generate_recovery_email(domain: str, account_id: str) -> str:

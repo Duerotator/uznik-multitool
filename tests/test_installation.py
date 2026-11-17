@@ -29,7 +29,7 @@ class RequirementsTests(unittest.TestCase):
         providers = {
             "PIL": "pillow", "PySide6": "pyside6", "pyrogram": "kurigram",
             "telethon": "telethon", "dotenv": "python-dotenv", "socks": "pysocks",
-            "zxingcpp": "zxing-cpp", "cv2": "opencv-python", "tgcrypto": "tgcrypto-pyrofork",
+            "python_socks": "python-socks", "zxingcpp": "zxing-cpp", "cv2": "opencv-python",
         }
         packages = self.requirements()
         for base in (ROOT / "app", ROOT / "scripts"):
@@ -49,12 +49,12 @@ class RequirementsTests(unittest.TestCase):
 
     def test_only_supported_namespace_providers_are_installed(self):
         requirements = self.requirements()
-        self.assertEqual("Kurigram==2.2.26", requirements["kurigram"])
-        self.assertEqual("TgCrypto-pyrofork==1.2.8", requirements["tgcrypto-pyrofork"])
-        for forbidden in ("pyrogram", "pyrofork", "tgcrypto", "solvecaptcha-python", "fastapi", "uvicorn", "python-telegram-bot"):
+        self.assertEqual("Kurigram==2.2.27", requirements["kurigram"])
+        self.assertIn("kuricrypt", requirements)
+        self.assertIn("cryptg", requirements)
+        self.assertIn("python-socks", requirements)
+        for forbidden in ("pyrogram", "pyrofork", "tgcrypto", "tgcrypto-pyrofork", "socksio", "solvecaptcha-python", "fastapi", "uvicorn", "python-telegram-bot"):
             self.assertNotIn(forbidden, requirements)
-        self.assertIn("--only-binary=TgCrypto-pyrofork",
-                      (ROOT / "config/requirements.txt").read_text(encoding="utf-8"))
 
     def test_ocr_cpu_dependencies_and_platform_specific_opencv(self):
         requirements = self.requirements()
@@ -92,10 +92,13 @@ class InstallationCheckTests(unittest.TestCase):
             self.assertEqual([], checker.namespace_errors())
 
     def test_namespace_check_rejects_overlapping_distributions(self):
-        with patch.object(checker, "installed_version", side_effect=lambda name: "1" if name == "Pyrogram" else None):
-            errors = checker.namespace_errors()
-        self.assertEqual(1, len(errors))
-        self.assertIn("Conflicting package Pyrogram", errors[0])
+        for pkg in ("Pyrogram", "TgCrypto-pyrofork"):
+            with self.subTest(pkg=pkg), patch.object(
+                checker, "installed_version", side_effect=lambda name, p=pkg: "1" if name == p else None
+            ):
+                errors = checker.namespace_errors()
+            self.assertEqual(1, len(errors))
+            self.assertIn(f"Conflicting package {pkg}", errors[0])
 
     def test_unsupported_python_is_rejected(self):
         with patch.object(checker.sys, "version_info", (3, 11, 0)), \
@@ -111,10 +114,12 @@ class InstallationCheckTests(unittest.TestCase):
         with patch.object(checker, "namespace_errors", return_value=[]), \
              patch.object(checker.importlib, "import_module") as imports, \
              patch.object(checker, "check_browser") as browser, \
+             patch.object(checker, "check_node") as node, \
              patch.object(checker, "check_native_tool") as native:
             self.assertEqual(0, checker.main(["--namespace-only"]))
         imports.assert_not_called()
         browser.assert_not_called()
+        node.assert_not_called()
         native.assert_not_called()
 
     def test_complete_install_passes_without_reading_configuration(self):
@@ -122,6 +127,7 @@ class InstallationCheckTests(unittest.TestCase):
              patch.object(checker, "installed_version", return_value="1"), \
              patch.object(checker.importlib, "import_module"), \
              patch.object(checker, "check_crypto"), patch.object(checker, "check_browser"), \
+             patch.object(checker, "check_node"), \
              patch.object(checker, "check_native_tool", return_value=True), \
              patch("builtins.open", side_effect=AssertionError("No user files may be opened")), \
              contextlib.redirect_stdout(io.StringIO()):
@@ -132,6 +138,7 @@ class InstallationCheckTests(unittest.TestCase):
              patch.object(checker, "installed_version", return_value="1"), \
              patch.object(checker.importlib, "import_module"), \
              patch.object(checker, "check_crypto"), patch.object(checker, "check_browser"), \
+             patch.object(checker, "check_node"), \
              patch.object(checker, "check_native_tool", return_value=False), \
              contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(1, checker.main(["--require-native"]))
@@ -143,11 +150,13 @@ class InstallationCheckTests(unittest.TestCase):
              patch.object(checker.importlib, "import_module", side_effect=ImportError("missing")), \
              patch.object(checker, "check_crypto", side_effect=RuntimeError("bad AES")), \
              patch.object(checker, "check_browser", side_effect=RuntimeError("missing Chromium")), \
+             patch.object(checker, "check_node", side_effect=RuntimeError("missing Node")), \
              patch.object(checker, "check_native_tool", side_effect=OSError("bad exe")), \
              contextlib.redirect_stdout(io.StringIO()) as output:
             self.assertEqual(1, checker.main(["--require-native"]))
         self.assertIn("bad AES", output.getvalue())
         self.assertIn("missing Chromium", output.getvalue())
+        self.assertIn("missing Node", output.getvalue())
 
     def test_native_probe_is_bounded_and_only_requests_version(self):
         for tool, argument in (("ffmpeg", "-version"), ("tesseract", "--version"), ("xray", "version")):
@@ -258,8 +267,16 @@ class WindowsInstallerTests(unittest.TestCase):
         source = (ROOT / "scripts/setup.ps1").read_text(encoding="utf-8")
         for marker in ("'check_install.py'", "'--namespace-only'", "'--require-native'",
                        "'check'", "'install', 'chromium'", "'windows\\install_native_tools.ps1'",
-                       "if (-not (Test-Path -LiteralPath $envFile))", "[switch]$SkipNativeTools"):
+                       "if (-not (Test-Path -LiteralPath $envFile))", "[switch]$SkipNativeTools",
+                       "'app\\ui\\finance'", "'run', 'build'"):
             self.assertIn(marker, source)
+
+    def test_check_crypto_and_node_reject_missing_runtime(self):
+        with patch.object(checker, "find_native_tool", return_value=None):
+            with self.assertRaisesRegex(RuntimeError, "Node.js"):
+                checker.check_node()
+        checker.check_crypto()
+        checker.check_node()
 
 
 if __name__ == "__main__":

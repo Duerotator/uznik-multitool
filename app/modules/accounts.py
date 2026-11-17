@@ -18,7 +18,6 @@ class AccountService:
     def __init__(self, config: AppConfig):
         self.config = config
         self.config.groups_dir.mkdir(parents=True, exist_ok=True)
-        self._sync_group_folders(self._load())
 
     def list_accounts(
         self,
@@ -136,40 +135,34 @@ class AccountService:
 
     def delete_accounts(self, account_ids: list[str], delete_sessions: bool = True) -> int:
         wanted = set(account_ids)
-        deleted = 0
+        if not wanted:
+            return 0
+        removed: list[AccountRecord] = []
 
         def mutate(accounts: list[AccountRecord]) -> list[AccountRecord]:
-            nonlocal deleted
-            kept: list[AccountRecord] = []
-            removed: list[AccountRecord] = []
-            for account in accounts:
-                if account.id in wanted:
-                    removed.append(account)
-                else:
-                    kept.append(account)
+            nonlocal removed
+            removed = [account for account in accounts if account.id in wanted]
+            if not removed:
+                raise _NoChange
+            return [account for account in accounts if account.id not in wanted]
 
-            if delete_sessions:
-                for account in removed:
-                    self._delete_owned_session_file(account)
-
-            deleted = len(removed)
-            removed_ids.extend(account.id for account in removed)
-            return kept
-
-        removed_ids: list[str] = []
         self._update(mutate)
+        if delete_sessions:
+            for account in removed:
+                self._delete_owned_session_file(account)
+        removed_ids = [account.id for account in removed]
         from modules.account_cleanup import cleanup_removed_accounts
         cleanup_removed_accounts(self.config, removed_ids)
-        return deleted
+        return len(removed)
 
     def deduplicate_accounts(self, delete_sessions: bool = True) -> int:
-        deleted = 0
+        removed: list[AccountRecord] = []
 
         def mutate(accounts: list[AccountRecord]) -> list[AccountRecord]:
-            nonlocal deleted
+            nonlocal removed
             seen: dict[str, AccountRecord] = {}
             kept: list[AccountRecord] = []
-            removed: list[AccountRecord] = []
+            removed = []
             for account in sorted(accounts, key=lambda item: item.created_at):
                 key = self._duplicate_key(account)
                 if not key:
@@ -183,20 +176,16 @@ class AccountService:
 
             if not removed:
                 raise _NoChange
-
-            if delete_sessions:
-                for account in removed:
-                    self._delete_owned_session_file(account)
-
-            deleted = len(removed)
-            removed_ids.extend(account.id for account in removed)
             return kept
 
-        removed_ids: list[str] = []
         self._update(mutate)
+        if delete_sessions:
+            for account in removed:
+                self._delete_owned_session_file(account)
+        removed_ids = [account.id for account in removed]
         from modules.account_cleanup import cleanup_removed_accounts
         cleanup_removed_accounts(self.config, removed_ids)
-        return deleted
+        return len(removed)
 
     def find_duplicate_user_ids(self) -> dict[int, list[AccountRecord]]:
         by_user_id: dict[int, list[AccountRecord]] = {}
@@ -242,7 +231,6 @@ class AccountService:
             Path(account.session_ref).name,
             Path(account.session_ref).stem,
             account.id,
-            account.label,
         }
         names = {name for name in names if name}
         allowed_suffixes = {".session", ".json", ".txt", ".zip"}
@@ -350,7 +338,8 @@ class AccountService:
         if (
             folder.exists()
             and folder.is_dir()
-            and str(resolved).startswith(str(groups_root) + "\\")
+            and resolved != groups_root
+            and resolved.is_relative_to(groups_root)
         ):
             shutil.rmtree(resolved)
         self._forget_group_order(group)
@@ -431,7 +420,7 @@ class AccountService:
 
         def apply(raw: dict) -> dict:
             accounts = [self._normalize_account(account) for account in mutate(self._decode(raw))]
-            saved.extend(accounts)
+            saved[:] = accounts
             return {"accounts": [account.to_dict() for account in accounts]}
 
         try:

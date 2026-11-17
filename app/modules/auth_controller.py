@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -10,7 +11,13 @@ from typing import TYPE_CHECKING, Any
 from core.config import AppConfig
 from core.session_manager import SessionManager
 from core.storage import write_json_atomic
-from core.telegram_connection import CLEANUP_TIMEOUT, CONNECT_TIMEOUT, REQUEST_TIMEOUT, connection_error, is_connection_error
+from core.telegram_connection import (
+    CLEANUP_TIMEOUT,
+    CONNECT_TIMEOUT,
+    REQUEST_TIMEOUT,
+    connection_error,
+    is_connection_error,
+)
 from modules.accounts import AccountService
 from modules.fingerprint_generator import FingerprintGenerator
 from utils.telegram_errors import short_error
@@ -43,7 +50,7 @@ class AuthManager:
         (config.import_dir / "auth_input").mkdir(parents=True, exist_ok=True)
 
     async def verified_proxy_url(self, proxy_url: str | None = None) -> str | None:
-        """Use the configured proxy or pool; an empty pool permits direct I/O."""
+        """Use the configured proxy or pool; fail closed when PROXY_MODE=vpn_gateway."""
         from core.models import ProxyConfig
         from modules.proxy_manager import ProxyPool, validate_proxy
 
@@ -73,12 +80,18 @@ class AuthManager:
         except TimeoutError:
             raise connection_error(True) from None
         if entry is None:
+            if os.getenv("PROXY_MODE", "").strip().lower() == "vpn_gateway":
+                raise RuntimeError(
+                    "VPN gateway proxy required (PROXY_MODE=vpn_gateway), "
+                    "but no working exit is available; direct connection is forbidden."
+                )
             logger.info("No proxy configured or available; using direct Telegram connection")
             return None
         return entry.url
 
     async def send_code(self, phone: str, proxy_url: str | None = None) -> dict[str, Any]:
         self.config.require_telegram_api()
+        await self.cleanup_expired()
         from pyrogram import Client
         from pyrogram.types import SentCode
 
@@ -130,13 +143,26 @@ class AuthManager:
                     proxy_url=proxy_url,
                 )
 
-            return {
+            sent_type = getattr(sent, "type", None)
+            next_type = getattr(sent, "next_type", None)
+            payload: dict[str, Any] = {
                 "ok": True,
                 "phone_code_hash": phone_code_hash,
-                "type": str(sent.type),
+                "type": str(sent_type),
+                "sent_code_type": type(sent_type).__name__ if sent_type is not None else "",
+                "next_type": str(next_type) if next_type is not None else "",
                 "timeout": getattr(sent, "timeout", 120),
                 "fingerprint": {"device": fp["device_model"], "os": fp["system_version"]},
             }
+            for attr, out_key in (
+                ("email_pattern", "email_pattern"),
+                ("url", "fragment_url"),
+                ("length", "code_length"),
+            ):
+                val = getattr(sent_type, attr, None)
+                if val is not None:
+                    payload[out_key] = val
+            return payload
         except BaseException as exc:
             try:
                 await asyncio.wait_for(client.disconnect(), CLEANUP_TIMEOUT)
@@ -159,6 +185,12 @@ class AuthManager:
 
         try:
             user = await asyncio.wait_for(auth.client.sign_in(phone, phone_code_hash, code), REQUEST_TIMEOUT)
+            if type(user).__name__ == "TermsOfService":
+                return {"ok": False, "status": "tos_required", "error": "Telegram Terms of Service acceptance required."}
+            if getattr(user, "id", None) is None and hasattr(user, "user"):
+                user = user.user
+            if getattr(user, "id", None) is None:
+                return {"ok": False, "status": "signup_required", "error": f"Unexpected authorization state ({type(user).__name__})."}
             return await self._finalize_auth(phone, auth, user)
         except SessionPasswordNeeded:
             return {"ok": False, "status": "2fa_required", "hint": "Enter cloud password."}
@@ -179,6 +211,8 @@ class AuthManager:
 
         try:
             user = await asyncio.wait_for(auth.client.check_password(password), REQUEST_TIMEOUT)
+            if getattr(user, "id", None) is None and hasattr(user, "user"):
+                user = user.user
             return await self._finalize_auth(phone, auth, user)
         except Exception as exc:
             return {"ok": False, "error": str(connection_error(auth.proxy_url)) if is_connection_error(exc) else short_error(exc)}
@@ -213,6 +247,8 @@ class AuthManager:
 
         write_json_atomic(dump_path, {"backend": "pyrogram", "session_string": session_string, "phone": phone})
 
+        imported: list[Any] = []
+        session_path = str(dump_path)
         try:
             imported = self.session_mgr.import_path(dump_path, group="inbox", backend_hint="pyrogram")
             for account in imported:
@@ -224,8 +260,16 @@ class AuthManager:
                 account.proxy = auth.proxy_url
                 account.metadata["fingerprint"] = dict(auth.fingerprint)
                 self.session_mgr._upsert_account(account)
+            if imported:
+                primary_ref = getattr(imported[0], "session_ref", "") or ""
+                if primary_ref:
+                    resolved_primary = Path(primary_ref).resolve()
+                    resolved_dump = dump_path.resolve()
+                    if resolved_primary != resolved_dump and resolved_primary.exists():
+                        dump_path.unlink(missing_ok=True)
+                    session_path = primary_ref
         except Exception as exc:
-            logger.warning("Auto-import failed for %s: %s", dump_path, exc)
+            logger.warning("Auto-import failed (%s)", type(exc).__name__)
             imported = []
 
         async with self._lock:
@@ -238,7 +282,7 @@ class AuthManager:
             "first_name": first_name,
             "last_name": last_name,
             "username": username,
-            "session_path": str(dump_path),
+            "session_path": session_path,
             "imported": len(imported) > 0,
             "error": "" if imported else "New authorization was saved, but account import failed; source was kept.",
         }

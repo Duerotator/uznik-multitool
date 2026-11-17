@@ -13,7 +13,7 @@ from core.results import ActionResult
 from core.telegram_client import create_client
 from modules.accounts import AccountService
 from utils.rate_limit import human_delay
-from utils.telegram_errors import is_invalid_auth_error, short_error
+from utils.telegram_errors import flood_wait_seconds, is_frozen_error, is_invalid_auth_error, short_error
 
 
 @dataclass(frozen=True)
@@ -24,6 +24,8 @@ class SpamBlockStatus:
 
     @property
     def display(self) -> str:
+        if self.status == "frozen":
+            return "frozen"
         if self.status == "clear":
             return "none"
         if self.status == "forever":
@@ -45,22 +47,62 @@ class SpamBlockService:
         self.accounts = AccountService(config)
         self.log = logging.getLogger("spamblock")
 
-    async def check(self, accounts: list[AccountRecord], progress=None) -> ActionResult:
+    async def _fetch_freeze_metadata(self, client) -> dict[str, object]:
+        meta: dict[str, object] = {
+            "health_status": "frozen",
+            "health_checked_at": utc_now_iso(),
+            "spamblock_status": "frozen",
+            "spamblock_checked_at": utc_now_iso(),
+        }
+        get_cfg = getattr(client, "get_app_config", None)
+        if not callable(get_cfg):
+            return meta
+        try:
+            app_cfg = await get_cfg()
+        except Exception:
+            return meta
+        if isinstance(app_cfg, dict):
+            for key in ("freeze_since_date", "freeze_until_date", "freeze_appeal_url"):
+                if app_cfg.get(key) is not None:
+                    meta[key] = app_cfg[key]
+        return meta
+
+    async def check(
+        self,
+        accounts: list[AccountRecord],
+        progress=None,
+        *,
+        stop_event: asyncio.Event | None = None,
+    ) -> ActionResult:
         semaphore = asyncio.Semaphore(max(1, self.config.max_concurrency))
         result = ActionResult()
 
         async def worker(account: AccountRecord) -> None:
             async with semaphore:
-                await human_delay(self.config.min_action_delay, self.config.max_action_delay)
+                if stop_event and stop_event.is_set():
+                    return
+                await human_delay(self.config.min_action_delay, self.config.max_action_delay, stop_event=stop_event)
+                if stop_event and stop_event.is_set():
+                    return
                 try:
                     async with create_client(self.config, account) as client:
-                        started_at = int(time.time())
-                        await client.send_message("@SpamBot", "/start")
                         try:
-                            text = await self._read_spambot_reply(client, since_ts=started_at)
-                        except RuntimeError as exc:
-                            self.log.warning("SpamBot reply missing for %s: %s", account.id, exc)
-                            text = ""
+                            before = await client.get_recent_chat_messages("@SpamBot", limit=8)
+                            before_ids = {int(m.get("id") or 0) for m in before if m.get("id")}
+                            await client.send_message("@SpamBot", "/start")
+                            text = await self._read_spambot_reply(client, before_ids=before_ids, stop_event=stop_event)
+                        except Exception as inner_exc:
+                            if is_frozen_error(inner_exc):
+                                freeze_meta = await self._fetch_freeze_metadata(client)
+                                freeze_err = short_error(inner_exc)
+                                self.accounts.update_profile_metadata(account.id, freeze_meta)
+                                self.accounts.mark_error(account.id, freeze_err, disable=True)
+                                result.add_error(account.id, freeze_err + " [frozen, disabled]")
+                                if progress:
+                                    progress.mark_error(account.id, freeze_err)
+                                self.log.warning("%s frozen (session preserved): %s", account.id, freeze_meta.get("freeze_appeal_url") or freeze_err)
+                                return
+                            raise
                     status = parse_spambot_response(text)
                     self.accounts.update_profile_metadata(
                         account.id,
@@ -72,44 +114,73 @@ class SpamBlockService:
                         },
                     )
                     result.add_ok(account.id)
-                    if progress: progress.mark_ok(account.id)
+                    if progress:
+                        progress.mark_ok(account.id)
                     self.log.info("Spamblock for %s: %s", account.id, status.display)
+                except asyncio.CancelledError:
+                    raise
                 except Exception as exc:
                     error = short_error(exc)
+                    if is_frozen_error(exc):
+                        self.accounts.update_profile_metadata(
+                            account.id,
+                            {
+                                "health_status": "frozen",
+                                "health_checked_at": utc_now_iso(),
+                                "spamblock_status": "frozen",
+                                "spamblock_checked_at": utc_now_iso(),
+                            },
+                        )
+                        self.accounts.mark_error(account.id, error, disable=True)
+                        result.add_error(account.id, error + " [frozen, disabled]")
+                        if progress:
+                            progress.mark_error(account.id, error)
+                        self.log.warning("%s frozen (session preserved): %s", account.id, error)
+                        return
                     result.add_error(account.id, error)
-                    if progress: progress.mark_error(account.id, error)
+                    if progress:
+                        progress.mark_error(account.id, error)
                     disable = is_invalid_auth_error(exc)
-                    self.accounts.mark_error(account.id, error, disable=disable)
+                    if disable or flood_wait_seconds(exc) is None:
+                        self.accounts.mark_error(account.id, error, disable=disable)
                     self.log.error("Spamblock check failed for %s: %s", account.id, error)
 
         await asyncio.gather(*(worker(account) for account in accounts if account.enabled))
         return result
 
-    async def _read_spambot_reply(self, client, since_ts: int) -> str:
-        fallback: list[str] = []
-        for attempt in range(4):
-            await asyncio.sleep(1.0)
+    async def _read_spambot_reply(
+        self,
+        client,
+        since_ts: int | None = None,
+        *,
+        before_ids: set[int] | None = None,
+        stop_event: asyncio.Event | None = None,
+    ) -> str:
+        seen_ids = before_ids if before_ids is not None else set()
+        for _attempt in range(5):
+            if stop_event and stop_event.is_set():
+                raise asyncio.CancelledError()
+            await asyncio.sleep(1.5)
             messages = await client.get_recent_chat_messages("@SpamBot", limit=8)
-            incoming = [
-                str(message.get("text") or "").strip()
-                for message in messages
-                if message.get("text")
-                and not message.get("outgoing")
-            ]
-            recent = [
-                str(message.get("text") or "").strip()
-                for message in messages
-                if message.get("text")
-                and not message.get("outgoing")
-                and int(message.get("received_at") or 0) >= since_ts - 2
-            ]
-            if recent:
-                return "\n\n".join(recent[:3])
-            if incoming and not fallback:
-                fallback = incoming
-        if fallback:
-            return "\n\n".join(fallback[:3])
-        raise RuntimeError("No @SpamBot reply received.")
+            if before_ids is not None:
+                fresh = [
+                    str(message.get("text") or "").strip()
+                    for message in messages
+                    if message.get("text")
+                    and not message.get("outgoing")
+                    and int(message.get("id") or 0) not in seen_ids
+                ]
+            else:
+                fresh = [
+                    str(message.get("text") or "").strip()
+                    for message in messages
+                    if message.get("text")
+                    and not message.get("outgoing")
+                    and (since_ts is None or int(message.get("received_at") or 0) >= since_ts - 2)
+                ]
+            if fresh:
+                return "\n\n".join(fresh[:3])
+        raise RuntimeError("No fresh @SpamBot reply received.")
 
 
 def parse_spambot_response(text: str) -> SpamBlockStatus:
@@ -134,6 +205,9 @@ def parse_spambot_response(text: str) -> SpamBlockStatus:
     )
     if any(marker in normalized for marker in clear_markers):
         return SpamBlockStatus(status="clear", raw_text=text)
+
+    if until:
+        return SpamBlockStatus(status="temporary", until=until, raw_text=text)
 
     forever_markers = (
         "limited forever",
@@ -172,8 +246,6 @@ def parse_spambot_response(text: str) -> SpamBlockStatus:
         "\u0644\u0646 \u062a\u062a\u0645\u0643\u0646 \u0645\u0646 \u0625\u0631\u0633\u0627\u0644",
         "\u0645\u0643\u0627\u0641\u062d\u0629 \u0627\u0644\u0631\u0633\u0627\u0626\u0644 \u0627\u0644\u0645\u0632\u0639\u062c\u0629",
     )
-    if until:
-        return SpamBlockStatus(status="temporary", until=until, raw_text=text)
     if any(marker in normalized for marker in limited_markers):
         return SpamBlockStatus(status="limited", raw_text=text)
     return SpamBlockStatus(status="unknown", raw_text=text)
@@ -242,6 +314,6 @@ def normalize_month_name(value: str) -> str:
         "дек": "Dec",
         "декабря": "Dec",
     }
-    for ru, en in months.items():
-        value = re.sub(rf"\b{ru}\.?\b", en, value, flags=re.IGNORECASE)
+    for ru, en in sorted(months.items(), key=lambda item: -len(item[0])):
+        value = re.sub(rf"\b{ru}\.?(?!\w)", en, value, flags=re.IGNORECASE)
     return value

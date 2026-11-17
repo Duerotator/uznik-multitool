@@ -24,7 +24,24 @@ class DesktopPackageTests(unittest.TestCase):
         for marker in ("density_combo", "change_density", "session_sync", "mobile_web", "ui.bot"):
             self.assertNotIn(marker, source)
         self.assertFalse((APP / "modules/session_sync.py").exists())
-        self.assertEqual({"__init__.py", "qt_app.py"}, {p.name for p in (APP / "ui").glob("*.py")})
+        self.assertEqual(
+            {
+                "__init__.py",
+                "qt_app.py",
+                "asset_dialog.py",
+                "captcha_support_dialog.py",
+                "carousel_funding_dialog.py",
+                "guard_dialog.py",
+                "marketapp_credentials_dialog.py",
+                "marketapp_dialog.py",
+                "native_money_dialog.py",
+                "profile_review_dialog.py",
+                "profile_studio_dialog.py",
+                "task_history_dialog.py",
+                "vault_dialog.py",
+            },
+            {p.name for p in (APP / "ui").glob("*.py")},
+        )
 
     def test_first_party_imports_are_complete(self):
         # Include lazy imports so optional desktop actions do not break later.

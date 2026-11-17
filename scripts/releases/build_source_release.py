@@ -29,10 +29,12 @@ def validate_path(name: str) -> None:
     basename = path.name.lower()
     if lower == "config/.env.example":
         return
-    if (basename.startswith(".env") or re.search(r"\.(session|sqlite|db)", lower)
+    if (basename.startswith(".env") or basename == ".vpn-gateway.env"
+            or re.search(r"\.(session|sqlite|db)", lower)
             or path.suffix.lower() in {".log", ".pem", ".key", ".p12", ".ovpn", ".uzbk"}
-            or basename in {"batch_phones.txt", "промт.txt"}
-            or path.parts[0] in {".venv", "venv", "dist", "build", ".git"}):
+            or basename in {"batch_phones.txt", "промт.txt", "unknown_errors.txt"}
+            or "node_modules" in {part.lower() for part in path.parts}
+            or path.parts[0].lower() in {".venv", "venv", "dist", "build", ".git", "_local"}):
         raise ValueError(f"Sensitive/runtime file tracked in Git: {name}")
     private_tree = path.parts[0] in {"data", "imports", "templates"}
     private_tree |= lower.startswith(("assets/avatar_packs/", "assets/avatar_packs_raw/"))

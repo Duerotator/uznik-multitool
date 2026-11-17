@@ -17,14 +17,21 @@ from core.results import ActionResult
 from core.telegram_client import create_client, parse_post_link
 from core.ui_progress import OperationProgress
 from modules.accounts import AccountService
+from modules.captcha_support import CaptchaSupportStore, ManualRequired, manual_notice
 from modules.raffle_common import (
+    RAFFLE_CHROME_USER_AGENT,
+    ReferralCoordinator,
     configure_raffle_client,
+    extract_ref_link_and_count,
     is_long_raffle_flood_wait,
-    playwright_proxy,
+    playwright_proxy_context,
     raffle_flood_skip_message,
+    raffle_stealth_init_script,
+    solve_ddddocr,
+    stop_aware_delay,
+    stop_aware_sleep,
 )
-from utils.rate_limit import human_delay
-from utils.telegram_errors import is_invalid_auth_error, short_error
+from utils.telegram_errors import is_frozen_error, is_invalid_auth_error, short_error
 
 RANDOM_BOT = "random"
 JOIN_APP_SHORT_NAME = "JoinLot"
@@ -36,7 +43,7 @@ STARTAPP_RE = re.compile(
     re.IGNORECASE,
 )
 JOINLOT_RE = re.compile(
-    r"(?:t\.me|telegram\.me)/(?:Random|random)/JoinLot\?[^\s\"']+",
+    r"(?:t\.me|telegram\.me)/(?:Random|Randomized)/JoinLot\?[^\s\"']+",
     re.IGNORECASE,
 )
 CHANNEL_RE = re.compile(
@@ -48,6 +55,7 @@ SKIP_USERNAMES = {
     "random",
     "randomgod",
     "randomgodbot",
+    "randomized",
     "telegram",
     "share",
     "boost",
@@ -101,12 +109,17 @@ class RandomRaffleService:
         extra_channels: list[str] | None = None,
         progress: OperationProgress | None = None,
         probe_account: AccountRecord | None = None,
+        stop_event: asyncio.Event | None = None,
     ) -> ActionResult:
         enabled = [account for account in accounts if account.enabled]
+        result = ActionResult()
+        if not enabled or (stop_event is not None and stop_event.is_set()):
+            return result
+
         parsed = await self.resolve_target(
             target,
             extra_channels=extra_channels or [],
-            probe_account=probe_account or (enabled[0] if enabled else None),
+            probe_account=probe_account or enabled[0],
         )
         self.log.info(
             "Raffle target start_param=%s post=%s channels=%s",
@@ -114,23 +127,41 @@ class RandomRaffleService:
             parsed.post_link,
             parsed.channels,
         )
-        # Playwright Chromium is substantially heavier than ordinary MTProto
-        # work. Keep its provider-specific ceiling low on the VPS even when
-        # TELEGRAM_MAX_CONCURRENCY is higher for lightweight operations.
-        browser_limit = max(1, self.config.giveaway_browser_max_concurrency)
-        semaphore = asyncio.Semaphore(max(1, min(self.config.max_concurrency, browser_limit)))
-
-        result = ActionResult()
+        browser_limit = max(1, getattr(self.config, "giveaway_browser_max_concurrency", 1) or 1)
+        concurrency = max(1, min(self.config.max_concurrency or 1, browser_limit))
+        semaphore = asyncio.Semaphore(concurrency)
+        channels_lock = asyncio.Lock()
+        referrals = ReferralCoordinator(parsed.start_param)
+        referral_mode: bool | None = None  # None until first account succeeds
 
         async def worker(account: AccountRecord) -> None:
-            nonlocal current_batch_size
+            nonlocal referral_mode
+            if stop_event is not None and stop_event.is_set():
+                return
             async with semaphore:
-                await human_delay(self.config.min_action_delay, self.config.max_action_delay)
+                if await stop_aware_delay(self.config.min_action_delay, self.config.max_action_delay, stop_event):
+                    return
+                used_start_param = await referrals.acquire_start_param()
+                async with channels_lock:
+                    target_snapshot = RaffleTarget(
+                        source=parsed.source,
+                        start_param=used_start_param,
+                        post_link=parsed.post_link,
+                        chat=parsed.chat,
+                        message_id=parsed.message_id,
+                        channels=list(parsed.channels),
+                        text=parsed.text,
+                        button_text=parsed.button_text,
+                        callback_data=parsed.callback_data,
+                    )
                 try:
                     outcome = await asyncio.wait_for(
-                        self._participate_one(account, parsed),
+                        self._participate_one(account, target_snapshot, stop_event=stop_event),
                         timeout=180,
                     )
+                    if len(target_snapshot.channels) > len(parsed.channels):
+                        async with channels_lock:
+                            parsed.channels = unique_channels([*parsed.channels, *target_snapshot.channels])
                     detail = outcome.message or outcome.status
                     if outcome.status in {"ok", "already"}:
                         result.add_ok(account.id)
@@ -138,33 +169,34 @@ class RandomRaffleService:
                         if progress:
                             progress.mark_ok(account.id)
                         self.log.info("%s: %s", account.id, detail)
-                        
+
                         ref_link = outcome.raw.get("ref_link")
-                        if ref_link and ("start=" in str(ref_link) or "startapp=" in str(ref_link)):
-                            new_start = re.split(r"start(?:app)?=", str(ref_link))[-1]
-                            parsed.start_param = new_start
-                            
-                            new_count = outcome.raw.get("ref_count")
-                            if new_count:
-                                current_batch_size = max(1, int(new_count))
-                                self.log.info("%s: updated batch_size to %s", account.id, current_batch_size)
-                            else:
-                                current_batch_size = 1
-                            
-                            self.log.info("%s: updated start_param to %s for next accounts", account.id, new_start)
-
-
+                        ref_count = outcome.raw.get("ref_count")
+                        registered = await referrals.register_ref(ref_link, ref_count)
+                        if registered:
+                            referral_mode = True
+                            self.log.info("%s: queued referral startapp=%s (slots=%s)", account.id, registered, ref_count or 1)
+                        elif referral_mode is None:
+                            referral_mode = False
                     else:
                         result.add_error(account.id, detail)
                         if progress:
                             progress.mark_error(account.id)
                         self.log.error("%s failed: %s", account.id, detail)
+                except asyncio.CancelledError:
+                    raise
                 except asyncio.TimeoutError:
                     error = "timeout after 180s"
                     result.add_error(account.id, error)
                     if progress:
                         progress.mark_error(account.id)
                     self.log.error("%s timed out", account.id)
+                except ManualRequired as exc:
+                    error = short_error(exc)
+                    result.add_error(account.id, error)
+                    if progress:
+                        progress.mark_error(account.id)
+                    self.log.warning("%s manual captcha required: %s", account.id, error)
                 except Exception as exc:
                     long_flood_wait = is_long_raffle_flood_wait(exc)
                     error = raffle_flood_skip_message(exc) if long_flood_wait else short_error(exc)
@@ -173,21 +205,33 @@ class RandomRaffleService:
                         progress.mark_error(account.id)
                     if long_flood_wait:
                         self.log.warning("%s %s", account.id, error)
+                    elif is_invalid_auth_error(exc):
+                        self.accounts.mark_error(account.id, error, disable=True)
+                        self.log.error("%s auth invalid: %s", account.id, error)
+                    elif is_frozen_error(exc):
+                        self.accounts.mark_error(account.id, f"frozen: {error}", disable=False)
+                        self.log.error("%s frozen: %s", account.id, error)
                     else:
-                        disable = is_invalid_auth_error(exc)
-                        self.accounts.mark_error(account.id, error, disable=disable)
                         self.log.error("%s failed: %s", account.id, error)
 
-        current_batch_size = len(enabled)
-        scout, *remaining = enabled
-        await worker(scout)
-
         idx = 0
-        while idx < len(remaining):
-            batch = remaining[idx : idx + current_batch_size]
+        while idx < len(enabled):
+            if stop_event is not None and stop_event.is_set():
+                break
+            if referral_mode is None:
+                # Probe sequentially until one account succeeds so failed scout doesn't stampede without ref link.
+                await worker(enabled[idx])
+                idx += 1
+                continue
+            if referral_mode:
+                async with referrals._lock:
+                    head_slots = referrals._queue[0][1] if referrals._queue else 1
+                batch_size = max(1, min(concurrency, head_slots))
+            else:
+                batch_size = concurrency
+            batch = enabled[idx : idx + batch_size]
             await asyncio.gather(*(worker(account) for account in batch))
             idx += len(batch)
-
 
         return result
 
@@ -214,9 +258,9 @@ class RandomRaffleService:
                 post_link=post_link,
             )
 
-        # (2) JoinLot URL (t.me/Random/JoinLot?startapp=...) — resolve offline
+        # (2) JoinLot URL (t.me/Random/JoinLot?startapp=... or t.me/Randomized/JoinLot?...)
         start_param = extract_start_param(raw)
-        if start_param and "JoinLot" in raw:
+        if start_param and "joinlot" in raw.lower():
             channels = self._collect_channels(raw, extra)
             post_link = _derive_post_link(raw)
             self.log.info("Resolved via JoinLot URL: startapp=%s channels=%s", start_param, channels)
@@ -263,8 +307,21 @@ class RandomRaffleService:
         async with create_client(self.config, account) as client:
             configure_raffle_client(client)
             detail = await client.get_message_detail(post_link)
+            forward_post_link = str(detail.get("forward_post_link") or "").strip()
+            forward_channels: list[str] = []
+            if forward_post_link and forward_post_link != post_link:
+                forward_channels = extract_channel_targets(str(detail.get("text") or ""))
+                for hl in detail.get("hidden_links") or []:
+                    forward_channels.extend(extract_channel_targets(str(hl)))
+                fwd_chat = str(detail.get("chat_username") or detail.get("chat") or "")
+                if fwd_chat:
+                    forward_channels.append(fwd_chat)
+                detail = await client.get_message_detail(forward_post_link)
+                post_link = forward_post_link
+
             text = str(detail.get("text") or "")
             channels = extract_channel_targets(text)
+            channels.extend(forward_channels)
             for hidden_link in detail.get("hidden_links") or []:
                 channels.extend(extract_channel_targets(str(hidden_link)))
             for button in detail.get("buttons") or []:
@@ -336,7 +393,13 @@ class RandomRaffleService:
             channels.extend(extract_channels(item))
         return unique_channels(channels)
 
-    async def _participate_one(self, account: AccountRecord, target: RaffleTarget) -> JoinOutcome:
+    async def _participate_one(
+        self,
+        account: AccountRecord,
+        target: RaffleTarget,
+        *,
+        stop_event: asyncio.Event | None = None,
+    ) -> JoinOutcome:
         async with create_client(self.config, account) as client:
             configure_raffle_client(client)
             if target.post_link:
@@ -347,13 +410,18 @@ class RandomRaffleService:
                         raise
                     self.log.debug("view_post failed for %s: %s", account.id, short_error(exc))
 
-            await self._ensure_channels(client, target.channels, view_from=target.post_link)
+            if stop_event is not None:
+                await self._ensure_channels(client, target.channels, view_from=target.post_link, stop_event=stop_event)
+            else:
+                await self._ensure_channels(client, target.channels, view_from=target.post_link)
+            if stop_event is not None and stop_event.is_set():
+                raise asyncio.CancelledError("Giveaway stopped")
 
             web = await client.request_bot_app_webview(
                 RANDOM_BOT,
                 JOIN_APP_SHORT_NAME,
                 target.start_param or "",
-                # JoinLot is a bot Mini App.  Using the source-post channel as
+                # JoinLot is a bot Mini App. Using the source-post channel as
                 # peer fails with CHANNEL_PRIVATE for accounts that can read
                 # a public post but are not members of that channel.
                 peer=RANDOM_BOT,
@@ -363,26 +431,53 @@ class RandomRaffleService:
                 raise RuntimeError("Empty WebApp URL")
 
             proxy_url = account.proxy or self.config.global_proxy
-            outcome = await self._browser_join_flow(account.id, web_url, proxy_url)
+            flow_kwargs: dict[str, Any] = {}
+            if stop_event is not None:
+                flow_kwargs["stop_event"] = stop_event
+            outcome = await self._browser_join_flow(
+                account.id, web_url, proxy_url,
+                used_start_param=target.start_param, **flow_kwargs,
+            )
             if outcome.status == "need_channels":
                 dynamic_channels = [str(value) for value in outcome.raw.get("channels", [])]
                 retry_channels = unique_channels([*target.channels, *dynamic_channels])
                 if dynamic_channels:
+                    target.channels = retry_channels
                     self.log.info(
                         "%s: retrying after Mini App required channels: %s",
                         account.id,
                         retry_channels,
                     )
-                await self._ensure_channels(client, retry_channels, view_from=target.post_link)
-                outcome = await self._browser_join_flow(account.id, web_url, proxy_url)
+                if stop_event is not None:
+                    await self._ensure_channels(client, retry_channels, view_from=target.post_link, stop_event=stop_event)
+                else:
+                    await self._ensure_channels(client, retry_channels, view_from=target.post_link)
+                outcome = await self._browser_join_flow(
+                    account.id, web_url, proxy_url,
+                    used_start_param=target.start_param, **flow_kwargs,
+                )
             if outcome.status == "captcha_failed":
                 self.log.info("%s: retrying Random Mini App after captcha failure", account.id)
-                outcome = await self._browser_join_flow(account.id, web_url, proxy_url)
+                outcome = await self._browser_join_flow(
+                    account.id, web_url, proxy_url,
+                    used_start_param=target.start_param, **flow_kwargs,
+                )
+                if outcome.status == "captcha_failed" and getattr(getattr(self, "config", None), "data_dir", None):
+                    manual_notice(self.config, account.id, "random", reason="unreadable", kind="image")
             return outcome
 
-    async def _ensure_channels(self, client, channels: list[str], *, view_from: str | None) -> None:
+    async def _ensure_channels(
+        self,
+        client,
+        channels: list[str],
+        *,
+        view_from: str | None,
+        stop_event: asyncio.Event | None = None,
+    ) -> None:
         joined_now = 0
         for channel in channels:
+            if stop_event is not None and stop_event.is_set():
+                raise asyncio.CancelledError("Giveaway stopped")
             try:
                 await client.join_chat(channel)
                 joined_now += 1
@@ -400,11 +495,11 @@ class RandomRaffleService:
                     self.log.debug("Already in %s", channel)
                 else:
                     self.log.warning("Join %s failed: %s", channel, err)
-            await human_delay(0.4, 1.2)
+            if await stop_aware_delay(0.4, 1.2, stop_event):
+                raise asyncio.CancelledError("Giveaway stopped")
         if joined_now:
-            # Telegram may acknowledge ImportChatInvite before the giveaway
-            # bot's membership check sees the updated participant list.
-            await human_delay(1.5, 3.0)
+            if await stop_aware_delay(1.5, 3.0, stop_event):
+                raise asyncio.CancelledError("Giveaway stopped")
         if view_from:
             try:
                 await client.view_post(view_from)
@@ -413,7 +508,13 @@ class RandomRaffleService:
                     raise
 
     async def _browser_join_flow(
-        self, account_id: str, web_url: str, proxy_url: str | None = None,
+        self,
+        account_id: str,
+        web_url: str,
+        proxy_url: str | None = None,
+        *,
+        used_start_param: str | None = None,
+        stop_event: asyncio.Event | None = None,
     ) -> JoinOutcome:
         from playwright.async_api import async_playwright
 
@@ -423,34 +524,33 @@ class RandomRaffleService:
         ref_link: str | None = None
         ref_count: int | None = None
         captcha_attempts = 0
-
+        last_captcha_bytes: bytes | None = None
         max_captcha_rounds = 5
 
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(
-                headless=True,
-                args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
-                proxy=playwright_proxy(proxy_url),
-            )
-            context = await browser.new_context(
-                viewport={"width": 420, "height": 800},
-                user_agent=(
-                    "Mozilla/5.0 (Linux; Android 13; Pixel 7) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/124.0.0.0 Mobile Safari/537.36"
-                ),
-            )
-            page = await context.new_page()
-
-            # Mock Telegram WebApp platform and hide webdriver
-            await page.add_init_script("""
-                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-                window.Telegram = window.Telegram || {};
-                window.Telegram.WebApp = window.Telegram.WebApp || {};
-                window.Telegram.WebApp.platform = 'android';
-            """)
-
+        async with playwright_proxy_context(proxy_url) as proxy_cfg, async_playwright() as p:
+            browser = None
+            context = None
+            page = None
             try:
+                browser = await p.chromium.launch(
+                    headless=True,
+                    args=[
+                        "--no-sandbox",
+                        "--disable-setuid-sandbox",
+                        "--disable-dev-shm-usage",
+                        "--disable-blink-features=AutomationControlled",
+                        "--webrtc-ip-handling-policy=disable_non_proxied_udp",
+                    ],
+                    proxy=proxy_cfg,
+                )
+                context = await browser.new_context(
+                    viewport={"width": 412, "height": 915},
+                    user_agent=RAFFLE_CHROME_USER_AGENT,
+                    locale="ru-RU",
+                )
+                page = await context.new_page()
+                await page.add_init_script(raffle_stealth_init_script(platform="android", language="ru-RU"))
+
                 await page.goto(web_url, wait_until="domcontentloaded", timeout=30_000)
                 try:
                     await page.wait_for_selector("#descriptionText", timeout=20_000)
@@ -463,7 +563,8 @@ class RandomRaffleService:
                 last_text = ""
                 turnstile_clicked = False
                 for _ in range(120):
-                    await asyncio.sleep(1)
+                    if await stop_aware_sleep(1.0, stop_event):
+                        raise asyncio.CancelledError("Giveaway stopped")
                     try:
                         desc_el = await page.query_selector("#descriptionText")
                         text = (await desc_el.inner_text()).strip() if desc_el else ""
@@ -474,9 +575,11 @@ class RandomRaffleService:
                         self.log.info("%s: status = %s", account_id, text[:120])
                         last_text = text
 
+                    lowered = text.lower()
+
                     # Success
                     if any(
-                        phrase in text.lower()
+                        phrase in lowered
                         for phrase in (
                             "участвуете в розыгрыше",
                             "вы участвуете",
@@ -489,7 +592,7 @@ class RandomRaffleService:
 
                     # Already joined
                     if any(
-                        phrase in text.lower()
+                        phrase in lowered
                         for phrase in (
                             "уже участвуете",
                             "уже принимаете",
@@ -503,7 +606,7 @@ class RandomRaffleService:
 
                     # Need channels
                     if any(
-                        phrase in text.lower()
+                        phrase in lowered
                         for phrase in (
                             "не подписаны на все каналы",
                             "not all channels subscribed",
@@ -515,10 +618,17 @@ class RandomRaffleService:
                         break
 
                     # Banned / VPN
-
                     if any(
-                        phrase in text.lower()
-                        for phrase in ("vpn", "wi-fi", "отключите", "используете", "anti-bot")
+                        phrase in lowered
+                        for phrase in (
+                            "отключите vpn",
+                            "используете vpn",
+                            "вы используете прокси",
+                            "disable vpn",
+                            "turn off vpn",
+                            "wi-fi",
+                            "anti-bot",
+                        )
                     ):
                         result_status = "banned"
                         result_text = text
@@ -526,7 +636,7 @@ class RandomRaffleService:
 
                     # Hard errors
                     if any(
-                        phrase in text.lower()
+                        phrase in lowered
                         for phrase in (
                             "розыгрыш уже завершен",
                             "розыгрыш был удален",
@@ -541,17 +651,21 @@ class RandomRaffleService:
                         break
 
                     # === Captcha flow ===
-                    # Step 1: click turnstile
+                    # Step 1: click turnstile with human-like pointer hover/click
                     tc = await page.query_selector("#turnstile_check")
                     if tc and await tc.is_visible():
                         if not turnstile_clicked:
                             self.log.info("%s: clicking turnstile", account_id)
                             try:
+                                box = await tc.bounding_box()
+                                if box:
+                                    await page.mouse.move(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2, steps=5)
                                 await tc.click()
                             except Exception:
                                 pass
                             turnstile_clicked = True
-                            await asyncio.sleep(2)
+                            if await stop_aware_sleep(2.0, stop_event):
+                                raise asyncio.CancelledError("Giveaway stopped")
                             continue
 
                     # Step 2: solve captcha digits
@@ -565,19 +679,26 @@ class RandomRaffleService:
                                 captcha_attempts,
                                 max_captcha_rounds,
                             )
-                            # wait for image with real src
                             for _img_wait in range(5):
                                 img_el = await page.query_selector(".turnstile__question img")
                                 if img_el:
                                     src = await img_el.get_attribute("src") or ""
                                     if src.startswith("data:image"):
                                         break
-                                await asyncio.sleep(0.5)
+                                if await stop_aware_sleep(0.5, stop_event):
+                                    raise asyncio.CancelledError("Giveaway stopped")
                             else:
                                 img_el = await page.query_selector(".turnstile__question img")
 
                             if img_el:
                                 img_bytes = await img_el.screenshot(type="png")
+                                last_captcha_bytes = img_bytes
+                                if getattr(self.config, "data_dir", None):
+                                    try:
+                                        CaptchaSupportStore(self.config.data_dir).reserve_attempt(account_id, "random")
+                                    except ManualRequired:
+                                        manual_notice(self.config, account_id, "random", img_bytes, reason="budget_exhausted", kind="image")
+                                        raise
                                 answer = await self._solve_captcha_image(img_bytes)
                                 if answer:
                                     self.log.info("%s: captcha answer = %s", account_id, answer)
@@ -587,26 +708,29 @@ class RandomRaffleService:
                                         cls = await btn.get_attribute("class") or ""
                                         if "disabled" not in cls:
                                             await btn.click()
-                                            await asyncio.sleep(2)
+                                            if await stop_aware_sleep(2.0, stop_event):
+                                                raise asyncio.CancelledError("Giveaway stopped")
                                             continue
-                                    await asyncio.sleep(1)
+                                    if await stop_aware_sleep(1.0, stop_event):
+                                        raise asyncio.CancelledError("Giveaway stopped")
                                     continue
                                 else:
                                     self.log.warning("%s: captcha OCR failed", account_id)
                             else:
                                 self.log.warning("%s: captcha image not found", account_id)
-                            # retry after delay
-                            await asyncio.sleep(2)
+                            if await stop_aware_sleep(2.0, stop_event):
+                                raise asyncio.CancelledError("Giveaway stopped")
                             continue
 
                     if inp and await inp.is_visible() and captcha_attempts >= max_captcha_rounds:
                         result_status = "captcha_failed"
                         result_text = f"captcha retries exhausted after {max_captcha_rounds} attempts"
+                        if getattr(self.config, "data_dir", None) and last_captcha_bytes:
+                            manual_notice(self.config, account_id, "random", last_captcha_bytes, reason="unreadable", kind="image")
                         break
 
                     # 5xx / refresh error
-                    if "обновить страницу" in text.lower() or "504" in text:
-
+                    if "обновить страницу" in lowered or re.search(r"\b(?:error|ошибка)\s*50[234]\b|\b504\s+gateway", lowered):
                         result_status = "error"
                         result_text = text
                         break
@@ -621,40 +745,43 @@ class RandomRaffleService:
                         except Exception:
                             pass
                         result_text = f"browser flow timeout after 120s, last: {last_text or 'N/A'}"
-                
 
                 if result_status in ("ok", "already"):
                     try:
-                        content = await page.content()
-                        import re
-                        match = re.search(r'https?://(?:t\.me|telegram\.me)/[a-zA-Z0-9_]+bot\?(?:start|startapp)=[a-zA-Z0-9_-]+', content)
-                        if match:
-                            ref_link = match.group(0)
-                            self.log.info("%s: found referral link %s", account_id, ref_link)
-                            
-                            # extract referral count
-                            try:
-                                page_text = (await page.inner_text("body")).lower()
-                                fraction_match = re.search(r'\d+\s*/\s*(\d+)', page_text)
-                                if fraction_match:
-                                    ref_count = int(fraction_match.group(1))
-                                else:
-                                    cnt_match = re.search(r'(?:invite|пригласи(?:ть)?)\D*?(\d+)', page_text)
-                                    if cnt_match:
-                                        ref_count = int(cnt_match.group(1))
-                            except Exception:
-                                pass
+                        hrefs = await page.locator("a[href]").evaluate_all("els => els.map(el => el.href)")
                     except Exception:
-                        pass
+                        hrefs = []
+                    try:
+                        content = await page.content()
+                    except Exception:
+                        content = ""
+                    try:
+                        page_text = await page.inner_text("body")
+                    except Exception:
+                        page_text = result_text
+                    ref_link, ref_count = extract_ref_link_and_count(
+                        page_text,
+                        [*hrefs, content],
+                        ignore_start_params={used_start_param} if used_start_param else None,
+                    )
+                    if ref_link:
+                        self.log.info("%s: found referral link %s (needed=%s)", account_id, ref_link, ref_count)
 
-
-
+            except asyncio.CancelledError:
+                raise
+            except ManualRequired:
+                raise
             except Exception as exc:
                 result_status = "error"
                 result_text = short_error(exc)
                 self.log.error("%s: browser error %s", account_id, result_text)
             finally:
-                await browser.close()
+                for closer in (page, context, browser):
+                    if closer is not None:
+                        try:
+                            await closer.close()
+                        except Exception:
+                            pass
 
         mapping = {
             "ok": "joined",
@@ -690,13 +817,12 @@ class RandomRaffleService:
             content = await page.content()
         except Exception:
             content = ""
-        
+
         combined_text = " ".join(str(href or "") for href in hrefs) + " " + str(content)
         return extract_channel_targets(combined_text)
 
     async def _solve_captcha_image(self, image: bytes) -> str | None:
-
-        result = await asyncio.to_thread(_ddddocr_digits, image)
+        result = await asyncio.to_thread(solve_ddddocr, image, alphanumeric=False, min_len=3, max_len=5)
         if result:
             self.log.info("Captcha ddddocr: %s", result)
             return result
@@ -793,9 +919,6 @@ def looks_like_post_link(value: str) -> bool:
     text = value.strip().lower()
     if "t.me/" not in text and "telegram.me/" not in text:
         return False
-    if "joinlot" in text or "startapp=" in text:
-        # could still be a post if path has /channel/id
-        pass
     try:
         parse_post_link(normalize_post_link(value))
         return True
@@ -818,30 +941,6 @@ def _derive_post_link(raw: str) -> str | None:
         text = normalize_post_link(raw)
         parse_post_link(text)
         return text
-    except Exception:
-        return None
-
-
-def _user_id_from_init(init_data: str) -> int | None:
-    try:
-        qs = parse_qs(init_data)
-        user_raw = qs.get("user", [""])[0]
-        if not user_raw:
-            return None
-        import json
-
-        user = json.loads(user_raw)
-        return int(user.get("id"))
-    except Exception:
-        return None
-
-
-def _ddddocr_digits(image: bytes) -> str | None:
-    try:
-        import ddddocr
-        ocr = ddddocr.DdddOcr(show_ad=False)
-        result = ocr.classification(image)
-        return re.sub(r"\D", "", result or "")[:5] if result else None
     except Exception:
         return None
 
@@ -872,7 +971,7 @@ def _tesseract_digits(image: bytes) -> str | None:
                 text=True,
                 timeout=20,
                 check=False,
-                env={**__import__("os").environ, "PATH": "/usr/bin:/usr/local/bin:" + __import__("os").environ.get("PATH", "")},
+                env={**os.environ, "PATH": "/usr/bin:/usr/local/bin:" + os.environ.get("PATH", "")},
             )
         except Exception:
             return None
@@ -893,7 +992,8 @@ def _find_tesseract() -> str | None:
         r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
         "tesseract",
     ):
-        if shutil.which(candidate) is not None or Path(candidate).is_file():
+        p = Path(candidate)
+        if (p.is_absolute() and p.is_file()) or shutil.which(candidate) is not None:
             return candidate
     return None
 

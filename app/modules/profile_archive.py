@@ -115,10 +115,30 @@ class ProfileArchive:
                 })
         return result
 
+    def _profile_dir(self, username: str) -> Path | None:
+        key = (username or "").strip().lower().lstrip("@")
+        if not key:
+            return None
+        root = self.dir.resolve()
+        candidate = (self.dir / key).resolve()
+        if candidate == root or not candidate.is_relative_to(root):
+            return None
+        return candidate
+
     def has_stories(self, username: str) -> bool:
-        key = username.lower().lstrip("@")
-        data = read_json(self.dir / key / "meta.json", None)
-        return bool(data and data.get("stories"))
+        profile_dir = self._profile_dir(username)
+        if profile_dir is None:
+            return False
+        data = read_json(profile_dir / "meta.json", None)
+        if not isinstance(data, dict):
+            return False
+        for info in data.get("stories") or []:
+            if not isinstance(info, dict) or not isinstance(info.get("file"), str):
+                continue
+            path = (profile_dir / info["file"]).resolve()
+            if path.is_relative_to(profile_dir) and path.is_file() and path.stat().st_size > 0:
+                return True
+        return False
 
     def save_stories(self, username: str, stories: list[dict[str, Any]]) -> int:
         key = username.lower().lstrip("@")

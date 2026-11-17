@@ -12,8 +12,17 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 
 from core.storage import read_json, write_json_atomic
-from modules.device_catalog import DEVICES, DEVICE_TYPES, PLATFORM_LANG_PACKS
-from modules.fingerprint_generator import FingerprintGenerator, SessionFingerprint
+from modules.device_catalog import (
+    DEVICES,
+    DEVICE_TYPES,
+    PLATFORM_APP_VERSIONS,
+    PLATFORM_LANG_PACKS,
+)
+from modules.fingerprint_generator import (
+    LANGUAGES,
+    FingerprintGenerator,
+    SessionFingerprint,
+)
 
 
 class CatalogueTests(unittest.TestCase):
@@ -22,6 +31,13 @@ class CatalogueTests(unittest.TestCase):
         self.assertEqual(len(DEVICES), len({device.model for device in DEVICES}))
         self.assertEqual(set(DEVICE_TYPES), {device.device_type for device in DEVICES})
         self.assertEqual(set(PLATFORM_LANG_PACKS), {device.platform for device in DEVICES})
+        self.assertEqual(set(PLATFORM_APP_VERSIONS), set(PLATFORM_LANG_PACKS))
+        for platform, versions in PLATFORM_APP_VERSIONS.items():
+            self.assertTrue(versions, platform)
+            for item in versions:
+                self.assertNotIn("Uznik", item)
+                self.assertNotIn("Kurigram", item)
+                self.assertNotIn("Telethon", item)
         for device in DEVICES:
             with self.subTest(model=device.model):
                 self.assertTrue(device.systems)
@@ -31,8 +47,8 @@ class CatalogueTests(unittest.TestCase):
         for device in DEVICES:
             with self.subTest(model=device.model), \
                  patch("modules.fingerprint_generator.random.choice", side_effect=[
-                     device, ("ru", "en"), device.systems[-1],
-                 ]), patch("modules.fingerprint_generator.version", return_value="2.2.26"):
+                     device, ("ru", "ru"), device.systems[-1],
+                 ]):
                 fp = FingerprintGenerator.generate_random(
                     device_type=device.device_type, platform=device.platform,
                 )
@@ -40,8 +56,9 @@ class CatalogueTests(unittest.TestCase):
                 self.assertIn(fp.system_version, device.systems)
                 self.assertEqual(device.platform, fp.platform)
                 self.assertEqual(PLATFORM_LANG_PACKS[device.platform], fp.lang_pack)
-                self.assertEqual("Uznik MultiTool (Kurigram 2.2.26)", fp.app_version)
-                self.assertEqual(("ru", "en"), (fp.lang_code, fp.system_lang_code))
+                self.assertIn(fp.app_version, PLATFORM_APP_VERSIONS[device.platform])
+                self.assertNotIn("Uznik MultiTool", fp.app_version)
+                self.assertEqual(("ru", "ru"), (fp.lang_code, fp.system_lang_code))
 
     def test_os_family_and_device_type_are_compatible(self):
         prefixes = {"android": "Android ", "ios": ("iOS ", "iPadOS "),
@@ -75,11 +92,19 @@ class CatalogueTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 FingerprintGenerator.generate_random(**kwargs)
 
-    def test_backend_version_is_not_an_official_mobile_build(self):
-        with patch("modules.fingerprint_generator.version", return_value="1.42") as metadata:
-            fp = FingerprintGenerator.generate_random(backend="telethon")
-        metadata.assert_called_once_with("Telethon")
-        self.assertEqual("Uznik MultiTool (Telethon 1.42)", fp.app_version)
+    def test_official_lang_packs_use_platform_app_versions(self):
+        for backend in ("pyrogram", "telethon"):
+            with self.subTest(backend=backend):
+                fp = FingerprintGenerator.generate_random(backend=backend)
+                self.assertIn(fp.app_version, PLATFORM_APP_VERSIONS[fp.platform])
+                self.assertNotIn("Uznik MultiTool", fp.app_version)
+                self.assertNotIn("Kurigram", fp.app_version)
+                self.assertNotIn("Telethon", fp.app_version)
+
+    def test_language_pairs_are_consistent(self):
+        self.assertTrue(LANGUAGES)
+        for lang_code, system_lang_code in LANGUAGES:
+            self.assertEqual(lang_code, system_lang_code)
 
 
 class PersistenceTests(unittest.TestCase):
@@ -136,14 +161,18 @@ class PersistenceTests(unittest.TestCase):
     def test_explicit_regeneration_only_changes_selected_record(self):
         self.generator.get_params("selected")
         untouched = self.generator.get_params("untouched")
-        with patch.object(self.generator, "generate_random", return_value=SessionFingerprint.from_dict(self.original)):
-            self.assertEqual(self.original, self.generator.regenerate("selected"))
+        with patch.object(self.generator, "generate_random", return_value=SessionFingerprint.from_dict(self.original)) as generate:
+            self.assertEqual(self.original, self.generator.regenerate("selected", backend="telethon"))
+        generate.assert_called_once_with(backend="telethon")
         self.assertEqual(untouched, read_json(self.path, {})["untouched"])
 
     def test_invalid_metadata_falls_back_to_account_backend(self):
         account = SimpleNamespace(id="new", backend="telethon", metadata={"fingerprint": {"device_model": ""}})
-        with patch("modules.fingerprint_generator.version", return_value="1.42"):
-            self.assertIn("Telethon", self.generator.params_for_account(account)["app_version"])
+        with patch.object(self.generator, "generate_random", wraps=self.generator.generate_random) as generate:
+            fp = self.generator.params_for_account(account)
+        generate.assert_called_once_with(backend="telethon")
+        self.assertIn(fp["app_version"], PLATFORM_APP_VERSIONS[fp["platform"]])
+        self.assertNotIn("Uznik MultiTool", fp["app_version"])
 
     def test_malformed_entries_do_not_crash_or_erase_other_entries(self):
         write_json_atomic(self.path, {"valid": self.original, "invalid": None})

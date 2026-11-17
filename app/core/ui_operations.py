@@ -17,6 +17,7 @@ class BulkOperationPreview:
     enabled: int
     sleeping: int
     without_proxy: int
+    unknown_sleep: int = 0
 
     def to_dict(self) -> dict[str, str | int]:
         return asdict(self)
@@ -28,6 +29,7 @@ class BulkOperationPreview:
             f"Selected: {self.selected}",
             f"Enabled: {self.enabled}",
             f"Sleeping: {self.sleeping}",
+            f"Sleep not configured: {self.unknown_sleep}",
             f"Without VPN: {self.without_proxy}",
         ))
 
@@ -38,9 +40,11 @@ def build_bulk_operation_preview(
     accounts: Iterable[AccountRecord],
     *,
     sleeping_ids: Collection[str] = (),
+    unknown_sleep_ids: Collection[str] = (),
 ) -> BulkOperationPreview:
     items = list(accounts)
     sleeping = set(sleeping_ids)
+    unknown = set(unknown_sleep_ids)
     return BulkOperationPreview(
         action=action,
         group=group,
@@ -48,6 +52,7 @@ def build_bulk_operation_preview(
         enabled=sum(1 for account in items if account.enabled),
         sleeping=sum(1 for account in items if account.id in sleeping),
         without_proxy=sum(1 for account in items if not account.proxy),
+        unknown_sleep=sum(1 for account in items if account.id in unknown),
     )
 
 

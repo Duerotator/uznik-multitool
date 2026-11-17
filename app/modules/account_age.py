@@ -10,11 +10,54 @@ from core.models import AccountRecord, utc_now_iso
 from core.results import ActionResult
 from core.telegram_client import create_client
 from modules.accounts import AccountService
-from utils.telegram_errors import is_invalid_auth_error, short_error
+from utils.rate_limit import human_delay
+from utils.telegram_errors import is_frozen_error, is_invalid_auth_error, short_error
 
 logger = logging.getLogger("account-age")
 
 DATERE_BOT = "dateregbot"
+
+# Historical Telegram user ID -> (year, month) checkpoints for offline fallback estimation.
+_USER_ID_TIMELINE: tuple[tuple[int, tuple[int, int]], ...] = (
+    (1, (2013, 8)),
+    (25_000_000, (2013, 12)),
+    (75_000_000, (2014, 12)),
+    (100_000_000, (2015, 3)),
+    (150_000_000, (2015, 10)),
+    (250_000_000, (2016, 8)),
+    (350_000_000, (2017, 5)),
+    (500_000_000, (2018, 2)),
+    (750_000_000, (2019, 2)),
+    (1_000_000_000, (2019, 12)),
+    (1_400_000_000, (2020, 10)),
+    (1_850_000_000, (2021, 6)),
+    (5_000_000_000, (2022, 1)),
+    (5_750_000_000, (2023, 1)),
+    (6_500_000_000, (2023, 11)),
+    (7_200_000_000, (2024, 9)),
+    (7_900_000_000, (2025, 7)),
+    (8_500_000_000, (2026, 6)),
+    (8_900_000_000, (2026, 11)),
+)
+
+
+def estimate_registration_from_user_id(user_id: int) -> str | None:
+    """Estimate approximate MM/YY registration month from a Telegram user ID."""
+    if not isinstance(user_id, int) or user_id <= 0:
+        return None
+    if user_id <= _USER_ID_TIMELINE[0][0]:
+        y, m = _USER_ID_TIMELINE[0][1]
+        return f"~{m:02d}/{y % 100:02d}"
+    for (id_lo, ym_lo), (id_hi, ym_hi) in zip(_USER_ID_TIMELINE, _USER_ID_TIMELINE[1:]):
+        if user_id <= id_hi:
+            m_lo = ym_lo[0] * 12 + (ym_lo[1] - 1)
+            m_hi = ym_hi[0] * 12 + (ym_hi[1] - 1)
+            ratio = (user_id - id_lo) / max(1, id_hi - id_lo)
+            total_months = round(m_lo + ratio * (m_hi - m_lo))
+            year, month_idx = divmod(total_months, 12)
+            return f"~{month_idx + 1:02d}/{year % 100:02d}"
+    y, m = _USER_ID_TIMELINE[-1][1]
+    return f"~{m:02d}/{y % 100:02d}"
 
 MONTHS_MAP = {
     "январь": "01", "февраль": "02", "март": "03", "апрель": "04",
@@ -145,12 +188,30 @@ class AccountAgeService:
                 previous_ids = {int(message.get("id") or 0) for message in previous}
                 self.log.info("%s: checking @dateregbot target %s", account.id, target)
                 await client.send_message(DATERE_BOT, target)
-                return await self._wait_registration_reply(client, account, previous_ids)
+                bot_reply = await self._wait_registration_reply(client, account, previous_ids)
+                if bot_reply:
+                    return bot_reply
+                estimated = estimate_registration_from_user_id(user_id)
+                if estimated:
+                    self.log.info("%s estimated registration from user_id %s: %s", account.id, user_id, estimated)
+                return estimated
         except Exception as exc:
             error = short_error(exc)
+            if is_frozen_error(exc):
+                self.accounts.update_profile_metadata(
+                    account.id,
+                    {"health_status": "frozen", "health_checked_at": utc_now_iso()},
+                )
+                self.accounts.mark_error(account.id, error, disable=True)
+                self.log.warning("%s frozen during age check, disabled (session preserved): %s", account.id, error)
+                return None
             if is_invalid_auth_error(exc):
                 self.accounts.mark_error(account.id, error, disable=True)
+                self.log.error("%s age check failed: %s", account.id, error)
+                return None
             self.log.error("%s age check failed: %s", account.id, error)
+            if account.user_id:
+                return estimate_registration_from_user_id(int(account.user_id))
             return None
 
     async def _wait_registration_reply(
@@ -187,7 +248,15 @@ class AccountAgeService:
         async def worker(account: AccountRecord) -> None:
             if not account.enabled:
                 return
+            cached = account.metadata.get("registration")
+            if cached:
+                self.log.info("%s already checked: %s", account.id, cached)
+                result.add_ok(account.id)
+                if progress:
+                    progress.mark_ok(account.id)
+                return
             async with semaphore:
+                await human_delay(self.config.min_action_delay, self.config.max_action_delay)
                 registration = await self.check_one(account)
                 if registration:
                     self.accounts.update_profile_metadata(account.id, {
@@ -195,10 +264,12 @@ class AccountAgeService:
                         "reg_checked_at": utc_now_iso(),
                     })
                     result.add_ok(account.id)
-                    if progress: progress.mark_ok(account.id)
+                    if progress:
+                        progress.mark_ok(account.id)
                 else:
                     result.add_error(account.id, "no_reg_date_found")
-                    if progress: progress.mark_error(account.id)
+                    if progress:
+                        progress.mark_error(account.id)
 
         await asyncio.gather(*(worker(account) for account in accounts), return_exceptions=True)
         return result

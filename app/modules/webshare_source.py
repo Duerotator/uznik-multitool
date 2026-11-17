@@ -36,30 +36,39 @@ class WebshareSource:
             return []
 
         proxies: list[tuple[str, int, str, str, str]] = []
+        max_pages = 50
         async with httpx.AsyncClient(timeout=15) as client:
             for account_index, account in enumerate(accounts, start=1):
                 api_key = account.get("api_key", "")
                 if not api_key:
                     continue
+                next_url: str | None = f"{BASE}/proxy/list/?mode=direct&page=1&page_size=100"
+                pages = 0
                 try:
-                    r = await client.get(
-                        f"{BASE}/proxy/list/?mode=direct&page=1&page_size=50",
-                        headers={"Authorization": f"Token {api_key}"},
-                    )
-                    if r.status_code != 200:
-                        logger.warning("Webshare API error for account #%d: HTTP %d", account_index, r.status_code)
-                        continue
-                    data = r.json()
-                    for p in data.get("results", []):
-                        if not p.get("valid"):
-                            continue
-                        proxies.append((
-                            p["proxy_address"],
-                            p["port"],
-                            "http",
-                            p["username"],
-                            p["password"],
-                        ))
+                    while next_url and pages < max_pages:
+                        pages += 1
+                        r = await client.get(
+                            next_url,
+                            headers={"Authorization": f"Token {api_key}"},
+                        )
+                        if r.status_code != 200:
+                            logger.warning("Webshare API error for account #%d: HTTP %d", account_index, r.status_code)
+                            break
+                        data = r.json()
+                        results = data.get("results", []) or []
+                        for p in results:
+                            if not p.get("valid"):
+                                continue
+                            proxies.append((
+                                p["proxy_address"],
+                                p["port"],
+                                "http",
+                                p["username"],
+                                p["password"],
+                            ))
+                        next_url = data.get("next") or None
+                        if not results:
+                            break
                 except Exception as exc:
                     # Response errors may contain credentials; log only the type.
                     logger.warning("Webshare fetch failed for account #%d (%s)", account_index, type(exc).__name__)
@@ -77,9 +86,15 @@ class WebshareSource:
         return self._cache
 
 
+_INSTANCES: dict[str, WebshareSource] = {}
+
+
 def get_webshare_source(config: AppConfig | None = None) -> WebshareSource:
-    """Singleton для WebshareSource."""
-    if not hasattr(get_webshare_source, "_instance"):
-        accounts_file = (config.data_dir / "webshare_accounts.json") if config else Path("data/webshare_accounts.json")
-        get_webshare_source._instance = WebshareSource(accounts_file)
-    return get_webshare_source._instance
+    """Per-data-dir instance of WebshareSource."""
+    accounts_file = (config.data_dir / "webshare_accounts.json") if config else Path("data/webshare_accounts.json")
+    key = str(accounts_file.resolve())
+    instance = _INSTANCES.get(key)
+    if instance is None:
+        instance = WebshareSource(accounts_file)
+        _INSTANCES[key] = instance
+    return instance

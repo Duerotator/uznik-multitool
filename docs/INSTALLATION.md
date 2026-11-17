@@ -2,31 +2,34 @@
 
 ## Установка в один запуск
 
-Нужны Windows 10/11 x64, интернет, стандартный CPython 3.12–3.14 x64
-и WinGet (компонент Microsoft App Installer). Рекомендуется Python 3.14;
+Нужны Windows 10/11 x64, интернет, стандартный CPython 3.12–3.14 x64,
+WinGet (компонент Microsoft App Installer) и Node.js 18+ (рекомендуется
+24+ LTS — для кодека WalletTg и сборки TON-активов). Рекомендуется Python 3.14;
 free-threaded и 32-битные сборки не входят в проверенную конфигурацию.
 
 Дважды нажмите `setup.bat`. Он:
 
 1. Создаст `.venv` в папке проекта, не меняя системные Python-пакеты.
 2. Установит `config/requirements.txt` и проверит совместимость зависимостей.
-3. Скачает Chromium для Playwright.
-4. Установит отсутствующие FFmpeg, Tesseract и Xray через WinGet.
-5. Создаст `.env` из шаблона, только если файла ещё нет.
-6. Проверит импорты, MTProto-ускорение, запуск пустого браузера и внешние программы.
-7. Создаст ярлыки в папке проекта и на рабочем столе.
+3. Установит npm-зависимости `app/ui/finance/` (`npm ci`) и соберёт `dist/money.js` (`npm run build`).
+4. Скачает Chromium для Playwright.
+5. Установит отсутствующие FFmpeg, Tesseract и Xray через WinGet.
+6. Создаст `.env` из шаблона, только если файла ещё нет.
+7. Проверит импорты, MTProto-ускорение, запуск пустого браузера и внешние программы.
+8. Создаст ярлыки в папке проекта и на рабочем столе.
 
 Нативные программы устанавливаются средствами Windows Package Manager и
 могут потребовать подтверждения Windows. Уже найденные программы установщик
 не переустанавливает. Xray не запускается: gateway требует собственной
 конфигурации и отдельного включения в приложении.
 
-Python-пакеты загружаются из PyPI, браузер — средствами Playwright,
-нативные программы — из каталога WinGet (ID указаны ниже). Скрипт запускается
-с `-ExecutionPolicy Bypass` только для своего процесса PowerShell; постоянная
-политика Windows не меняется. Служба приложения не устанавливается. Изменения
-касаются окружения проекта, новых конфигурационных файлов, ярлыков и выбранных
-внешних программ. Подробнее: [данные и безопасность](SECURITY_AND_DATA.md).
+Python-пакеты загружаются из PyPI, npm-пакеты кодека — из npm (`@ton/core` и
+`@tonconnect/*`), браузер — средствами Playwright, нативные программы — из
+каталога WinGet (ID указаны ниже). Скрипт запускается с `-ExecutionPolicy Bypass`
+только для своего процесса PowerShell; постоянная политика Windows не меняется.
+Служба приложения не устанавливается. Изменения касаются окружения проекта,
+новых конфигурационных файлов, ярлыков и выбранных внешних программ.
+Подробнее: [данные и безопасность](SECURITY_AND_DATA.md).
 
 Проверка установки не загружает аккаунты, `.env` или сессии и не входит
 в Telegram. Данные и существующие настройки не перезаписываются.
@@ -41,11 +44,15 @@ py -3.14 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r config/requirements.txt
 .\.venv\Scripts\python.exe -m pip check
 .\.venv\Scripts\python.exe -m playwright install chromium
+npm --prefix app/ui/finance ci
+npm --prefix app/ui/finance run build
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/windows/install_native_tools.ps1
 ```
 
 При использовании Python 3.12 или 3.13 замените `-3.14` в первой команде.
 Активация виртуального окружения не обязательна: команды явно используют его Python.
+Установите [Node.js LTS](https://nodejs.org/) (v24+), чтобы работали финансовый
+кодек `app/ui/finance/wallet_tg_codec.cjs` и сборка `dist/money.js`.
 
 Скопируйте `config/.env.example` в `.env`, **только если `.env` ещё нет**,
 заполните свои Telegram API-ключи. `TELEGRAM_GLOBAL_PROXY` необязателен:
@@ -78,14 +85,15 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/setup.ps1 -SkipNativ
 
 | Область | Зависимости |
 | --- | --- |
-| Telegram / MTProto | Kurigram, TgCrypto-pyrofork, Telethon |
+| Telegram / MTProto | Kurigram, kuricrypt, Telethon, cryptg |
 | Интерфейс | PySide6 |
-| Настройки и диагностика | python-dotenv, psutil |
-| HTTP, прокси, скачивание | httpx, PySocks, socksio, gdown |
+| Настройки и диагностика | python-dotenv, psutil, tzdata |
+| HTTP, прокси, скачивание | httpx, python-socks, pysocks, gdown |
 | Браузер | Playwright + отдельная загрузка Chromium |
 | Изображения и QR | Pillow, NumPy, zxing-cpp |
 | Локальный OCR | ddddocr, CPU ONNX Runtime, OpenCV |
-| Passkey | cbor2, cryptography |
+| Passkey и шифрование | cbor2, cryptography |
+| TON / WalletTg (Node.js) | Node.js 24+, `@ton/core`, `@tonconnect/sdk`, `@tonconnect/ui`, `buffer`, `esbuild` |
 | Внешние исполняемые программы | FFmpeg, Tesseract, Xray |
 
 На Windows устанавливается `opencv-python`; на Linux —
@@ -99,18 +107,18 @@ Telegram-клиент — **[Kurigram](https://pypi.org/project/Kurigram/)**.
 Название модуля остаётся `pyrogram` для совместимости; это не означает, что
 нужно устанавливать пакет `Pyrogram`. Версия клиента закреплена в requirements.
 
-Для MTProto установлен **[TgCrypto-pyrofork](https://pypi.org/project/TgCrypto-pyrofork/)**,
-предоставляющий модуль `tgcrypto` и готовые Windows x64 wheels, в том числе
-для CPython 3.14. Это криптографическое расширение, а не замена Kurigram.
-Установка требует готовый wheel и не пытается компилировать его из исходников.
+Для ускорения MTProto устанавливаются **kuricrypt** (для Kurigram) и
+**cryptg** (для Telethon) с готовыми Windows x64 wheels, в том числе
+для CPython 3.14. Это криптографические расширения, а не замена Kurigram.
+Установка требует готовый wheel и не пытается компилировать расширения из исходников.
 
-Не добавляйте `Pyrogram`, `pyrofork`, `TgCrypto` или extra `kurigram[fast]`
+Не добавляйте оригинальные `Pyrogram`, `pyrofork`, `TgCrypto` или `TgCrypto-pyrofork`
 в это окружение: они могут перекрыть используемые модули. Установщик обнаруживает
 конфликт и останавливается, ничего автоматически не удаляя.
 Если конфликт уже появился, закройте приложение и **в окружении этого проекта**:
 
 ```powershell
-.\.venv\Scripts\python.exe -m pip uninstall Pyrogram pyrofork TgCrypto
+.\.venv\Scripts\python.exe -m pip uninstall Pyrogram pyrofork TgCrypto TgCrypto-pyrofork
 .\.venv\Scripts\python.exe -m pip install --force-reinstall -r config/requirements.txt
 ```
 
@@ -126,7 +134,7 @@ winget install --id UB-Mannheim.TesseractOCR --exact --source winget
 winget install --id XTLS.Xray-core --exact --source winget
 ```
 
-При ручной установке FFmpeg и Xray должны быть доступны в `PATH`.
+При ручной установке Node.js, FFmpeg и Xray должны быть доступны в `PATH`.
 Tesseract также находится в стандартном каталоге `Program Files/Tesseract-OCR`.
 Для нестандартного расположения Xray укажите `XRAY_EXECUTABLE` в `.env`.
 После изменения `PATH` закройте и заново откройте окно терминала / папку проекта.
@@ -145,6 +153,8 @@ Tesseract также находится в стандартном каталог
 - **Нет Python / несовместимая версия:** установите CPython 3.12–3.14 x64.
   Если `.venv` уже создана другой версией, сохраните её под другим именем и
   повторите установку. Аккаунты находятся в `data/`, не в `.venv`.
+- **Нет Node.js или `node_modules` в `app/ui/finance/`:** установите Node.js 24+ LTS
+  и выполните `npm --prefix app/ui/finance ci`. Без этого кодек WalletTg недоступен.
 - **WinGet недоступен:** установите или обновите Microsoft App Installer либо
   установите внешние программы вручную.
 - **Ошибка загрузки пакета:** проверьте доступ к PyPI, интернет и настройки

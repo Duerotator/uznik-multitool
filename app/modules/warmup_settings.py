@@ -75,6 +75,7 @@ class WarmupHistory:
         self.data = read_json(path, {}) if path else {}
         if not isinstance(self.data, dict):
             raise ValueError("Warmup history must be a JSON object.")
+        self._dirty_accounts: set[str] = set()
 
     def _account(self, account_id: str) -> dict:
         return self.data.setdefault(account_id, {"posts": {}, "joined": [], "blocked": {}})
@@ -89,6 +90,7 @@ class WarmupHistory:
             actions.append(action)
         while len(posts) > 5000:
             del posts[next(iter(posts))]
+        self._dirty_accounts.add(account_id)
         self._save()
 
     def joined(self, account_id: str, channel: str) -> bool:
@@ -98,6 +100,7 @@ class WarmupHistory:
         channels = self._account(account_id)["joined"]
         if channel not in channels:
             channels.append(channel)
+            self._dirty_accounts.add(account_id)
             self._save()
 
     def available(self, account_id: str, channel: str) -> bool:
@@ -105,8 +108,43 @@ class WarmupHistory:
 
     def block(self, account_id: str, channel: str, seconds: float = 21600) -> None:
         self._account(account_id)["blocked"][channel] = time.time() + seconds
+        self._dirty_accounts.add(account_id)
         self._save()
 
     def _save(self) -> None:
-        if self.path:
-            update_json(self.path, {}, lambda _: self.data)
+        if not self.path or not self._dirty_accounts:
+            return
+        dirty = set(self._dirty_accounts)
+
+        def mutate(disk: dict) -> dict:
+            if not isinstance(disk, dict):
+                disk = {}
+            for account_id in dirty:
+                local_acc = self.data.get(account_id)
+                if not isinstance(local_acc, dict):
+                    continue
+                disk_acc = disk.get(account_id)
+                if not isinstance(disk_acc, dict):
+                    disk_acc = {"posts": {}, "joined": [], "blocked": {}}
+                merged_posts = dict(disk_acc.get("posts") or {})
+                for link, actions in (local_acc.get("posts") or {}).items():
+                    merged_posts[link] = list(dict.fromkeys([*merged_posts.get(link, []), *actions]))
+                while len(merged_posts) > 5000:
+                    del merged_posts[next(iter(merged_posts))]
+                merged_joined = list(dict.fromkeys([*(disk_acc.get("joined") or []), *(local_acc.get("joined") or [])]))
+                merged_blocked = dict(disk_acc.get("blocked") or {})
+                for ch, until in (local_acc.get("blocked") or {}).items():
+                    prev = float(merged_blocked.get(ch, 0) or 0)
+                    merged_blocked[ch] = max(prev, float(until or 0))
+                disk[account_id] = {
+                    "posts": merged_posts,
+                    "joined": merged_joined,
+                    "blocked": merged_blocked,
+                }
+            return disk
+
+        merged = update_json(self.path, {}, mutate)
+        for account_id in dirty:
+            if account_id in merged:
+                self.data[account_id] = merged[account_id]
+        self._dirty_accounts.clear()

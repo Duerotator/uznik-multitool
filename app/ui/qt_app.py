@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import os
 import re
 import socket
 import threading
+import time
 import traceback
 from collections.abc import Awaitable, Callable
 from concurrent.futures import CancelledError as FutureCancelledError
@@ -14,12 +16,13 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, QObject, Qt, QSettings, QSize, QTimer, QUrl, Signal
-from PySide6.QtGui import QColor, QCloseEvent, QDesktopServices, QIcon, QPalette
+from PySide6.QtGui import QColor, QCloseEvent, QDesktopServices, QIcon, QIntValidator, QPalette
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
     QCheckBox,
     QComboBox,
+    QDialog,
     QFrame,
     QFileDialog,
     QGridLayout,
@@ -54,7 +57,9 @@ from core.ui_progress import OperationProgress
 from core.ui_logs import Severity, UiLogEntry
 from core.ui_state import UiStateStore
 from core.telegram_client import ReactionChoice
-from modules.account_security import AccountSecurityService, passkey_restore_candidates
+from modules.account_security import AccountSecurityService, SecurityScanResult, passkey_restore_candidates
+from modules.security_guard import GuardResult
+from modules.asset_registry import AssetReadResult
 from modules.account_filters import AccountFilter, country_options, effective_proxy, filter_accounts, login_mail_state
 from modules.accounts import AccountService
 from modules.ai_companion import AICompanion, AIConversationConfig
@@ -143,6 +148,15 @@ class UiSignals(QObject):
     progress_updated = Signal(object)
     warmup_status = Signal(object)
     auth_code_requested = Signal(object)
+    profile_review_event = Signal(str, object)
+    guard_event = Signal(object)
+    asset_event = Signal(object)
+    marketapp_event = Signal(object)
+    captcha_support_event = Signal(object)
+    profile_studio_event = Signal(object)
+    task_history_event = Signal(object)
+    native_money_event = Signal(object)
+    carousel_funding_event = Signal(object)
 
 
 class ButtonRow(QWidget):
@@ -240,7 +254,7 @@ class Section(QWidget):
 class AccountTableModel(QAbstractTableModel):
     HEADERS = ["Added", "Phone / Region", "Spamblock", "Login Mail", "Cloud Password", "Username", "VPN", "Sleep", "Reg", "Profile"]
     STATUS_COLUMNS = {2, 3, 4, 5, 6, 7, 8, 9}
-    FIXED_WIDTHS = {0: 142, 2: 118, 3: 122, 4: 140, 6: 72, 7: 82, 9: 72}
+    FIXED_WIDTHS = {0: 142, 2: 118, 3: 122, 4: 140, 6: 72, 7: 82, 8: 92, 9: 72}
     STATUS_COLORS = {
         "ok": QColor("#45d483"),
         "bad": QColor("#ff6b6b"),
@@ -284,7 +298,7 @@ class AccountTableModel(QAbstractTableModel):
         normalized = value.lower()
         if normalized in {"valid", "clear", "custom", "yes", "awake"} or normalized.startswith("active"):
             return "ok"
-        if normalized in {"invalid", "error", "forever", "no", "absent"} or "dead" in normalized:
+        if normalized in {"invalid", "error", "forever", "no", "absent", "frozen"} or "dead" in normalized or "frozen" in normalized:
             return "bad"
         if normalized in {"unknown", "disabled", "none"} or normalized.startswith("sleep"):
             return "neutral"
@@ -332,6 +346,8 @@ class QtDesktopApp(QMainWindow):
         self._restart_required = False
         self.external_sessions_running = False
         self._announced_external_sources: set[str] = set()
+        self._last_ui_progress_flush = 0.0
+        self._marketapp_snapshot: tuple[str, set[str]] = ("", set())
         self.settings = QSettings("UznikMultiTool", "Desktop")
         self.group_name = str(self.settings.value("active_group", "inbox"))
 
@@ -417,6 +433,15 @@ class QtDesktopApp(QMainWindow):
         self.signals.progress_updated.connect(self.on_progress_updated)
         self.signals.warmup_status.connect(self.on_warmup_status)
         self.signals.auth_code_requested.connect(self.on_auth_code_requested)
+        self.signals.profile_review_event.connect(self.on_profile_review_event)
+        self.signals.guard_event.connect(self.on_guard_event)
+        self.signals.asset_event.connect(self.on_asset_event)
+        self.signals.marketapp_event.connect(self.on_marketapp_event)
+        self.signals.captcha_support_event.connect(self.on_captcha_support_event)
+        self.signals.profile_studio_event.connect(self.on_profile_studio_event)
+        self.signals.task_history_event.connect(self.on_task_history_event)
+        self.signals.native_money_event.connect(self.on_native_money_event)
+        self.signals.carousel_funding_event.connect(self.on_carousel_funding_event)
 
     def _build_layout(self) -> None:
         root = QWidget()
@@ -455,8 +480,20 @@ class QtDesktopApp(QMainWindow):
         self.security_section = self._add_section(sidebar_layout, "security", "Security")
         self._build_security_section(self.security_section.content_layout)
 
+        self.guard_section = self._add_section(sidebar_layout, "guard", "Guard")
+        self._build_guard_section(self.guard_section.content_layout)
+
+        self.money_section = self._add_section(sidebar_layout, "money", "Money")
+        self._build_money_section(self.money_section.content_layout)
+
+        self.gifts_section = self._add_section(sidebar_layout, "gifts", "Gifts")
+        self._build_gifts_section(self.gifts_section.content_layout)
+
         self.passkeys_section = self._add_section(sidebar_layout, "passkeys", "Passkeys")
         self._build_passkeys_section(self.passkeys_section.content_layout)
+
+        self.smart_section = self._add_section(sidebar_layout, "smart", "Auto Grouping")
+        self._build_smart_section(self.smart_section.content_layout)
 
         self.scenarios_section = self._add_section(sidebar_layout, "scenarios", "Scenarios")
         self._build_scenarios_section(self.scenarios_section.content_layout)
@@ -499,6 +536,36 @@ class QtDesktopApp(QMainWindow):
         self.progress_bar.setVisible(False)
         header_layout.addWidget(self.progress_bar)
         main_layout.addWidget(header)
+
+        groups_row = QHBoxLayout()
+        groups_row.setContentsMargins(0, 0, 0, 0)
+        groups_row.setSpacing(6)
+        self.group_tabs_scroll = QScrollArea()
+        self.group_tabs_scroll.setObjectName("groupTabsScroll")
+        self.group_tabs_scroll.setWidgetResizable(True)
+        self.group_tabs_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.group_tabs_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.group_tabs_scroll.setFixedHeight(44)
+        self.groups_bar = QWidget()
+        self.groups_bar.setObjectName("groupsBar")
+        self.groups_layout = QHBoxLayout(self.groups_bar)
+        self.groups_layout.setContentsMargins(0, 0, 0, 0)
+        self.groups_layout.setSpacing(6)
+        self.group_tabs_scroll.setWidget(self.groups_bar)
+        groups_row.addWidget(self.group_tabs_scroll, 1)
+        new_group_btn = QPushButton("+ Group")
+        new_group_btn.setProperty("class", "secondary")
+        new_group_btn.clicked.connect(self.create_group)
+        groups_row.addWidget(new_group_btn)
+        self.clear_group_btn = QPushButton("Clear group")
+        self.clear_group_btn.setProperty("class", "secondary")
+        self.clear_group_btn.clicked.connect(self.clear_active_group)
+        groups_row.addWidget(self.clear_group_btn)
+        self.delete_group_btn = QPushButton("Delete group")
+        self.delete_group_btn.setProperty("class", "danger")
+        self.delete_group_btn.clicked.connect(self.delete_active_group)
+        groups_row.addWidget(self.delete_group_btn)
+        main_layout.addLayout(groups_row)
 
         self.filters_section = Section("filters", "Filters")
         self.filters_section.button.clicked.connect(self.filters_section.set_open)
@@ -597,6 +664,8 @@ class QtDesktopApp(QMainWindow):
         header.setSectionResizeMode(5, QHeaderView.Stretch)
         header.setSectionResizeMode(6, QHeaderView.Fixed)
         header.setSectionResizeMode(7, QHeaderView.Fixed)
+        header.setSectionResizeMode(8, QHeaderView.Fixed)
+        header.setSectionResizeMode(9, QHeaderView.Fixed)
         for column, width in self.table_model.FIXED_WIDTHS.items():
             self.table.setColumnWidth(column, width)
         main_layout.addWidget(self.table, 4)
@@ -623,6 +692,12 @@ class QtDesktopApp(QMainWindow):
             button.setProperty("class", style)
             button.clicked.connect(handler)
             selection_layout.addWidget(button)
+        self.remove_group_button = QPushButton("Remove")
+        self.remove_group_button.setProperty("class", "secondary")
+        self.remove_group_button.setToolTip("Remove selected accounts from current group")
+        self.remove_group_button.clicked.connect(self.remove_selected_from_group)
+        self.remove_group_button.setVisible(False)
+        selection_layout.addWidget(self.remove_group_button)
         self.selection_bar.setVisible(False)
         main_layout.addWidget(self.selection_bar)
 
@@ -631,7 +706,7 @@ class QtDesktopApp(QMainWindow):
         logs_layout = QVBoxLayout(logs_panel)
         logs_layout.setContentsMargins(10, 8, 10, 10)
         logs_layout.setSpacing(7)
-        self.log_title = QLabel("ACTIVITY  ·  inbox")
+        self.log_title = QLabel(f"ACTIVITY  ·  {self.active_group()}")
         self.log_title.setObjectName("logsTitle")
         logs_layout.addWidget(self.log_title)
         self.log_box = QPlainTextEdit()
@@ -653,26 +728,6 @@ class QtDesktopApp(QMainWindow):
         label.setProperty("tone", tone)
         label.style().unpolish(label)
         label.style().polish(label)
-
-    def _status_tone(self, value: str) -> str:
-        normalized = value.lower()
-        if normalized in {"valid", "clear", "custom", "yes", "awake"} or normalized.startswith("active"):
-            return "ok"
-        if normalized in {"invalid", "error", "forever", "no", "absent"} or "dead" in normalized:
-            return "bad"
-        if normalized in {"unknown", "disabled", "none"} or normalized.startswith("sleep"):
-            return "neutral"
-        if "temporary" in normalized or "limited" in normalized or "slow" in normalized:
-            return "warn"
-        return "info"
-
-    def _status_badge(self, value: str) -> QLabel:
-        badge = QLabel(value)
-        badge.setAlignment(Qt.AlignCenter)
-        badge.setProperty("class", "statusBadge")
-        badge.setProperty("tone", self._status_tone(value))
-        badge.setToolTip(value)
-        return badge
 
     def apply_account_filters(self) -> None:
         self.account_filter = AccountFilter(
@@ -753,6 +808,7 @@ class QtDesktopApp(QMainWindow):
                 ("Check registration date", self.check_account_age, "secondary"),
             ],
         )
+        self._add_button_row(layout, [("Task history / resume…", self.open_task_history, "secondary")])
         self._add_button_row(layout, [("Check spamblock", self.check_spamblock, "secondary")])
 
         self._add_title(layout, "External sessions")
@@ -799,6 +855,7 @@ class QtDesktopApp(QMainWindow):
         self.ai_chat_entry = self._add_line_with_paste(layout, "id/@ chat")
         self.ai_topic_entry = self._add_line_with_paste(layout, "Topic")
         self.ai_count_entry = self._add_line_with_paste(layout, "messages")
+        self.ai_count_entry.setValidator(QIntValidator(1, 9999, self))
         self._add_button_row(layout, [("Run AI for group", self.start_ai, "primary")])
 
     def _build_warmup_section(self, layout: QVBoxLayout) -> None:
@@ -866,6 +923,7 @@ class QtDesktopApp(QMainWindow):
 
 
     def _build_giveaway_section(self, layout: QVBoxLayout) -> None:
+        self._add_button_row(layout, [("CAPTCHA diagnostics / manual queue…", self.open_captcha_support, "secondary")])
         self._add_label(layout, "Giveaway engine")
         self.giveaway_provider = QComboBox()
         for key, label in PROVIDER_LABELS.items():
@@ -885,8 +943,12 @@ class QtDesktopApp(QMainWindow):
             [
                 ("Check link", self.inspect_giveaway, "secondary"),
                 ("Join giveaway", self.join_giveaway, "primary"),
+                ("Stop giveaway", self.stop_task, "secondary"),
             ],
         )
+        self.giveaway_status_label = QLabel("Idle. Enter a giveaway link or select accounts.")
+        self.giveaway_status_label.setWordWrap(True)
+        layout.addWidget(self.giveaway_status_label)
         self._add_label(
             layout,
             "Uses selected accounts when rows are selected; otherwise uses the filtered active group.",
@@ -947,6 +1009,7 @@ class QtDesktopApp(QMainWindow):
         self.scrape_count_entry = QLineEdit()
         self.scrape_count_entry.setText("5")
         self.scrape_count_entry.setMaximumWidth(70)
+        self.scrape_count_entry.setValidator(QIntValidator(1, 9999, self))
         row_count = QHBoxLayout()
         row_count.addWidget(self.scrape_count_entry)
         row_count.addStretch()
@@ -969,11 +1032,13 @@ class QtDesktopApp(QMainWindow):
         self.min_avatars = QLineEdit()
         self.min_avatars.setText("0")
         self.min_avatars.setMaximumWidth(40)
+        self.min_avatars.setValidator(QIntValidator(0, 9999, self))
         lbl_s = QLabel("Min stories:")
         lbl_s.setStyleSheet("font-size:11px")
         self.min_stories = QLineEdit()
         self.min_stories.setText("0")
         self.min_stories.setMaximumWidth(40)
+        self.min_stories.setValidator(QIntValidator(0, 9999, self))
         for w in [lbl_a, self.min_avatars, lbl_s, self.min_stories]:
             f2.addWidget(w)
         f2.addStretch()
@@ -1013,11 +1078,14 @@ class QtDesktopApp(QMainWindow):
             ("Premium stories", self.premium_stories, "secondary"),
             ("Apply saved profiles", self.apply_saved_profiles, "secondary"),
         ])
+        self._add_button_row(layout, [("Review story publications…", self.review_story_publications, "secondary")])
+        self._add_button_row(layout, [("Profile Studio · local plan…", self.open_profile_studio, "secondary")])
         self._add_button_row(layout, [
             ("Clear selected", self.clear_full_profile, "secondary"),
         ])
 
     def _build_security_section(self, layout: QVBoxLayout) -> None:
+        self._add_button_row(layout, [("Secret vault…", self.open_secret_vault, "secondary")])
         self._add_label(layout, "2FA current password")
         self.twofa_entry = self._add_line_with_paste(
             layout,
@@ -1124,19 +1192,29 @@ class QtDesktopApp(QMainWindow):
         progress = self.begin_operation_progress(operation, accounts)
         async def runner(stop):
             bad_ids, frozen_ids = set(), set()
+            last_refresh = 0.0
             async def execute(name, account, saved_options):
+                nonlocal last_refresh
                 if name != "check-sessions":
-                    return await self.resumable_jobs._execute(name, account, saved_options)
-                service = SessionHealthService(self.config)
-                outcome = await service.validate([account])
-                bad_ids.update(service.invalid_session_ids)
-                frozen_ids.update(service.frozen_session_ids)
+                    outcome = await self.resumable_jobs._execute(name, account, saved_options)
+                else:
+                    service = SessionHealthService(self.config)
+                    outcome = await service.validate([account])
+                    bad_ids.update(service.invalid_session_ids)
+                    frozen_ids.update(service.frozen_session_ids)
+                now = time.monotonic()
+                if now - last_refresh >= 1.5:
+                    last_refresh = now
+                    self.signals.refresh_requested.emit()
                 return outcome
             result = await self.resumable_jobs.run(job_id, stop, progress=progress, execute=execute)
             if operation == "check-sessions":
                 self.signals.session_check_done.emit(result.ok, sorted(bad_ids), group)
                 if frozen_ids:
-                    self.accounts.delete_accounts(sorted(frozen_ids), delete_sessions=True)
+                    self.signals.log_message.emit(
+                        f"Frozen accounts preserved (marked frozen & disabled; .session files kept): {len(frozen_ids)}",
+                        group,
+                    )
             self.signals.refresh_requested.emit()
             return result
         self.log(f"Saved batch {job_id[:8]}: {operation}, {len(accounts)} pending account(s).", group=group)
@@ -1635,7 +1713,32 @@ class QtDesktopApp(QMainWindow):
         self.refresh_accounts()
         self.render_group_log()
 
+    def refresh_group_tabs(self) -> None:
+        if not hasattr(self, "groups_layout"):
+            return
+        active = self.active_group()
+        groups = self.accounts.groups()
+        if active not in groups:
+            active = "inbox"
+            self.group_name = "inbox"
+        self._clear_layout(self.groups_layout)
+        for group in groups:
+            button = QPushButton(group)
+            button.setProperty("groupTab", "true")
+            button.setProperty("active", "true" if group == active else "false")
+            button.clicked.connect(lambda _checked=False, name=group: self.switch_group(name))
+            self.groups_layout.addWidget(button)
+        self.groups_layout.addStretch(1)
+        is_custom = active != "inbox"
+        if hasattr(self, "clear_group_btn"):
+            self.clear_group_btn.setEnabled(is_custom)
+        if hasattr(self, "delete_group_btn"):
+            self.delete_group_btn.setEnabled(is_custom)
+        if hasattr(self, "remove_group_button"):
+            self.remove_group_button.setVisible(is_custom)
+
     def refresh_accounts(self) -> None:
+        self.refresh_group_tabs()
         selected = set(self.selected_account_ids()) if hasattr(self, "table") else set()
         accounts = self.filtered_accounts(
             self.accounts.list_accounts(group=self.active_group())
@@ -1656,12 +1759,17 @@ class QtDesktopApp(QMainWindow):
             ]
             rows.append((account.id, [str(value) for value in values]))
         self.table.setUpdatesEnabled(False)
-        self.table_model.set_rows(rows)
-        self.table.clearSelection()
-        for row, (account_id, _values) in enumerate(rows):
-            if account_id in selected:
-                self.table.selectRow(row)
-        self.table.setUpdatesEnabled(True)
+        sel_model = self.table.selectionModel()
+        sel_model.blockSignals(True)
+        try:
+            self.table_model.set_rows(rows)
+            self.table.clearSelection()
+            for row, (account_id, _values) in enumerate(rows):
+                if account_id in selected:
+                    self.table.selectRow(row)
+        finally:
+            sel_model.blockSignals(False)
+            self.table.setUpdatesEnabled(True)
         self.update_header_status()
 
     def update_header_status(self) -> None:
@@ -1686,6 +1794,8 @@ class QtDesktopApp(QMainWindow):
             self.selection_bar_label.setText(f"Selected: {selected}")
             self.selection_bar.setVisible(selected > 0)
             self.open_account_button.setVisible(selected == 1)
+        if hasattr(self, "remove_group_button"):
+            self.remove_group_button.setVisible(selected > 0 and self.active_group() != "inbox")
         self._set_status_pill(
             self.proxy_pill,
             (
@@ -1694,6 +1804,9 @@ class QtDesktopApp(QMainWindow):
             ),
             "ok" if self.proxy_active_count else "warn",
         )
+        from modules.marketapp_rentals import fingerprint
+        enabled_ids = {account.id for account in accounts if account.enabled}
+        self._marketapp_snapshot = (fingerprint([self.active_group(), self.account_filter.to_dict()]), enabled_ids)
         self.ui_state.update(
             active_group=self.active_group(),
             selected_accounts=self.selected_account_ids(),
@@ -1717,6 +1830,8 @@ class QtDesktopApp(QMainWindow):
         self.worker.submit(read_count(), done)
 
     def on_proxy_count_ready(self, active: int, total: int) -> None:
+        if (active, total) == (self.proxy_active_count, self.proxy_total_count) and "online" in self.proxy_pill.text():
+            return
         self.proxy_active_count = active
         self.proxy_total_count = total
         self.update_header_status()
@@ -1766,18 +1881,6 @@ class QtDesktopApp(QMainWindow):
         except ValueError:
             return value[:16]
 
-    def account_validity(self, account) -> str:
-        status = str(account.metadata.get("health_status") or "").lower()
-        if not account.enabled:
-            return "disabled"
-        if status == "valid":
-            return "valid"
-        if status in {"invalid", "error"}:
-            return status
-        if account.metadata.get("last_error"):
-            return "error"
-        return "unknown"
-
     def login_mail_status(self, account) -> str:
         return login_mail_state(account)
 
@@ -1790,12 +1893,16 @@ class QtDesktopApp(QMainWindow):
         return "unknown"
 
     def spamblock_status(self, account) -> str:
+        if str(account.metadata.get("health_status") or "").lower() == "frozen":
+            return "frozen"
         status = str(account.metadata.get("spamblock_status") or "").lower()
         until = str(account.metadata.get("spamblock_until") or "")
         if status == "clear":
             return "none"
         if status == "forever":
             return "forever"
+        if status == "frozen":
+            return "frozen"
         if status == "temporary" and until:
             try:
                 parsed = datetime.fromisoformat(until.replace("Z", "+00:00"))
@@ -1815,11 +1922,11 @@ class QtDesktopApp(QMainWindow):
         if not proxy:
             return "none"
         latency = account.metadata.get("proxy_latency")
-        checked = account.metadata.get("proxy_checked_at", "")
         try:
             from urllib.parse import urlparse
             parsed = urlparse(proxy)
-            base = f"{parsed.scheme or 'socks5'}://{parsed.hostname or '?'}"
+            port_part = f":{parsed.port}" if parsed.port else ""
+            base = f"{parsed.scheme or 'socks5'}://{parsed.hostname or '?'}{port_part}"
             if latency is not None:
                 return f"{base} ({latency}s)"
             return base
@@ -2390,13 +2497,30 @@ class QtDesktopApp(QMainWindow):
             plan = ProfileUpdatePlan(avatars_dir=self.avatars_dir)
         elif action == "profile.clear_avatars":
             plan = ProfileUpdatePlan(clear_avatars=True)
-        elif action == "profile.clear_full":
+        elif action in {"profile.clear_full", "profile.clear_full_profile"}:
+            ProfileSnapshotService(self.config).save_latest(accounts, action)
             plan = ProfileUpdatePlan(
                 usernames=[None] * len(accounts),
                 last_names=[""],
                 bios=[""],
                 clear_avatars=True,
             )
+            result = await customizer.apply(accounts, plan)
+            for acc in accounts:
+                try:
+                    customizer.accounts.update_profile_metadata(acc.id, {"profiled": False})
+                except Exception:
+                    pass
+            try:
+                from modules.profile_bindings import ProfileBindings
+                bindings = ProfileBindings(self.config)
+                for acc in accounts:
+                    bindings.unbind(acc.id)
+            except Exception:
+                pass
+            return result
+        elif action == "profile.apply_saved":
+            return await ProfileScraperService(self.config).apply_saved_profiles(accounts)
         elif action == "profile.rollback":
             profiles = ProfileSnapshotService(self.config).load_latest_profiles({account.id for account in accounts})
             if not profiles:
@@ -2461,6 +2585,9 @@ class QtDesktopApp(QMainWindow):
         if not queued:
             return
         self.log(f"Queued {len(queued)} external session(s) in imports/auth_input. Original files were not changed.")
+        QTimer.singleShot(0, self, lambda items=list(queued): self._confirm_external_sessions_drop(items))
+
+    def _confirm_external_sessions_drop(self, queued: list[Path]) -> None:
         if self.confirm(
             "Process external sessions?",
             "The tool will create its own local session for each dropped file. "
@@ -2487,6 +2614,7 @@ class QtDesktopApp(QMainWindow):
             self.log(str(exc), severity="warning")
             return
         self.external_sessions_running = True
+        log_group = self.active_group()
 
         async def ask_for_input(phone: str, source: Path, *, password: bool = False) -> str | None:
             request = {"phone": phone, "source": source, "password": password, "event": threading.Event(), "value": ""}
@@ -2528,7 +2656,7 @@ class QtDesktopApp(QMainWindow):
                     detail += f" · {result.phone}"
                 if result.error:
                     detail += f" · {result.error}"
-                self.signals.log_message.emit(detail, self.active_group())
+                self.signals.log_message.emit(detail, log_group)
             self.signals.refresh_requested.emit()
             return results
 
@@ -2558,7 +2686,16 @@ class QtDesktopApp(QMainWindow):
         if isinstance(event, threading.Event):
             event.set()
 
+    def _financial_dialog_active(self) -> bool:
+        for attr in ("_carousel_funding_dialog", "_native_money_dialog"):
+            dlg = getattr(self, attr, None)
+            if dlg is not None and dlg.isVisible():
+                return True
+        return False
+
     def auto_import_tick(self) -> None:
+        if self._financial_dialog_active():
+            return
         self.import_now(verbose=False)
         self.refresh_external_session_queue()
 
@@ -2590,6 +2727,7 @@ class QtDesktopApp(QMainWindow):
         name: str,
         factory: Callable[[asyncio.Event], Awaitable[object]],
         task_group: str | None = None,
+        *, resume_spec=None, checkpoint_factory=None, resume_from=None,
     ) -> None:
         if getattr(self, "_restart_required", False) is True:
             self.log("Restart the application after restoring a backup before starting another task.")
@@ -2617,7 +2755,14 @@ class QtDesktopApp(QMainWindow):
                     f"Stopped online-mode before {name}: {stopped_online} task(s).",
                     task_group,
                 )
-            task_id = self.tasks.start(name, factory)
+            task_id = (
+                self.tasks.start(name, factory)
+                if (resume_spec is None and checkpoint_factory is None and resume_from is None)
+                else self.tasks.start(
+                    name, factory, progress=self.current_progress,
+                    resume_spec=resume_spec, checkpoint_factory=checkpoint_factory, resume_from=resume_from,
+                )
+            )
             task = self.tasks.tasks[task_id]
             # Queue Started before a fast validation failure can queue Failed.
             self.signals.task_started.emit(name, task_id, None, task_group)
@@ -2660,11 +2805,21 @@ class QtDesktopApp(QMainWindow):
                 self.clear_progress()
             self.log(f"{name} failed to start: {error}", group=group)
             self._set_status_pill(self.task_pill, "Task: failed", "bad")
+            if name.startswith("giveaway-") and isinstance(getattr(self, "giveaway_status_label", None), QLabel):
+                self.giveaway_status_label.setText(f"Failed to start: {error}")
             return
         self.current_task_id = str(result)
         self.current_task_name = name
         self._set_status_pill(self.task_pill, f"Task: {name}", "warn")
         self.log(f"Started {name}: {result}", group=group)
+        if name.startswith("giveaway-") and isinstance(getattr(self, "giveaway_status_label", None), QLabel):
+            self.giveaway_status_label.setText(f"Running {name}…")
+        if hasattr(self, "ui_state"):
+            self.ui_state.update(
+                active_task=self.current_task_id,
+                warmup_running=name == "warmup",
+                online_running=name == "online-mode",
+            )
 
     def on_progress_updated(self, snapshot: object) -> None:
         if not isinstance(snapshot, dict):
@@ -2674,11 +2829,12 @@ class QtDesktopApp(QMainWindow):
             return
         total = int(snapshot.get("total", 0) or 0)
         completed = int(snapshot.get("completed", 0) or 0)
+        errors = int(snapshot.get("errors", 0) or 0)
         operation = str(snapshot.get("operation") or "Working")
+        current_account = str(snapshot.get("current_account") or "")
         determinate = str(snapshot.get("mode") or "determinate") != "indeterminate" and total > 0
         if determinate:
             percent = min(100, round((completed / total) * 100))
-            errors = int(snapshot.get("errors", 0) or 0)
             detail = f"{operation}: {completed}/{total} · {percent}%"
             if errors:
                 detail += f" · errors {errors}"
@@ -2686,11 +2842,22 @@ class QtDesktopApp(QMainWindow):
             self.progress_bar.setRange(0, total)
             self.progress_bar.setValue(min(completed, total))
         else:
-            self._set_status_pill(self.progress_pill, f"{operation}: working…", "info")
+            detail = f"{operation}: {completed} done · working…" if completed else f"{operation}: working…"
+            self._set_status_pill(self.progress_pill, detail, "info")
             self.progress_bar.setRange(0, 0)
         self.progress_pill.setVisible(True)
         self.progress_bar.setVisible(True)
-        self.ui_state.update(operation_progress=dict(snapshot))
+        if (
+            "giveaway" in operation.lower()
+            and isinstance(getattr(self, "giveaway_status_label", None), QLabel)
+        ):
+            acc_part = f" ({current_account})" if current_account else ""
+            self.giveaway_status_label.setText(f"{detail}{acc_part}")
+        now = time.monotonic()
+        last_flush = getattr(self, "_last_ui_progress_flush", 0.0)
+        if now - last_flush >= 0.5 or (total > 0 and completed >= total):
+            self._last_ui_progress_flush = now
+            self.ui_state.update(operation_progress=dict(snapshot))
 
     def clear_progress(self) -> None:
         self.current_progress = None
@@ -2738,13 +2905,19 @@ class QtDesktopApp(QMainWindow):
         self.current_task_name = ""
         self.clear_progress()
         self._set_status_pill(self.task_pill, "Task: failed" if failed else "Task: idle", "bad" if failed else "ok")
+        if hasattr(self, "ui_state"):
+            self.ui_state.update(active_task="", warmup_running=False, online_running=False)
 
     def task_failed(self, name: str, error: str, group: str, task_id: str = "") -> None:
         QtDesktopApp._resume_backup_timers(self, name)
         QtDesktopApp.clear_task_state(self, task_id, failed=True)
         self.ui_log.error("[%s] %s failed: %s", group, name, error)
         summary = error.strip().splitlines()[-1] if error.strip() else "Unknown error"
+        if hasattr(self, "ui_state"):
+            self.ui_state.update(last_error=summary)
         self.log(f"{name} failed: {summary}", group=group, severity="error")
+        if name.startswith("giveaway-") and isinstance(getattr(self, "giveaway_status_label", None), QLabel):
+            self.giveaway_status_label.setText(f"Failed: {summary}")
         if name in {"change-login-email", "bind-recovery-email"}:
             QMessageBox.warning(self, "Email operation failed", summary)
 
@@ -2754,6 +2927,8 @@ class QtDesktopApp(QMainWindow):
             self.external_sessions_running = False
         QtDesktopApp.clear_task_state(self, task_id)
         self.log(f"{name} stopped.", group=group)
+        if name.startswith("giveaway-") and isinstance(getattr(self, "giveaway_status_label", None), QLabel):
+            self.giveaway_status_label.setText("Giveaway stopped by user.")
 
     def task_finished(self, name: str, result: object, group: str, task_id: str = "") -> None:
         QtDesktopApp._resume_backup_timers(self, name)
@@ -2762,8 +2937,23 @@ class QtDesktopApp(QMainWindow):
         QtDesktopApp.clear_task_state(self, task_id)
         if isinstance(result, ActionResult):
             self.log(result.summary(name), group=group, operation=name)
+            if name.startswith("giveaway-") and isinstance(getattr(self, "giveaway_status_label", None), QLabel):
+                self.giveaway_status_label.setText(f"Finished: ok={result.ok}, errors={result.errors}")
             for account_id, detail in result.details.items():
                 if detail == "ok":
+                    continue
+                if isinstance(result, AssetReadResult):
+                    self.log(detail, group=group, account=account_id, operation=name,
+                             severity="error" if detail in result.error_messages else "info")
+                    continue
+                if isinstance(result, GuardResult):
+                    self.log(detail, group=group, account=account_id, operation=name,
+                             severity="warning" if "Guard observation:" in detail else "info"
+                             if detail.startswith("Skipped:") else "error")
+                    continue
+                if isinstance(result, SecurityScanResult) and account_id in result.observations:
+                    self.log(detail, group=group, account=account_id, operation=name,
+                             severity="warning" if result.observations[account_id]["status"] == "needs_review" else "info")
                     continue
                 self.log(
                     detail,
@@ -2785,6 +2975,8 @@ class QtDesktopApp(QMainWindow):
                 self.log(f"[{stamp}] {item.label} ({item.account_id}) | code={item.code}", group=group)
         elif isinstance(result, GiveawayInspection):
             self.log(f"Giveaway link: {result.summary()}", group=group, operation=name)
+            if isinstance(getattr(self, "giveaway_status_label", None), QLabel):
+                self.giveaway_status_label.setText(result.summary())
         elif isinstance(result, DirectAccessResult):
             self.log(f"{result.account_id}: {result.detail}", group=group, operation=name)
         elif all(hasattr(result, attr) for attr in ("copied", "male", "female", "unknown", "skipped")):
@@ -2800,6 +2992,13 @@ class QtDesktopApp(QMainWindow):
         else:
             self.log(f"{name} finished.", group=group)
         self.refresh_accounts()
+        if (
+            name == "money:batch-provision"
+            and self.isVisible()
+            and not self.isMinimized()
+            and QApplication.activeModalWidget() is None
+        ):
+            QTimer.singleShot(100, self.export_wallet_addresses)
 
     def start_chat_action(self, action: str) -> None:
         target = self.entry_value(self.target_entry)
@@ -2875,16 +3074,22 @@ class QtDesktopApp(QMainWindow):
             self.log("No enabled accounts match the current selection/filter.")
             return
         service = GiveawayService(self.config)
-        self.start_managed_task(
-            f"giveaway-inspect:{target}",
-            lambda _stop: service.inspect(
+        supports_stop = "stop_event" in inspect.signature(service.inspect).parameters
+        if isinstance(getattr(self, "giveaway_status_label", None), QLabel):
+            self.giveaway_status_label.setText(f"Inspecting giveaway link… ({len(accounts)} probe candidate(s))")
+
+        async def runner(stop: asyncio.Event):
+            kwargs = {"stop_event": stop} if supports_stop else {}
+            return await service.inspect(
                 target,
                 provider=provider,
                 extra_channels=channels,
                 probe_account=accounts[0],
                 probe_accounts=accounts,
-            ),
-        )
+                **kwargs,
+            )
+
+        self.start_managed_task(f"giveaway-inspect:{target}", runner)
 
     def join_giveaway(self) -> None:
         values = self._giveaway_inputs()
@@ -2902,14 +3107,19 @@ class QtDesktopApp(QMainWindow):
             return
         progress = self.begin_operation_progress("Join giveaway", accounts)
         service = GiveawayService(self.config)
+        supports_stop = "stop_event" in inspect.signature(service.participate).parameters
+        if isinstance(getattr(self, "giveaway_status_label", None), QLabel):
+            self.giveaway_status_label.setText(f"Starting giveaway for {len(accounts)} account(s)…")
 
-        async def runner(_stop: asyncio.Event) -> ActionResult:
+        async def runner(stop: asyncio.Event) -> ActionResult:
+            kwargs = {"stop_event": stop} if supports_stop else {}
             return await service.participate(
                 accounts,
                 target,
                 provider=provider,
                 extra_channels=channels,
                 progress=progress,
+                **kwargs,
             )
 
         self.start_managed_task(f"giveaway-join:{target}", runner)
@@ -3311,6 +3521,7 @@ class QtDesktopApp(QMainWindow):
         from urllib.parse import unquote, urlparse
         pool = ProxyPool(self.config.proxy_pool_db)
         progress = self.begin_operation_progress("Check VPN exits", accounts)
+        group = self.active_group()
 
         async def runner(_stop: asyncio.Event) -> ActionResult:
             result = ActionResult()
@@ -3325,7 +3536,7 @@ class QtDesktopApp(QMainWindow):
 
             if os.getenv("PROXY_MODE", "").strip().lower() == "vpn_gateway":
                 return await self._check_gateway_proxies(
-                    accounts, validate_proxy, pool, result, mark_ok, mark_error,
+                    accounts, validate_proxy, pool, result, mark_ok, mark_error, group=group,
                 )
 
             for account in accounts:
@@ -3345,7 +3556,14 @@ class QtDesktopApp(QMainWindow):
                         valid, latency = await validate_proxy(ip, port, proto, auth=auth)
                         if valid:
                             mark_ok(account.id)
-                            account.metadata["proxy_latency"] = round(latency, 3)
+                            rounded = round(latency, 3)
+                            checked_at = utc_now_iso()
+                            account.metadata["proxy_latency"] = rounded
+                            account.metadata["proxy_checked_at"] = checked_at
+                            self.accounts.update_profile_metadata(
+                                account.id,
+                                {"proxy_latency": rounded, "proxy_checked_at": checked_at},
+                            )
                             await pool.record_success(ip, port, proto, latency)
                         else:
                             await pool.add_to_blacklist(ip, port, proto)
@@ -3375,6 +3593,8 @@ class QtDesktopApp(QMainWindow):
         result: ActionResult,
         mark_ok,
         mark_error,
+        *,
+        group: str = "inbox",
     ) -> ActionResult:
         """Check each shared exit once and move accounts off recovering exits."""
         from urllib.parse import unquote, urlparse
@@ -3445,9 +3665,10 @@ class QtDesktopApp(QMainWindow):
             for account in failed_accounts:
                 if account.id not in assigned_ids:
                     mark_error(account.id, "no healthy VPN replacement; assignment preserved")
-            self.log(
+            self.signals.log_message.emit(
                 f"Moved {len(assigned_ids)} account(s) away from "
-                f"{len(failed_groups)} recovering VPN exit(s)."
+                f"{len(failed_groups)} recovering VPN exit(s).",
+                group,
             )
         else:
             for account in failed_accounts:
@@ -3527,18 +3748,22 @@ class QtDesktopApp(QMainWindow):
             lambda result, error: self.signals.stop_done.emit(f"Stop {task_id}", result, error),
         )
 
-    def stop_all_tasks(self) -> None:
-        self.worker.submit(
-            self.tasks.stop_all(),
-            lambda result, error: self.signals.stop_done.emit("Stop all", result, error),
-        )
-
     def on_stop_done(self, label: str, result: object, error: object) -> None:
         if error:
             self.log(f"{label}: {error}")
         else:
             self.log(f"{label}: {result}")
         self.refresh_accounts()
+
+    @staticmethod
+    def _parse_int_field(entry: QLineEdit, default: int, *, minimum: int = 0) -> int:
+        raw = entry.text().strip()
+        if not raw:
+            return default
+        try:
+            return max(minimum, int(raw))
+        except ValueError:
+            return default
 
     def _profile_scrape(self) -> None:
         accounts = self.get_selected_accounts() if self.has_selection() else self.group_accounts()
@@ -3550,7 +3775,7 @@ class QtDesktopApp(QMainWindow):
         if not accounts:
             self.log("All accounts already profiled.")
             return
-        count = int(self.scrape_count_entry.text() or "5")
+        count = self._parse_int_field(self.scrape_count_entry, 5, minimum=1)
         group_raw = self.scrape_channel_entry.text().strip()
         user_raw = self.scrape_usernames_entry.text().strip()
         if group_raw:
@@ -3570,23 +3795,26 @@ class QtDesktopApp(QMainWindow):
         copy_music = self.chk_music.isChecked() if hasattr(self, "chk_music") else False
         copy_stories = self.chk_stories_copy.isChecked() if hasattr(self, "chk_stories_copy") else False
         copy_birthday = self.chk_birthday.isChecked() if hasattr(self, "chk_birthday") else False
-        min_avatars_val = int(self.min_avatars.text() or "0")
-        min_stories_val = int(self.min_stories.text() or "0")
+        min_avatars_val = self._parse_int_field(self.min_avatars, 0, minimum=0)
+        min_stories_val = self._parse_int_field(self.min_stories, 0, minimum=0)
         require_bio_val = self.chk_bio_flt.isChecked()
         require_avatar = self.chk_avatar.isChecked()
         require_stories = self.chk_story_flt.isChecked()
+        log_group = self.active_group()
+        progress = self.begin_indeterminate_progress("Profile parsing")
+
         async def runner(stop_event) -> ActionResult:
             scraper = ProfileScraperService(self.config)
-            on_log = self.log
+            on_log = lambda msg: self.signals.log_message.emit(str(msg), log_group)
             if names:
                 from modules.profile_scraper import ProfileData
                 profiles = [ProfileData(0, n, "", "", "", 0, 0, False) for n in names]
-                self.log(f"Using {len(profiles)} usernames")
+                on_log(f"Using {len(profiles)} usernames")
             else:
                 sr = await scraper.scrape_from_group(group, on_log=on_log)
                 profiles = sr.profiles
-                self.log(f"Parsed {len(profiles)} usernames from group")
-            parse_progress = self.begin_operation_progress("Profile parsing", profiles)
+                on_log(f"Parsed {len(profiles)} usernames from group")
+            progress.reset("Profile parsing", len(profiles))
             need_stories = require_stories or copy_stories
             full = await scraper.fetch_full_profiles(
                 profiles,
@@ -3599,76 +3827,26 @@ class QtDesktopApp(QMainWindow):
                 require_bio=require_bio_val,
                 require_stories=require_stories,
                 max_count=count if not names else len(names),
-                progress=parse_progress,
+                progress=progress,
                 on_log=on_log,
             )
             if not full:
-                self.log("No profiles matched filters — try uncheck Has avatar / Has story")
+                on_log("No profiles matched filters — try uncheck Has avatar / Has story")
                 return ActionResult()
-            apply_progress = self.begin_operation_progress("Apply profiles", accounts[: len(full)])
-            return await scraper.apply_to_accounts(
+            progress.reset("Apply profiles", min(len(accounts), len(full)))
+            res = await scraper.apply_to_accounts(
                 accounts, full,
                 copy_name=copy_name, copy_bio=copy_bio,
                 copy_username=copy_username, copy_avatars=copy_avatars,
                 copy_music=copy_music, copy_stories=copy_stories, copy_birthday=copy_birthday,
-                clear_first=True, progress=apply_progress,
+                clear_first=True, progress=progress,
                 on_log=on_log,
             )
+            self.signals.refresh_requested.emit()
+            return res
 
         name = f"profile-scrape-{group or len(names)}"
-        self.start_managed_task(name, runner)
-
-    def set_usernames(self) -> None:
-        accounts = self.group_accounts()
-        if not accounts:
-            self.log("No enabled accounts in selected group.")
-            return
-        customizer = ProfileCustomizer(self.config)
-        usernames = [line.lstrip("@") for line in customizer.load_lines(self.usernames_file)]
-        if not self.confirm_bulk_operation("Set usernames", accounts):
-            return
-        self.record_scenario_step(
-            "profile.set_usernames",
-            "set usernames from templates/usernames.txt",
-            {"group": self.active_group()},
-        )
-        self.start_profile_task("set-usernames", ProfileUpdatePlan(usernames=usernames))
-
-    def clear_usernames(self) -> None:
-        accounts = self.group_accounts()
-        if not accounts:
-            self.log("No enabled accounts in selected group.")
-            return
-        if not self.confirm_bulk_operation("Clear usernames", accounts):
-            return
-        self.record_scenario_step(
-            "profile.clear_usernames",
-            "clear usernames",
-            {"group": self.active_group()},
-        )
-        self.start_profile_task("clear-usernames", ProfileUpdatePlan(usernames=[None] * len(accounts)))
-
-    def set_profile(self) -> None:
-        accounts = self.group_accounts()
-        if not accounts:
-            self.log("No enabled accounts in selected group.")
-            return
-        customizer = ProfileCustomizer(self.config)
-        if not self.confirm_bulk_operation("Set profile fields", accounts):
-            return
-        self.record_scenario_step(
-            "profile.set_profile",
-            "set first/last/bio from templates",
-            {"group": self.active_group()},
-        )
-        self.start_profile_task(
-            "set-profile",
-            ProfileUpdatePlan(
-                first_names=customizer.load_optional_lines(self.first_names_file),
-                last_names=customizer.load_optional_lines(self.last_names_file),
-                bios=customizer.load_optional_lines(self.bios_file),
-            ),
-        )
+        self.start_managed_task(name, runner, task_group=log_group)
 
     def generate_profiles(self) -> None:
         accounts = self.group_accounts()
@@ -3699,7 +3877,8 @@ class QtDesktopApp(QMainWindow):
         self.refresh_accounts()
 
     def download_avatar_pack(self) -> None:
-        url = self.entry_value(self.avatar_drive_entry)
+        entry = getattr(self, "avatar_drive_entry", None)
+        url = self.entry_value(entry) if entry is not None else self.ask_text("Download avatar pack", "Google Drive folder URL:")
         if not url:
             self.log("Enter Google Drive folder URL.")
             return
@@ -3715,29 +3894,6 @@ class QtDesktopApp(QMainWindow):
             {"group": self.active_group(), "avatar_url": url},
         )
         self.start_managed_task("download-avatar-pack", runner)
-
-    def apply_profile_plan(self) -> None:
-        customizer = ProfileCustomizer(self.config)
-        accounts = self.group_accounts()
-        if not accounts:
-            self.log("No enabled accounts in selected group.")
-            return
-        if not self.profile_plan_file.exists():
-            self.log("Generate profiles first or set an existing profile_plan.json.")
-            return
-        try:
-            profiles = customizer.load_profile_plan(self.profile_plan_file)
-        except Exception as exc:
-            self.log(f"Cannot load profile plan: {exc}")
-            return
-        if not self.confirm_bulk_operation("Apply profile plan", accounts):
-            return
-        self.record_scenario_step(
-            "profile.apply_plan",
-            "apply profile plan",
-            {"group": self.active_group()},
-        )
-        self.start_profile_task("apply-profile-plan", ProfileUpdatePlan(profile_plan=profiles))
 
     def split_unknown_avatars(self) -> None:
         if not self.confirm(
@@ -3758,48 +3914,6 @@ class QtDesktopApp(QMainWindow):
             f"Split unknown avatars: male={counters['male']}, "
             f"female={counters['female']}, skipped={counters['skipped']}"
         )
-
-    def clear_bio(self) -> None:
-        accounts = self.group_accounts()
-        if not accounts:
-            self.log("No enabled accounts in selected group.")
-            return
-        if not self.confirm_bulk_operation("Clear bios", accounts):
-            return
-        self.record_scenario_step(
-            "profile.clear_bio",
-            "clear bio",
-            {"group": self.active_group()},
-        )
-        self.start_profile_task("clear-bio", ProfileUpdatePlan(bios=[""]), accounts)
-
-    def set_avatars(self) -> None:
-        accounts = self.group_accounts()
-        if not accounts:
-            self.log("No enabled accounts in selected group.")
-            return
-        if not self.confirm_bulk_operation("Set profile photos", accounts):
-            return
-        self.record_scenario_step(
-            "profile.set_avatars",
-            "set avatars",
-            {"group": self.active_group()},
-        )
-        self.start_profile_task("set-avatars", ProfileUpdatePlan(avatars_dir=self.avatars_dir), accounts)
-
-    def clear_avatars(self) -> None:
-        accounts = self.group_accounts()
-        if not accounts:
-            self.log("No enabled accounts in selected group.")
-            return
-        if not self.confirm_bulk_operation("Clear profile photos", accounts):
-            return
-        self.record_scenario_step(
-            "profile.clear_avatars",
-            "clear avatars",
-            {"group": self.active_group()},
-        )
-        self.start_profile_task("clear-avatars", ProfileUpdatePlan(clear_avatars=True), accounts)
 
     def clear_full_profile(self) -> None:
         accounts = self.get_selected_accounts() if self.has_selection() else self.group_accounts()
@@ -3854,9 +3968,15 @@ class QtDesktopApp(QMainWindow):
             return
         scraper = ProfileScraperService(self.config)
         progress = self.begin_indeterminate_progress("Premium stories")
+        log_group = self.active_group()
         self.start_managed_task(
             "premium-stories",
-            lambda _stop: scraper.download_stories_for_bound(accounts, progress=progress, on_log=self.log),
+            lambda _stop: scraper.download_stories_for_bound(
+                accounts,
+                progress=progress,
+                on_log=lambda msg: self.signals.log_message.emit(str(msg), log_group),
+            ),
+            task_group=log_group,
         )
 
     def apply_saved_profiles(self) -> None:
@@ -3867,7 +3987,7 @@ class QtDesktopApp(QMainWindow):
         if not self.confirm_bulk_operation(
             "Apply saved profiles",
             accounts,
-            detail="Applies locally saved profiles to accounts; accounts already bound to a profile only get missing stories uploaded.",
+            detail="Applies locally saved profiles to accounts; bound accounts upload missing stories when receipts allow.",
         ):
             return
         self.record_scenario_step(
@@ -3875,47 +3995,7 @@ class QtDesktopApp(QMainWindow):
             "apply profiles from local archive",
             {"group": self.active_group()},
         )
-        from modules.story_publication import StoryPublicationStore
-        receipts = StoryPublicationStore(self.config.data_dir)
-        legacy = any(int((a.metadata or {}).get("stories_uploaded", 0) or 0) > 0 and not receipts.has_receipts(a.id) for a in accounts)
-        accept_legacy = False
-        if legacy:
-            accept_legacy = self.confirm("Legacy story counters", "Some accounts have old counters without per-media receipts.\n"
-                                         "Confirm ONLY if their first N archived stories were published in archive order.\n"
-                                         "Otherwise choose No: those accounts will stop with an explicit reconciliation error rather than risk duplicates.")
-        self.start_resumable_batch("apply-saved-profiles", accounts, options={"accept_legacy_stories": accept_legacy})
-
-    def rollback_profile_snapshot(self) -> None:
-        accounts = self.group_accounts()
-        if not accounts:
-            self.log("No enabled accounts in selected group.")
-            return
-        snapshot = ProfileSnapshotService(self.config)
-        profiles = snapshot.load_latest_profiles({account.id for account in accounts})
-        if not profiles:
-            self.log("No profile snapshot found for selected group.")
-            return
-        if not self.confirm_bulk_operation(
-            "Rollback profile snapshot",
-            accounts,
-            detail="Restores the latest known profile values; avatar rollback uses known stored paths.",
-        ):
-            return
-        self.record_scenario_step(
-            "profile.rollback",
-            "rollback profile snapshot",
-            {"group": self.active_group()},
-        )
-        customizer = ProfileCustomizer(self.config)
-        progress = self.begin_operation_progress("Rollback profile snapshot", accounts)
-        self.start_managed_task(
-            "rollback-profile-snapshot",
-            lambda _stop: customizer.apply(
-                accounts,
-                ProfileUpdatePlan(profile_plan=profiles),
-                progress=progress,
-            ),
-        )
+        self.start_resumable_batch("apply-saved-profiles", accounts)
 
     def terminate_other_sessions(self) -> None:
         self._terminate_sessions(desktop_only=False)
@@ -4232,31 +4312,6 @@ class QtDesktopApp(QMainWindow):
             return shared
         return self.ask_text(title, text, password=True)
 
-    def start_profile_task(self, name: str, plan: ProfileUpdatePlan, accounts: list[AccountRecord] | None = None) -> None:
-        if accounts is None:
-            accounts = self.group_accounts()
-        if not accounts:
-            self.log("No enabled accounts.")
-            return
-        snapshot_path = ProfileSnapshotService(self.config).save_latest(accounts, name)
-        self.log(f"Saved profile snapshot: {snapshot_path}")
-        customizer = ProfileCustomizer(self.config)
-        progress = self.begin_operation_progress(f"Profile: {name}", accounts)
-        is_clear = bool(plan.clear_avatars or (plan.usernames and all(u is None for u in plan.usernames)))
-
-        async def runner(_stop: asyncio.Event) -> ActionResult:
-            result = await customizer.apply(accounts, plan, progress=progress)
-            if is_clear:
-                for acc in accounts:
-                    try:
-                        customizer.accounts.update_profile_metadata(acc.id, {"profiled": False})
-                    except Exception:
-                        pass
-                self.signals.refresh_requested.emit()
-            return result
-
-        self.start_managed_task(name, runner)
-
     def confirm(self, title: str, text: str) -> bool:
         answer = QMessageBox.question(
             self,
@@ -4308,6 +4363,14 @@ class QtDesktopApp(QMainWindow):
             QMessageBox.warning(self, "Backup in progress", "Wait for the disk transaction to finish before closing the application.")
             event.ignore()
             return
+        if self.current_task_name in {"carousel-run", "carousel-resume", "native-money:execute", "native-money:deploy-uninit"}:
+            if not self.confirm(
+                "Financial operation in progress",
+                "A financial transfer is currently running. Closing does not cancel an already-signed broadcast.\n"
+                "Wait or check the journal afterwards. Close anyway?",
+            ):
+                event.ignore()
+                return
         self.settings.setValue("geometry", self.saveGeometry())
         self.settings.setValue("active_group", self.active_group())
         self.settings.setValue("table_widths", [self.table.columnWidth(i) for i in range(self.table_model.columnCount())])
@@ -4327,6 +4390,987 @@ class QtDesktopApp(QMainWindow):
         self.worker.stop()
         event.accept()
 
+
+
+    def _build_guard_section(self, layout: QVBoxLayout) -> None:
+        self._add_button_row(layout, [("Scan security (read-only)", self.scan_security, "secondary")])
+        self._add_button_row(layout, [("Guard review…", self.open_security_guard, "secondary")])
+        self._add_button_row(layout, [("Guard check selected", self.check_security_guard, "secondary")])
+        self._add_button_row(layout, [("Watch selected (3 passes)", lambda: self.check_security_guard(watch=True), "secondary")])
+
+    def _build_money_section(self, layout: QVBoxLayout) -> None:
+        self._add_button_row(layout, [("Массово создать кошельки (группа/выбранные)", self.batch_provision_wallets, "primary")])
+        self._add_button_row(layout, [("Список / экспорт адресов кошельков…", self.export_wallet_addresses, "secondary")])
+        self._add_button_row(layout, [("Money · карусель…", self.open_carousel_funding, "secondary")])
+        self._add_button_row(layout, [("Public assets (read-only)…", self.open_public_assets, "secondary")])
+        self._add_button_row(layout, [("Money · native local…", self.open_native_money, "secondary")])
+        self._add_button_row(layout, [("Money · open browser…", self.open_money_browser, "secondary")])
+
+    def _build_gifts_section(self, layout: QVBoxLayout) -> None:
+        self._add_button_row(layout, [("Gift rental catalog…", self.open_marketapp, "secondary")])
+        self._add_button_row(layout, [("Marketapp credentials…", self.open_marketapp_credentials, "secondary")])
+
+    def review_story_publications(self) -> None:
+        selected = set(self.selected_account_ids())
+        accounts = [a for a in self.group_accounts() if a.id in selected]
+        if len(selected) != 1 or len(accounts) != 1:
+            self.log("Select exactly one enabled account in the current group/filters.")
+            return
+        self._request_story_review("open", accounts[0].id, "", {})
+
+    def _request_story_review(self, action, account_id, token, payload):
+        if self.foreground_task_busy() or self._task_start_pending or getattr(self, "_profile_review_busy", False):
+            self.log("Finish the current task before reviewing publications.")
+            return
+        if account_id not in {a.id for a in self.group_accounts()}:
+            self.log("Review account is outside the current group/filters.")
+            return
+        self._profile_review_busy = True
+        dialog = getattr(self, "_profile_review_dialog", None)
+        if dialog:
+            dialog.set_busy(True)
+        async def runner(_stop):
+            from modules.profile_story_review import ProfileStoryReview
+            try:
+                service = getattr(self, "_profile_story_review", None)
+                if service is None:
+                    service = self._profile_story_review = ProfileStoryReview(self.config)
+                if action == "open":
+                    result = await service.open(account_id)
+                elif action == "preview":
+                    result = {"local": await service.preview(account_id, token, "local", payload["local_hash"])}
+                    if payload.get("story_id"):
+                        result["remote"] = await service.preview(account_id, token, "remote", payload["story_id"])
+                    result["token"] = token
+                else:
+                    result = await service.commit(account_id, token, payload.get("choices"), payload.get("confirmed"))
+                    result["token"] = token
+                self.signals.profile_review_event.emit(action, result)
+            except asyncio.CancelledError:
+                self.signals.profile_review_event.emit("error", {"message": "Review cancelled."})
+                raise
+            except Exception as exc:
+                self.signals.profile_review_event.emit("error", {"message": str(exc)})
+                raise
+        try:
+            self.start_managed_task("profile-story-review:"+action, runner)
+        except Exception:
+            self._profile_review_busy = False
+            if dialog:
+                dialog.set_busy(False)
+            raise
+
+    def on_profile_review_event(self, action, payload):
+        self._profile_review_busy = False
+        dialog = getattr(self, "_profile_review_dialog", None)
+        if action == "open":
+            from ui.profile_review_dialog import ProfileReviewDialog
+            if dialog:
+                dialog.close()
+            account_id, token = payload["account_id"], payload["token"]
+            self._profile_review_dialog = ProfileReviewDialog(
+                payload, lambda kind, values: self._request_story_review(kind, account_id, token, values), self)
+            self._profile_review_dialog.open()
+        elif dialog and dialog.isVisible():
+            dialog.set_busy(False)
+            if action == "error":
+                dialog.confirmed.setChecked(False)
+                dialog.message.setText(payload["message"])
+            elif payload.get("token") == dialog.token:
+                if action == "preview":
+                    dialog.previews(payload)
+                elif action == "commit":
+                    dialog.close()
+                    self.log(payload["detail"])
+                    self.refresh_accounts()
+        elif action == "error":
+            self.log(f"Story review: {payload.get('message', 'failed')}", severity="error")
+
+    def _profile_studio_scope(self):
+        from modules.profile_apply import fingerprint
+        ids = sorted(self.selected_account_ids())
+        if not 1 <= len(ids) <= 25 or len(set(ids)) != len(ids) or not set(ids) <= {item.id for item in self.group_accounts()}:
+            raise ValueError("Choose 1–25 enabled accounts in the current group/filters.")
+        return ids, fingerprint([self.active_group(), self.account_filter.to_dict()])
+
+    def open_task_history(self):
+        from ui.task_history_dialog import TaskHistoryDialog
+        old = getattr(self, "_task_history_dialog", None)
+        if old:
+            old.close()
+        self._task_history_dialog = TaskHistoryDialog(self._request_task_history, self.selected_account_ids, self)
+        self._task_history_dialog.open()
+        self._request_task_history("list", {})
+
+    def _request_task_history(self, action, values):
+        from core.task_history import HistoryConflict
+        dialog = self._task_history_dialog
+        if action == "resume":
+            try:
+                ids = values.get("account_ids")
+                if (self.foreground_task_busy() or self._task_start_pending or self._restart_required
+                        or values.get("confirmed") is not True or not isinstance(ids, list)
+                        or set(ids) != set(self.selected_account_ids()) or not set(ids) <= {a.id for a in self.group_accounts()}):
+                    raise HistoryConflict("Finish the active task; select exact enabled filtered accounts and confirm")
+                from modules.profile_apply import fingerprint
+                from modules.guard_tasks import guard_plan, run_guard_task
+                context = fingerprint([self.active_group(), self.account_filter.to_dict()])
+                spec = guard_plan(self.config, ids, context)
+                progress = self.begin_operation_progress("Guard resume", [None]*len(ids))
+                self.start_managed_task("security-guard", lambda stop: None, resume_spec=spec,
+                    resume_from=(values.get("id"), values.get("revision")),
+                    checkpoint_factory=lambda job, stop: run_guard_task(self.config, self.tasks.history, job, context, stop_event=stop, progress=progress))
+                dialog.busy(False)
+                dialog.resume.setEnabled(False)
+                dialog.message.setText("Resume requested. Check task status; refresh history after completion. Admission/context errors do not launch a task.")
+            except HistoryConflict as exc:
+                dialog.busy(False)
+                dialog.resume.setEnabled(False)
+                dialog.message.setText(str(exc))
+            return
+        dialog.busy(True)
+        async def read():
+            try:
+                rows = await asyncio.to_thread(self.tasks.history.list)
+                payload = {"rows": rows}
+            except Exception as exc:
+                payload = {"error": "History unavailable ("+type(exc).__name__+")"}
+            self.signals.task_history_event.emit({**payload, "dialog": dialog})
+        self.worker.submit(read())
+
+    def on_task_history_event(self, payload):
+        dialog = getattr(self, "_task_history_dialog", None)
+        if dialog is not payload["dialog"] or not dialog.isVisible():
+            return
+        if "rows" in payload:
+            dialog.render(payload["rows"])
+        else:
+            dialog.busy(False)
+            dialog.message.setText(payload["error"])
+            dialog.resume.setEnabled(False)
+
+    def open_profile_studio(self):
+        try:
+            scope = self._profile_studio_scope()
+        except ValueError as exc:
+            self.log(str(exc))
+            return
+        from ui.profile_studio_dialog import ProfileStudioDialog
+        dialog = getattr(self, "_profile_studio_dialog", None)
+        if dialog:
+            dialog.close()
+        self._profile_studio_dialog = ProfileStudioDialog({"selection": scope[0], "context": "", "recipes": []},
+            lambda action, values: self._request_profile_studio(scope, action, values), self)
+        self._profile_studio_dialog.open()
+        self._request_profile_studio(scope, "report", {})
+
+    def _request_profile_studio(self, scope, action, values):
+        dialog = getattr(self, "_profile_studio_dialog", None)
+        try:
+            if self._profile_studio_scope() != scope:
+                raise ValueError("Selection/group/filters changed. Close and reopen Studio.")
+        except ValueError as exc:
+            if dialog:
+                dialog.fail(str(exc))
+            return
+        dialog.busy(True)
+        if action == "apply":
+            from modules.profile_studio import ProfileStudioService, StudioConflict
+            try:
+                if self.foreground_task_busy() or self._task_start_pending or self._restart_required or set(values)-{"token","confirmed","expected_context"}:
+                    raise StudioConflict("Finish the active task before confirming Studio Apply")
+                service = ProfileStudioService(self.config)
+                service.validate_apply_request(values.get("token"),scope[0],scope[1],expected_context=values.get("expected_context"),confirmed=values.get("confirmed"))
+                progress = self.begin_operation_progress("Studio apply",[None]*len(scope[0]))
+                self.start_managed_task("studio-apply",lambda stop:service.apply_reviewed(values["token"],scope[0],scope[1],
+                    confirmed=True,expected_context=values["expected_context"],stop_event=stop,progress=progress))
+                dialog.render({"apply_queued":True,"detail":"Apply requested for the exact reviewed IDs. Inspect task results/receipts; no automatic retry."})
+            except StudioConflict as exc:
+                dialog.fail(str(exc))
+            except Exception as exc:
+                dialog.fail("Studio admission failed ("+type(exc).__name__+"). No automatic retry.")
+            return
+        async def run():
+            from modules.profile_studio import ProfileStudioService, StudioConflict
+            try:
+                result = await asyncio.to_thread(ProfileStudioService(self.config).action, action, scope[0], scope[1], values)
+                payload = {"result": result}
+            except Exception as exc:
+                payload = {"error": str(exc) if isinstance(exc, StudioConflict) else "Local Studio failed ("+type(exc).__name__+"). Source was not repaired."}
+            self.signals.profile_studio_event.emit({**payload, "scope": scope, "dialog": dialog})
+        self.worker.submit(run())
+
+    def on_profile_studio_event(self, payload):
+        dialog = getattr(self, "_profile_studio_dialog", None)
+        if dialog is not payload["dialog"] or not dialog.isVisible():
+            return
+        try:
+            if self._profile_studio_scope() != payload["scope"]:
+                raise ValueError("Selection/group/filters changed. Close and reopen Studio.")
+        except ValueError as exc:
+            dialog.fail(str(exc))
+            return
+        if "error" in payload:
+            dialog.fail(payload["error"])
+        else:
+            dialog.render(payload["result"])
+
+    def open_captcha_support(self) -> None:
+        selected = set(self.selected_account_ids())
+        ids = [item.id for item in self.group_accounts() if item.id in selected]
+        if selected and (len(selected) != 1 or len(ids) != 1):
+            self.log("Select exactly one enabled filtered account for its manual queue, or clear selection for diagnostics only.")
+            return
+        self._request_captcha_support(ids[0] if ids else None, "report", {}, opening=True)
+
+    def _request_captcha_support(self, account_id, action, payload, *, opening=False):
+        if account_id is not None and account_id not in {item.id for item in self.group_accounts()}:
+            self.signals.captcha_support_event.emit({"account_id": account_id, "error": "Account is outside the current group/filters. Close and select again."})
+            return
+        async def request():
+            from modules.captcha_support import CaptchaSupportService, ManualRequired
+            try:
+                service = CaptchaSupportService(self.config)
+                async with asyncio.timeout(15):
+                    if action == "ack":
+                        result = await asyncio.to_thread(service.acknowledge, account_id, payload.get("id"), payload.get("revision"),
+                            payload.get("expected_context"), confirmed=payload.get("confirmed"))
+                    else:
+                        result = await asyncio.to_thread(service.report, account_id)
+                self.signals.captcha_support_event.emit({"report": result, "open": opening})
+            except Exception as exc:
+                self.signals.captcha_support_event.emit({"account_id": account_id, "error": str(exc) if isinstance(exc, ManualRequired) else "Local support check failed ("+type(exc).__name__+")."})
+        self.worker.submit(request())
+
+    def on_captcha_support_event(self, payload):
+        dialog = getattr(self, "_captcha_support_dialog", None)
+        if payload.get("error"):
+            if dialog and dialog.isVisible() and dialog.report["account_id"] == payload.get("account_id"):
+                dialog.busy(False)
+                dialog.ack.setEnabled(False)
+                dialog.message.setText(payload["error"]+" Refresh the local queue before another acknowledgment.")
+            else:
+                self.log("CAPTCHA support: "+payload["error"])
+            return
+        report = payload["report"]
+        account_id = report["account_id"]
+        if account_id is not None and account_id not in {item.id for item in self.group_accounts()}:
+            return
+        if dialog and dialog.isVisible() and dialog.report["account_id"] == account_id:
+            dialog.render(report)
+            return
+        if payload.get("open") is not True:
+            return
+        selected = set(self.selected_account_ids())
+        if selected != ({account_id} if account_id is not None else set()):
+            return
+        from ui.captcha_support_dialog import CaptchaSupportDialog
+        if dialog:
+            dialog.close()
+        self._captcha_support_dialog = CaptchaSupportDialog(report,
+            lambda action, values: self._request_captcha_support(account_id, action, values), self)
+        self._captcha_support_dialog.open()
+
+    def _carousel_funding_scope(self):
+        from modules.money_policy import digest
+        from modules.asset_registry import account_context
+        selected=set(self.selected_account_ids());accounts=self.group_accounts()
+        if len(selected)>=2:
+            ordered=tuple(a.id for a in accounts if a.id in selected)
+            if not 2<=len(ordered)<=500 or set(ordered)!=selected:
+                raise ValueError('Выберите от 2 до 500 enabled аккаунтов текущей группы/фильтров')
+        else:
+            eligible=[
+                a for a in accounts
+                if isinstance(a.username,str) and re.fullmatch('[A-Za-z][A-Za-z0-9_]{4,31}',a.username)
+                and type(a.user_id) is int and a.user_id>0
+            ]
+            ordered=tuple(a.id for a in eligible[:500])
+            if len(ordered)<2:
+                raise ValueError('В текущей группе/фильтрах меньше 2 активных аккаунтов с @username и user_id для карусели')
+        allowed={a.id for a in accounts}
+        context=digest([self.active_group(),self.account_filter.to_dict(),ordered,
+            [(a.id,a.username,account_context(a)) for a in accounts]])
+        return ordered,allowed,context
+
+    def _check_carousel_funding_scope(self):
+        dialog=getattr(self,'_carousel_funding_dialog',None)
+        if not dialog or not dialog.isVisible():
+            timer=getattr(dialog,'_scope_timer',None)
+            if timer: timer.stop()
+            return
+        try: valid=self._carousel_funding_scope()==self._carousel_funding_open_scope
+        except Exception: valid=False
+        if not valid:
+            timer=getattr(dialog,'_scope_timer',None)
+            if timer: timer.stop()
+            self._carousel_funding_guard.clear();dialog.invalidate_scope()
+
+    def open_carousel_funding(self):
+        try:
+            if self.foreground_task_busy() or self._task_start_pending: raise ValueError('Сначала завершите текущую операцию')
+            ordered,allowed,context=self._carousel_funding_scope()
+            from modules.finance_money import MoneyService
+            from modules.money_funding import CarouselFunding
+            from ui.carousel_funding_dialog import CarouselFundingDialog
+            service=getattr(self,'_carousel_funding_service',None)
+            if service is None:
+                from modules.money_workspace import NativeMoneyWorkspace
+                native=getattr(self,'_native_money_workspace',None)
+                if native is None: native=self._native_money_workspace=NativeMoneyWorkspace(MoneyService(self.config))
+                service=self._carousel_funding_service=CarouselFunding(native.money)
+            old=getattr(self,'_carousel_funding_dialog',None)
+            if old and old.isVisible(): old.raise_();return
+            self._carousel_funding_open_scope=(ordered,allowed,context)
+            self._carousel_funding_guard=threading.Event();self._carousel_funding_guard.set()
+            report=service.latest(scope_ids=allowed,ui_context=context)
+            uq_by_id={}
+            try:
+                from core.ton_address import friendly_address
+                from modules.financial_vault import FinancialVault
+                inv=FinancialVault(self.config.data_dir).status()
+                for rec in inv.get('records',[]):
+                    if rec.get('network')=='mainnet' and rec.get('address'):
+                        uq_by_id[rec['account']]=friendly_address(rec['address'],'mainnet',bounceable=False)
+            except Exception:
+                pass
+            dialog=self._carousel_funding_dialog=CarouselFundingDialog(
+                [{'id':a.id,'username':a.username,'uq_address':uq_by_id.get(a.id)} for a in self.group_accounts()],ordered,self._request_carousel_funding,report,self)
+            guard=self._carousel_funding_guard
+            def _on_carousel_finished(*_args):
+                guard.clear()
+                workspace=getattr(self,'_carousel_money_workspace',None)
+                native=getattr(self,'_native_money_workspace',None)
+                vault=getattr(getattr(workspace,'native',native),'vault',None)
+                if vault is not None and hasattr(vault,'lock'): vault.lock()
+            dialog.finished.connect(_on_carousel_finished)
+            timer=QTimer(dialog);timer.timeout.connect(self._check_carousel_funding_scope);timer.start(200)
+            dialog._scope_timer=timer;dialog.open()
+        except Exception as exc: self.log(str(exc) if isinstance(exc,ValueError) else 'Не удалось открыть старт карусели ('+type(exc).__name__+')')
+
+    def _request_carousel_funding(self,action,values):
+        dialog=self._carousel_funding_dialog
+        try:
+            if action=='stop':
+                self._carousel_funding_guard.clear();dialog.valid=False;dialog.busy(False)
+                dialog.instruction.setText('Запрошена остановка. Уже отправленный перевод не отменён; проверьте исходный журнал Money.')
+                dialog.message.setText('Следующие шаги заблокированы. Не запускайте повторно до сверки исхода.')
+                if self.current_task_id: self.stop_task()
+                return
+            self._check_carousel_funding_scope()
+            if not self._carousel_funding_guard.is_set() or self.foreground_task_busy() or self._task_start_pending: raise ValueError('Scope изменился или другая операция уже выполняется')
+            _,ids,context=self._carousel_funding_open_scope;service=self._carousel_funding_service
+            args={'scope_ids':ids,'ui_context':context}
+            if action=='create': dialog.render(service.create(values['ids'],confirmed=True,**args));return
+            if action=='cancel': dialog.render(service.cancel(values['id'],values['revision'],confirmation=values['confirmation'],**args));return
+            if action not in {'check','review','run','inspect','provision-route','deploy-uninit','resume'}: raise ValueError('Unknown funding action')
+            workspace=None
+            if action in {'review','run','inspect','provision-route','deploy-uninit','resume'}:
+                from modules.money_carousel_workspace import CarouselMoneyWorkspace
+                from modules.money_workspace import NativeMoneyWorkspace
+                workspace=getattr(self,'_carousel_money_workspace',None)
+                if workspace is None:
+                    native=getattr(self,'_native_money_workspace',None)
+                    if native is None or native.money is not service.money:
+                        native=self._native_money_workspace=NativeMoneyWorkspace(service.money,vault=native.vault if native else None)
+                    workspace=self._carousel_money_workspace=CarouselMoneyWorkspace(native,service)
+            if action=='inspect': dialog.render_execution(workspace.inspect(values['id'],**args));return
+            guard=self._carousel_funding_guard;dialog.busy(True)
+            async def runner(stop):
+                try:
+                    scope_check=lambda:guard.is_set() and not stop.is_set()
+                    if action=='check': result=await service.check(values['id'],values['revision'],tx_hash=values.get('tx_hash'),confirmed=True,scope_check=scope_check,**args)
+                    elif action=='review': result=await workspace.review(values['reference'],values['limits'],confirmed=True,scope_check=scope_check,**args)
+                    elif action=='provision-route': result=await workspace.auto_provision_route(values['reference'],confirmed=True,scope_check=scope_check,**args)
+                    elif action=='deploy-uninit': result=await workspace.deploy_uninit_node(values['reference'],limits=values['limits'],confirmed=True,scope_check=scope_check,**args)
+                    elif action=='resume':
+                        result=await workspace.resume(values['id'],confirmation=values['confirmation'],scope_check=scope_check,
+                            progress=lambda event:self.signals.carousel_funding_event.emit({'guard':guard,'kind':'progress','result':event}),**args)
+                    else:
+                        result=await workspace.run(values['token'],confirmation=values['confirmation'],scope_check=scope_check,
+                            progress=lambda event:self.signals.carousel_funding_event.emit({'guard':guard,'kind':'progress','result':event}),**args)
+                    self.signals.carousel_funding_event.emit({'guard':guard,'kind':action,'result':result})
+                    return None
+                except (Exception, asyncio.CancelledError) as exc:
+                    self.signals.carousel_funding_event.emit({'guard':guard,'kind':action,'error':str(exc) if isinstance(exc,ValueError) else 'Операция карусели остановлена ('+type(exc).__name__+')'})
+                    raise
+            self.start_managed_task('carousel-funding-check' if action=='check' else 'carousel-'+action,runner)
+        except Exception as exc:
+            dialog.busy(False);dialog.message.setText(str(exc) if isinstance(exc,ValueError) else 'Funding action failed ('+type(exc).__name__+')');dialog.show_status()
+
+    def on_carousel_funding_event(self,payload):
+        dialog=getattr(self,'_carousel_funding_dialog',None)
+        if not dialog or not dialog.isVisible() or payload.get('guard') is not self._carousel_funding_guard: return
+        self._check_carousel_funding_scope()
+        if not self._carousel_funding_guard.is_set(): return
+        kind=payload.get('kind','check')
+        if kind=='progress': dialog.render_progress(payload['result']);return
+        if kind in {'run','resume'}: dialog.render_done(payload.get('result'),payload.get('error'));return
+        if kind in {'provision-route','deploy-uninit'}:
+            dialog.busy(False)
+            if payload.get('error'): dialog.message.setText(payload['error'])
+            else: dialog.message.setText('Кошелёк развёрнут (intent '+str(payload['result']['intent']['id'])+').' if kind=='deploy-uninit' else 'Ключи маршрута синхронизированы/созданы в Telegram и сохранены в DPAPI Vault ('+str(len(payload['result']['provisioned']))+' узлов).')
+            dialog.show_status();return
+        if kind=='review':
+            if payload.get('error'): dialog.busy(False);dialog.message.setText(payload['error']);dialog.show_status()
+            else: dialog.render_review(payload['result'])
+            return
+        if payload.get('error'):
+            try:
+                _,ids,context=self._carousel_funding_open_scope
+                dialog.render(self._carousel_funding_service.report(dialog.report['id'],scope_ids=ids,ui_context=context))
+            except Exception: dialog.invalidate_scope()
+            dialog.busy(False);dialog.message.setText(payload['error']);dialog.show_status()
+        else: dialog.render(payload['result'])
+
+    def _native_money_scope(self):
+        from modules.money_policy import digest
+        ids=set(self.selected_account_ids());allowed={a.id for a in self.group_accounts()}
+        if len(ids)!=1 or not ids<=allowed: raise ValueError('Select one enabled source in the current filters')
+        return next(iter(ids)),allowed,digest([self.active_group(),self.account_filter.to_dict(),sorted(allowed)])
+
+    def _check_native_money_scope(self):
+        dialog=getattr(self,'_native_money_dialog',None)
+        if not dialog or not dialog.isVisible():
+            timer=getattr(dialog,'_scope_timer',None)
+            if timer: timer.stop()
+            return
+        try: valid=self._native_money_scope()==self._native_money_open_scope
+        except Exception: valid=False
+        if not valid and self._native_money_guard.is_set():
+            timer=getattr(dialog,'_scope_timer',None)
+            if timer: timer.stop()
+            self._native_money_guard.clear();dialog.invalidate_scope()
+
+    def open_native_money(self):
+        try:
+            if self.foreground_task_busy() or self._task_start_pending: raise ValueError('Finish the current operation first')
+            source,ids,context=self._native_money_scope()
+            from modules.finance_money import MoneyService
+            from modules.money_workspace import NativeMoneyWorkspace
+            from ui.native_money_dialog import NativeMoneyDialog
+            service=getattr(self,'_native_money_workspace',None)
+            if service is None:
+                service=self._native_money_workspace=NativeMoneyWorkspace(MoneyService(self.config))
+            old=getattr(self,'_native_money_dialog',None)
+            if old and old.isVisible(): old.raise_();return
+            report=service.report(source,scope_ids=ids,ui_context=context)
+            self._native_money_open_scope=(source,ids,context)
+            self._native_money_guard=threading.Event();self._native_money_guard.set()
+            targets=[{'id':a.id,'username':a.username} for a in self.group_accounts()]
+            dialog=self._native_money_dialog=NativeMoneyDialog(report,targets,self._request_native_money,self)
+            guard=self._native_money_guard
+            dialog.finished.connect(lambda *_: (guard.clear(),service.vault.lock()))
+            timer=QTimer(dialog);timer.timeout.connect(self._check_native_money_scope);timer.start(200)
+            dialog._scope_timer=timer
+            dialog.open()
+        except Exception as exc:
+            self.log('Native Money setup: '+str(exc) if isinstance(exc,ValueError) else 'Native Money setup unavailable ('+type(exc).__name__+')')
+
+    def _request_native_money(self,action,values):
+        dialog=self._native_money_dialog;service=self._native_money_workspace
+        seed=values.get('seed')
+        seed_copy=bytearray(seed) if isinstance(seed,(bytes,bytearray)) else None
+        try:
+            self._check_native_money_scope()
+            if not self._native_money_guard.is_set() or self.foreground_task_busy() or self._task_start_pending:
+                raise ValueError('Scope changed or another task is active')
+            source,ids,context=self._native_money_open_scope
+            args={'scope_ids':ids,'ui_context':context}
+            if action in {'report','lock'}:
+                if action=='lock': service.vault.lock()
+                dialog.render(service.report(source,**args));dialog.message.setText('Локальная конфигурация обновлена. Сеть не использовалась.')
+                return
+            if action in {'create-vault','import-key','local-provision','save-policy','unlock'}:
+                guard=self._native_money_guard
+                dialog.busy(True)
+                def local_op():
+                    try:
+                        detail_result=None
+                        if action=='create-vault': service.vault.create(confirmed=True)
+                        elif action=='import-key':
+                            service.import_key(source,seed_copy,values['anchor'],expected_revision=values['expected_revision'],confirmed=True,**args)
+                            service.export_wallets_summary()
+                        elif action=='local-provision':
+                            detail_result=service.provision_local_wallet(source,phrase_or_seed=values.get('phrase') or None,replace_existing=bool(values.get('replace_existing')),confirmed=True,**args)
+                            service.export_wallets_summary()
+                        elif action=='save-policy': service.save_policy(source,values['values'],expected_revision=values['expected_revision'],confirmed=True,**args)
+                        elif action=='unlock': service.vault.unlock(confirmed=True)
+                        return detail_result
+                    finally:
+                        if isinstance(seed_copy,bytearray): seed_copy[:]=bytes(len(seed_copy))
+                async def local_runner():
+                    try:
+                        res=await asyncio.to_thread(local_op)
+                        self.signals.native_money_event.emit({'action':action,'result':res,'guard':guard})
+                    except Exception as exc:
+                        message=str(exc) if isinstance(exc,ValueError) else 'Local Money action failed ('+type(exc).__name__+')'
+                        self.signals.native_money_event.emit({'error':message,'guard':guard})
+                self.worker.submit(local_runner())
+                return
+            if action not in {'preview','execute','reconcile','resolve','recover','prepare-recipient','auto-provision'}: raise ValueError('Unknown native Money action')
+            guard=self._native_money_guard
+            dialog.busy(True)
+            async def runner(stop):
+                check=lambda: guard.is_set() and not stop.is_set()
+                try:
+                    if action=='preview': result=await service.preview(source,confirmed=True,scope_check=check,**args)
+                    elif action=='resolve': result=await service.resolve(source,values['target_id'],confirmed=True,scope_check=check,**args)
+                    elif action=='prepare-recipient': result=await service.prepare_recipient(source,values['target_id'],confirmation=values['confirmation'],confirmed=True,scope_check=check,**args)
+                    elif action=='auto-provision': result=await service.auto_sync_or_provision_wallet(source,phrase_or_seed=values.get('phrase') or None,replace_existing=bool(values.get('replace_existing')),confirmed=True,scope_check=check,**args)
+                    elif action=='execute': result=await service.send(source,values['token'],confirmation=values['confirmation'],scope_check=check,**args)
+                    elif action=='recover': result=await service.recover(source,values['id'],confirmation=values['confirmation'],scope_check=check,**args)
+                    else:
+                        with service.money.db() as db:
+                            row=db.execute('SELECT source,network FROM intents WHERE id=? AND account=?',(values['id'],source)).fetchone()
+                        if not row: raise ValueError('Unknown source intent')
+                        result=await service.money.action('reconcile',{'account_id':source,'id':values['id'],
+                            'source':row['source'],'network':row['network'],'confirmed':True},scope_check=check,**args)
+                    self.signals.native_money_event.emit({'action':action,'result':result,'guard':guard})
+                    # Never put the preview capability in task result/history.
+                    return None
+                except (Exception, asyncio.CancelledError) as exc:
+                    message=str(exc) if isinstance(exc,ValueError) else 'Native Money failed at '+action+' ('+type(exc).__name__+'). Check the journal; never retry an uncertain payment.'
+                    self.signals.native_money_event.emit({'error':message,'guard':guard})
+                    raise
+            self.start_managed_task('native-money:'+action,runner)
+        except Exception as exc:
+            if isinstance(seed_copy,bytearray): seed_copy[:]=bytes(len(seed_copy))
+            dialog.review=None;dialog.busy(False)
+            dialog.message.setText(str(exc) if isinstance(exc,ValueError) else 'Local Money action failed ('+type(exc).__name__+')')
+        finally:
+            if isinstance(seed,bytearray): seed[:]=bytes(len(seed))
+
+    def on_native_money_event(self,payload):
+        dialog=getattr(self,'_native_money_dialog',None)
+        if not dialog or not dialog.isVisible() or payload.get('guard') is not self._native_money_guard: return
+        if payload.get('error'):
+            dialog.review=None
+            if self._native_money_guard.is_set():
+                try:
+                    source,ids,context=self._native_money_open_scope
+                    dialog.render(self._native_money_workspace.report(source,scope_ids=ids,ui_context=context))
+                except Exception:
+                    pass  # Keep the original public error; never overwrite missing/uncertain journal state.
+            dialog.busy(False);dialog.message.setText(payload['error']);return
+        if not self._native_money_guard.is_set(): return
+        if payload['action']=='preview': dialog.show_preview(payload['result'])
+        elif payload['action'] in {'resolve','prepare-recipient'}: dialog.resolved(payload['result'])
+        else:
+            source,ids,context=self._native_money_open_scope
+            dialog.render(self._native_money_workspace.report(source,scope_ids=ids,ui_context=context))
+            if payload['action']=='local-provision':
+                res=payload['result'] or {}
+                phrase_note=(' · Фраза (12 слов): '+res['mnemonic_phrase']) if res.get('mnemonic_phrase') else ''
+                dialog.message.setText('Локальный кошелёк WalletTg готов ('+str(res.get('custody_mode','ok'))+').\nUQ (1-е пополнение): '+str(res.get('non_bounceable_address',''))+'\nRaw: '+str(res.get('provisioned_address',''))+phrase_note)
+            elif payload['action'] in {'create-vault','import-key','save-policy','unlock'}:
+                dialog.message.setText('Локальная конфигурация обновлена. Сеть не использовалась.')
+            elif payload['action']=='recover':
+                dialog.message.setText('Истёкший nonce освобождён по provider observations, не chain proof. Старый лимит зарезервирован, новый перевод не запускался. Для новой попытки нужен свежий preview.')
+            elif payload['action']=='auto-provision':
+                res=payload['result']
+                self._native_money_workspace.export_wallets_summary()
+                phrase_note=(' · Сгенерирована фраза (12 слов): '+res['mnemonic_phrase']) if res.get('mnemonic_phrase') else ''
+                uq_note=(' · UQ: '+res['non_bounceable_address']) if res.get('non_bounceable_address') else ''
+                dialog.message.setText('Кошелёк WalletTg синхронизирован ('+str(res.get('custody_mode','ok'))+'): '+str(res.get('provisioned_address',''))+uq_note+phrase_note)
+            else:
+                dialog.message.setText('Результат: '+str(payload['result'])+'\nRPC return не означает подтверждение блокчейна. Незавершённые операции сверяйте по журналу.')
+
+    def batch_provision_wallets(self) -> None:
+        if self.foreground_task_busy() or self._task_start_pending:
+            self.log("Сначала завершите или остановите текущую задачу.")
+            return
+        accounts = self.get_selected_accounts() or self.group_accounts()
+        if not accounts:
+            self.log("Нет выбранных или активных аккаунтов в текущей группе/фильтрах.")
+            return
+        scope_label = f"выбранных аккаунтов ({len(accounts)})" if self.has_selection() else f"всей группы «{self.active_group()}» ({len(accounts)} акк.)"
+        if QMessageBox.question(
+            self,
+            "Массовое создание кошельков WalletTg",
+            f"Создать / проверить локальные кошельки WalletTg (TEP-0003) для {scope_label}?\n\n"
+            "• Работает мгновенно и автономно (без ожидания прокси и без зависаний).\n"
+            "• Уже существующие кошельки не перезаписываются.\n"
+            "• Все ключи сохраняются в защищённый Windows DPAPI Vault.\n"
+            "• Все адреса (UQ / EQ / 0:...) автоматически выгружаются в data/wallet_addresses.txt и привязываются к Public Assets.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        ) != QMessageBox.Yes:
+            return
+        from modules.finance_money import MoneyService
+        from modules.money_policy import digest
+        from modules.money_workspace import NativeMoneyWorkspace
+        service = getattr(self, "_native_money_workspace", None)
+        if service is None:
+            service = self._native_money_workspace = NativeMoneyWorkspace(MoneyService(self.config))
+        allowed = {a.id for a in self.group_accounts()}
+        ui_context = digest([self.active_group(), self.account_filter.to_dict(), sorted(allowed)])
+        account_ids = [a.id for a in accounts]
+        progress = self.begin_operation_progress("Batch WalletTg setup", accounts)
+        group = self.active_group()
+
+        async def runner(stop):
+            res = await service.batch_provision_wallets(
+                account_ids,
+                replace_existing=False,
+                online_sync=False,
+                scope_ids=allowed,
+                ui_context=ui_context,
+                confirmed=True,
+                scope_check=lambda: not stop.is_set(),
+                progress=progress,
+            )
+            msg = (
+                f"Кошельки WalletTg готовы: всего {res['total']} · создано новых {res['created']} · "
+                f"уже было {res['already_configured']} · пропущено {len(res['skipped'])} · ошибок {len(res['failed'])}. "
+                f"Список адресов: {res['txt_path']}"
+            )
+            self.signals.log_message.emit(msg, group)
+            return msg
+
+        self.start_managed_task("money:batch-provision", runner, task_group=group)
+
+    def export_wallet_addresses(self) -> None:
+        from PySide6.QtWidgets import QDialog
+        from modules.finance_money import MoneyService
+        from modules.money_workspace import NativeMoneyWorkspace
+        try:
+            service = getattr(self, "_native_money_workspace", None)
+            if service is None:
+                service = self._native_money_workspace = NativeMoneyWorkspace(MoneyService(self.config))
+            selected_ids = self.selected_account_ids()
+            summary = service.export_wallets_summary(selected_ids if selected_ids else None)
+            items = summary["items"]
+            if not items:
+                QMessageBox.information(
+                    self,
+                    "Адреса кошельков WalletTg",
+                    "Пока не создано ни одного кошелька для выбранных аккаунтов.\n"
+                    "Нажмите «Массово создать кошельки (группа/выбранные)» в разделе Money.",
+                )
+                return
+            lines = [
+                f"Всего кошельков: {summary['count']} (сохранено в {summary['txt_path']})",
+                "Формат: account_id | phone | @username | UQ (для 1-го пополнения) | EQ (bounceable) | raw (0:...)",
+                "-" * 96,
+            ]
+            for it in items:
+                u = f"@{it['username']}" if it.get("username") else "-"
+                p = it.get("phone") or "-"
+                lines.append(
+                    f"{it['account_id']} | {p} | {u} | {it['non_bounceable_address']} | {it['bounceable_address']} | {it['raw_address']}"
+                )
+            text_block = "\n".join(lines)
+            dlg = QDialog(self)
+            dlg.setAttribute(Qt.WA_DeleteOnClose, True)
+            dlg.setWindowTitle("Список / экспорт адресов кошельков WalletTg")
+            dlg.resize(920, 560)
+            palette = dlg.palette()
+            for role, color in (
+                (QPalette.Window, TOKENS.panel),
+                (QPalette.WindowText, TOKENS.text),
+                (QPalette.Base, TOKENS.background),
+                (QPalette.Text, TOKENS.text),
+                (QPalette.Button, TOKENS.panel_secondary),
+                (QPalette.ButtonText, TOKENS.text),
+            ):
+                palette.setColor(role, QColor(color))
+            dlg.setPalette(palette)
+            dlg.setStyleSheet(
+                f"QDialog {{ background: {TOKENS.panel}; color: {TOKENS.text}; }}"
+                f"QLabel {{ color: {TOKENS.text}; }}"
+                f"QPlainTextEdit {{ background: {TOKENS.background}; color: {TOKENS.text}; border: 1px solid {TOKENS.border}; border-radius: 8px; padding: 8px; }}"
+                f"QPushButton {{ background: {TOKENS.panel_secondary}; color: {TOKENS.text}; border: 1px solid {TOKENS.border}; border-radius: 8px; padding: 8px 12px; }}"
+            )
+            vbox = QVBoxLayout(dlg)
+            info = QLabel(
+                f"Найдено кошельков: {summary['count']}. Полный список автоматически сохранён в:\n"
+                f"• {summary['txt_path']}\n• {summary['json_path']}"
+            )
+            info.setWordWrap(True)
+            vbox.addWidget(info)
+            viewer = QPlainTextEdit()
+            viewer.setReadOnly(True)
+            viewer.setPlainText(text_block)
+            vbox.addWidget(viewer, 1)
+            btn_row = QHBoxLayout()
+            copy_uq_btn = QPushButton("Скопировать только UQ-адреса (для пополнения)")
+            copy_all_btn = QPushButton("Скопировать всю таблицу")
+            close_btn = QPushButton("Закрыть")
+            copy_uq_btn.clicked.connect(
+                lambda: (
+                    QApplication.clipboard().setText(
+                        "\n".join(f"{it['account_id']}\t@{it.get('username') or '-'}\t{it['non_bounceable_address']}" for it in items)
+                    ),
+                    self.log(f"Скопировано {len(items)} UQ-адресов в буфер обмена."),
+                )
+            )
+            copy_all_btn.clicked.connect(
+                lambda: (
+                    QApplication.clipboard().setText(text_block),
+                    self.log(f"Скопирована таблица из {len(items)} кошельков в буфер обмена."),
+                )
+            )
+            close_btn.clicked.connect(dlg.accept)
+            btn_row.addWidget(copy_uq_btn)
+            btn_row.addWidget(copy_all_btn)
+            btn_row.addWidget(close_btn)
+            vbox.addLayout(btn_row)
+            dlg.exec()
+        except Exception as exc:
+            self.log(f"Ошибка экспорта адресов: {exc}")
+
+    def open_money_browser(self):
+        from modules.finance_money import public_origin, FinanceError
+        from PySide6.QtGui import QDesktopServices
+        from PySide6.QtCore import QUrl
+        try:
+            origin = public_origin()
+        except (FinanceError, ValueError):
+            self.log("Configure TGB_FINANCE_PUBLIC_URL for the authenticated HTTPS Web/Mini App before connecting a wallet.")
+            return
+        if QMessageBox.question(self,"Open Money in browser", "Open the configured Web UI? Sign in, select one account, then open Money in Assets/Security. No wallet transaction is requested by this button.",QMessageBox.Yes|QMessageBox.No,QMessageBox.No) == QMessageBox.Yes:
+            QDesktopServices.openUrl(QUrl(origin))
+
+    def open_marketapp_credentials(self):
+        from ui.marketapp_credentials_dialog import MarketappCredentialsDialog
+        MarketappCredentialsDialog(self.config.data_dir, self).exec()
+
+    def open_marketapp(self):
+        from ui.marketapp_dialog import MarketappDialog
+        dialog = getattr(self, "_marketapp_dialog", None)
+        if dialog and dialog.isVisible():
+            dialog.raise_()
+            return
+        self._marketapp_dialog = MarketappDialog(self._request_marketapp, self,
+            selected_accounts=lambda: list(self.selected_account_ids()))
+        self._marketapp_dialog.open()
+
+    def _request_marketapp(self, payload, generation):
+        from modules.marketapp_browser import MarketappCatalogSession
+        from modules.marketapp_catalog import CatalogError
+        if not hasattr(self, "_marketapp_session"):
+            self._marketapp_session = MarketappCatalogSession(self.config)
+        dialog = self._marketapp_dialog
+        operation = payload.get("_action", "catalog")
+        request_payload = {key: value for key, value in payload.items() if key != "_action"}
+        from modules.marketapp_rentals import MarketappRentalService, fingerprint
+        scope = {account.id for account in self.group_accounts()}
+        context = fingerprint([self.active_group(), self.account_filter.to_dict()])
+        self._marketapp_snapshot = (context, scope)
+        if operation != "catalog" and (self.foreground_task_busy() or self._task_start_pending):
+            dialog.render({"ok": False, "error": "Finish or stop the foreground task first"}, generation)
+            return
+        async def request():
+            try:
+                if operation == "catalog":
+                    result = {"ok": True, "catalog": await self._marketapp_session.fetch(request_payload)}
+                else:
+                    if not hasattr(self, "_marketapp_rentals"):
+                        self._marketapp_rentals = MarketappRentalService(self.config)
+                    def check_scope() -> bool:
+                        snap_context, snap_scope = self._marketapp_snapshot
+                        return (
+                            snap_context == context
+                            and not self.foreground_task_busy()
+                            and not self._task_start_pending
+                            and (operation == "rentals" or request_payload.get("account_id") in snap_scope)
+                        )
+                    result = {"ok": True, **await self._marketapp_rentals.execute(operation, request_payload,
+                        scope_ids=scope, ui_context=context,
+                        scope_check=check_scope)}
+            except CatalogError as exc:
+                result = {"ok": False, "error": str(exc)}
+            except NotImplementedError:
+                result = {"ok": False, "error": "Hosted gifts unsupported by this backend layer; no visibility change confirmed"}
+            except Exception:
+                result = {"ok": False, "error": "Visibility outcome unconfirmed. Refresh rentals and scan; do not retry blindly" if operation == "visibility" else "Catalog/rental operation unavailable; refresh explicitly"}
+            self.signals.marketapp_event.emit({"dialog": dialog, "generation": generation, "result": result})
+        coroutine = request()
+        try:
+            self.worker.submit(coroutine)
+        except Exception:
+            coroutine.close()
+            self.signals.marketapp_event.emit({"dialog": dialog, "generation": generation,
+                "result": {"ok": False, "error": "Catalog worker unavailable; retry explicitly later"}})
+
+    def on_marketapp_event(self, payload):
+        if getattr(self, "_marketapp_dialog", None) is payload["dialog"]:
+            payload["dialog"].render(payload["result"], payload["generation"])
+
+    def open_public_assets(self) -> None:
+        selected = set(self.selected_account_ids())
+        ids = [item.id for item in self.group_accounts() if item.id in selected]
+        if len(selected) != 1 or len(ids) != 1:
+            self.log("Select exactly one enabled account in the current group/filters for public assets.")
+            return
+        self._request_assets(ids[0], "report", "mainnet", {"open": True})
+
+    def _request_assets(self, account_id, action, network, payload):
+        if account_id not in {item.id for item in self.group_accounts()}:
+            self.log("Asset account is outside the current group/filters.")
+            dialog = getattr(self, "_asset_dialog", None)
+            if dialog:
+                dialog.busy(False)
+                dialog.message.setText("Account is outside the current group/filter. Close and select again.")
+            return
+        async def request(stop=None):
+            from modules.asset_registry import AssetRegistryService, AssetConflict
+            from core.ton_address import AddressError
+            try:
+                service = AssetRegistryService(self.config)
+                if action == "refresh":
+                    if payload.get("confirmed") is not True or not payload.get("expected_revision") or not payload.get("expected_context"):
+                        raise AssetConflict("Confirm the exact saved address before a public read")
+                    result = await service.refresh([account_id], network, stop_event=stop,
+                        expected_revisions={account_id: payload["expected_revision"]},
+                        expected_contexts={account_id: payload["expected_context"]})
+                    report = service.reports([account_id], network)[0]
+                elif action == "register":
+                    if not payload.get("expected_context"):
+                        raise AssetConflict("Reload the public account context first")
+                    report = await asyncio.to_thread(service.register, account_id, network, payload.get("address"), payload.get("source"),
+                        expected_revision=payload.get("expected_revision"), expected_context=payload["expected_context"], confirmed=payload.get("confirmed"))
+                    result = None
+                else:
+                    report = (await asyncio.to_thread(service.reports, [account_id], network))[0]
+                    result = None
+                self.signals.asset_event.emit({"report": report, "open": payload.get("open") is True})
+                return result
+            except asyncio.CancelledError:
+                self.signals.asset_event.emit({"account_id": account_id, "network": network, "error": "Public read cancelled; reload the saved record."})
+                raise
+            except Exception as exc:
+                self.signals.asset_event.emit({"account_id": account_id, "network": network,
+                    "error": str(exc) if isinstance(exc, (AssetConflict, AddressError)) else type(exc).__name__})
+                if action == "refresh":
+                    raise
+        if action == "refresh":
+            if self.foreground_task_busy() or self._task_start_pending:
+                self.signals.asset_event.emit({"account_id": account_id, "network": network, "error": "Finish or stop the current task before a public read."})
+                return
+            self.start_managed_task("asset-public-read", lambda stop: request(stop))
+        else:
+            self.worker.submit(request())
+
+    def on_asset_event(self, payload):
+        dialog = getattr(self, "_asset_dialog", None)
+        if payload.get("error"):
+            if dialog and dialog.isVisible() and dialog.report["account_id"] == payload["account_id"] and dialog.network.currentData() == payload["network"]:
+                dialog.fail(payload["error"])
+            else:
+                self.log("Public assets: "+payload["error"])
+            return
+        report = payload["report"]
+        if report["account_id"] not in {item.id for item in self.group_accounts()}:
+            return
+        if dialog and dialog.isVisible():
+            if dialog.report["account_id"] == report["account_id"] and dialog.network.currentData() == report["network"]:
+                dialog.render(report)
+            return
+        if set(self.selected_account_ids()) != {report["account_id"]}:
+            return
+        if payload.get("open") is not True:
+            return  # A completed request must not reopen a dialog the user closed.
+        from ui.asset_dialog import AssetDialog
+        self._asset_dialog = AssetDialog(report, lambda action, network, values: self._request_assets(report["account_id"], action, network, values), self)
+        self._asset_dialog.open()
+
+    def open_secret_vault(self) -> None:
+        from ui.vault_dialog import VaultDialog
+        selected = set(self.selected_account_ids())
+        ids = [account.id for account in self.group_accounts() if account.id in selected]
+        # No implicit group-wide migration when nothing is selected.
+        VaultDialog(self.config, ids, self).exec()
+
+    def open_security_guard(self) -> None:
+        selected = set(self.selected_account_ids())
+        ids = [item.id for item in self.group_accounts() if item.id in selected]
+        if len(selected) != 1 or len(ids) != 1:
+            self.log("Select exactly one enabled account in the current group/filters for Guard review.")
+            return
+        self._guard_local_request(ids[0], "report", {})
+
+    def _guard_local_request(self, account_id, action, payload):
+        if account_id not in {item.id for item in self.group_accounts()}:
+            self.log("Guard account is outside the current group/filters.")
+            return
+        async def request():
+            from modules.security_guard import SecurityGuardService
+            try:
+                service = SecurityGuardService(self.config)
+                if action == "trust":
+                    result = await asyncio.to_thread(service.trust, account_id, payload.get("token"),
+                        payload.get("fingerprints"), confirmed=payload.get("confirmed"))
+                else:
+                    result = await asyncio.to_thread(service.report, account_id)
+                self.signals.guard_event.emit({"report": result})
+            except Exception as exc:
+                from modules.security_guard import GuardConflict
+                self.signals.guard_event.emit({"account_id": account_id, "error": str(exc) if isinstance(exc, GuardConflict) else type(exc).__name__})
+        self.worker.submit(request())
+
+    def on_guard_event(self, payload):
+        if payload.get("error"):
+            dialog = getattr(self, "_guard_dialog", None)
+            if dialog and dialog.isVisible() and dialog.report.get("account_id") == payload.get("account_id"):
+                dialog.fail(payload["error"])
+            self.log("Guard review: "+payload["error"])
+            return
+        report = payload["report"]
+        if report["account_id"] not in {item.id for item in self.group_accounts()}:
+            return
+        dialog = getattr(self, "_guard_dialog", None)
+        if dialog and dialog.isVisible() and dialog.report["account_id"] == report["account_id"]:
+            dialog.render(report)
+            return
+        from ui.guard_dialog import GuardDialog
+        if dialog:
+            dialog.close()
+        self._guard_dialog = GuardDialog(report, lambda action, values: self._guard_local_request(report["account_id"], action, values), self)
+        self._guard_dialog.open()
+
+    def check_security_guard(self, *, watch=False):
+        selected = set(self.selected_account_ids())
+        accounts = [item for item in self.group_accounts() if item.id in selected]
+        if not selected or selected != {a.id for a in accounts}:
+            self.log("Select explicit enabled accounts in the current group/filters for Guard.")
+            return
+        if not self.confirm_bulk_operation("Guard observation", accounts, detail=(
+                "3 finite passes, 15 minutes apart; Stop interrupts waiting. " if watch else "One pass. ")+
+                "Read-only; no revocation, reset decline or login codes. Persistent cooldown may skip an account. Open Guard review to inspect saved evidence."):
+            return
+        from modules.security_guard import SecurityGuardService
+        service = SecurityGuardService(self.config)
+        cycles = 3 if watch else 1
+        progress = self.begin_operation_progress("Guard observation", accounts)
+        if watch:
+            self.start_managed_task("security-guard", lambda stop: service.check([item.id for item in accounts],
+                cycles=cycles, interval=900, stop_event=stop, progress=progress))
+        else:
+            from modules.guard_tasks import guard_plan, run_guard_task
+            from modules.profile_apply import fingerprint
+            context = fingerprint([self.active_group(), self.account_filter.to_dict()])
+            spec = guard_plan(self.config, [a.id for a in accounts], context)
+            self.start_managed_task("security-guard", lambda stop: None, resume_spec=spec,
+                checkpoint_factory=lambda job, stop: run_guard_task(self.config, self.tasks.history, job, context, stop_event=stop, progress=progress))
+
+    def scan_security(self) -> None:
+        accounts = self.group_accounts()
+        selected = set(self.selected_account_ids())
+        if selected:
+            accounts = [account for account in accounts if account.id in selected]
+        if not accounts:
+            self.log("No enabled accounts match the selected group/filters.")
+            return
+        if not self.confirm_bulk_operation("Read-only security scan", accounts,
+                                           detail="Reads 2FA/reset state and session counts. Does not revoke sessions or request login codes."):
+            return
+        progress = self.begin_operation_progress("Read-only security scan", accounts)
+        service = AccountSecurityService(self.config)
+        self.start_managed_task("scan-security", lambda stop: service.scan_security(
+            accounts, progress=progress, stop_event=stop,
+        ))
 
 def run_desktop_app(config: AppConfig) -> None:
     app = QApplication.instance() or QApplication([])

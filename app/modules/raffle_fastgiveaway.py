@@ -4,30 +4,37 @@ import asyncio
 import logging
 import re
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
 
 from core.config import AppConfig
 from core.models import AccountRecord
 from core.results import ActionResult
-from core.telegram_client import create_client, parse_post_link
+from core.telegram_client import create_client
 from core.ui_progress import OperationProgress
 from modules.accounts import AccountService
+from modules.captcha_support import CaptchaSupportStore, ManualRequired, manual_notice
 from modules.raffle_common import (
+    ReferralCoordinator,
     configure_raffle_client,
+    extract_ref_link_and_count,
     is_long_raffle_flood_wait,
     raffle_flood_skip_message,
+    stop_aware_delay,
+    stop_aware_sleep,
 )
-from modules.raffle_random import extract_channels, looks_like_post_link, normalize_post_link
-from utils.rate_limit import human_delay
-from utils.telegram_errors import is_invalid_auth_error, short_error
+from modules.raffle_random import (
+    extract_channel_targets,
+    extract_channels,
+    looks_like_post_link,
+    normalize_post_link,
+    unique_channels,
+)
+from utils.telegram_errors import is_frozen_error, is_invalid_auth_error, short_error
 
 BOT = "FastGiveawaysBot"
 START_RE = re.compile(r"start=(.+?)(?:&|$)", re.IGNORECASE)
 CAPTCHA_CB_RE = re.compile(r"contest_join\*captcha\*(\d+)")
-
-_EMOJI_MAP: dict[str, str] = {}
 
 log = logging.getLogger("raffle-fastgiveaway")
 
@@ -54,48 +61,69 @@ class FastGiveawayService:
         extra_channels: list[str] | None = None,
         progress: OperationProgress | None = None,
         probe_account: AccountRecord | None = None,
+        stop_event: asyncio.Event | None = None,
     ) -> ActionResult:
         enabled = [account for account in accounts if account.enabled]
+        result = ActionResult()
+        if not enabled or (stop_event is not None and stop_event.is_set()):
+            return result
+
         parsed = await self._resolve_target(
-            target, extra_channels or [], probe_account=probe_account or (enabled[0] if enabled else None),
+            target, extra_channels or [], probe_account=probe_account or enabled[0],
         )
         log.info("FastGiveaway start=%s channels=%s", parsed.start_param, parsed.channels)
 
-        sem = asyncio.Semaphore(max(1, self.config.max_concurrency or 1))
-        result = ActionResult()
+        concurrency = max(1, self.config.max_concurrency or 1)
+        sem = asyncio.Semaphore(concurrency)
+        referrals = ReferralCoordinator(parsed.start_param)
+        referral_mode: bool | None = None
 
         async def worker(acc: AccountRecord) -> None:
-            nonlocal current_batch_size
+            nonlocal referral_mode
+            if stop_event is not None and stop_event.is_set():
+                return
             async with sem:
-                await human_delay(self.config.min_action_delay, self.config.max_action_delay)
+                if await stop_aware_delay(self.config.min_action_delay, self.config.max_action_delay, stop_event):
+                    return
+                used_start = await referrals.acquire_start_param() or parsed.start_param
+                target_snapshot = FastGiveawayTarget(
+                    source=parsed.source,
+                    start_param=used_start,
+                    channels=list(parsed.channels),
+                    post_link=parsed.post_link,
+                )
                 try:
-                    outcome = await asyncio.wait_for(self._participate_one(acc, parsed), timeout=180)
+                    outcome = await asyncio.wait_for(
+                        self._participate_one(acc, target_snapshot, stop_event=stop_event),
+                        timeout=180,
+                    )
                     if outcome.status in ("ok", "already"):
                         result.add_ok(acc.id)
                         result.details[acc.id] = outcome.message
                         if progress:
                             progress.mark_ok(acc.id)
-                        if getattr(outcome, "ref_link", None) and ("start=" in str(outcome.ref_link) or "startapp=" in str(outcome.ref_link)):
-                            new_start = re.split(r"start(?:app)?=", str(outcome.ref_link))[-1]
-                            parsed.start_param = new_start
-                            
-                            new_count = getattr(outcome, "ref_count", None)
-                            if new_count:
-                                current_batch_size = max(1, int(new_count))
-                                log.info("%s: updated batch_size to %s", acc.id, current_batch_size)
-                            else:
-                                current_batch_size = 1
-                            
-                            log.info("%s: updated start_param to %s for next accounts", acc.id, new_start)
-
+                        registered = await referrals.register_ref(outcome.ref_link, outcome.ref_count)
+                        if registered:
+                            referral_mode = True
+                            log.info("%s: queued referral start=%s (slots=%s)", acc.id, registered, outcome.ref_count or 1)
+                        elif referral_mode is None:
+                            referral_mode = False
                     else:
                         result.add_error(acc.id, outcome.message)
                         if progress:
                             progress.mark_error(acc.id)
+                except asyncio.CancelledError:
+                    raise
                 except asyncio.TimeoutError:
                     result.add_error(acc.id, "timeout")
                     if progress:
                         progress.mark_error(acc.id)
+                except ManualRequired as exc:
+                    err = short_error(exc)
+                    result.add_error(acc.id, err)
+                    if progress:
+                        progress.mark_error(acc.id)
+                    log.warning("%s manual captcha required: %s", acc.id, err)
                 except Exception as exc:
                     err = (
                         raffle_flood_skip_message(exc)
@@ -107,14 +135,24 @@ class FastGiveawayService:
                         progress.mark_error(acc.id)
                     if is_invalid_auth_error(exc):
                         self.accounts.mark_error(acc.id, err, disable=True)
+                    elif is_frozen_error(exc):
+                        self.accounts.mark_error(acc.id, f"frozen: {err}", disable=False)
 
-        current_batch_size = len(enabled)
-        scout, *remaining = enabled
-        await worker(scout)
-        
         idx = 0
-        while idx < len(remaining):
-            batch = remaining[idx : idx + current_batch_size]
+        while idx < len(enabled):
+            if stop_event is not None and stop_event.is_set():
+                break
+            if referral_mode is None:
+                await worker(enabled[idx])
+                idx += 1
+                continue
+            if referral_mode:
+                async with referrals._lock:
+                    head_slots = referrals._queue[0][1] if referrals._queue else 1
+                batch_size = max(1, min(concurrency, head_slots))
+            else:
+                batch_size = concurrency
+            batch = enabled[idx : idx + batch_size]
             await asyncio.gather(*(worker(acc) for acc in batch))
             idx += len(batch)
 
@@ -131,10 +169,7 @@ class FastGiveawayService:
             return await self._resolve_from_post(_normalize(raw), extra, start_param, probe_account)
         if not start_param:
             raise ValueError("Could not extract start= param. Provide t.me/FastGiveawaysBot?start=... link")
-        channels: list[str] = []
-        for item in extra:
-            channels.extend(extract_channels(item))
-        channels = list(dict.fromkeys(channels))
+        channels = unique_channels(extract_channel_targets(" ".join(extra)))
         return FastGiveawayTarget(source=raw, start_param=start_param, channels=channels)
 
     async def _resolve_from_post(
@@ -149,12 +184,24 @@ class FastGiveawayService:
         acc = probe_account or self._first_account()
         if acc is None:
             raise RuntimeError("No enabled accounts")
-        channels = list(extract_channels(" ".join(extra)))
+        channels = list(extract_channel_targets(" ".join(extra)))
         async with create_client(self.config, acc) as client:
             configure_raffle_client(client)
             detail = await client.get_message_detail(raw)
+            forward_post_link = str(detail.get("forward_post_link") or "").strip()
+            if forward_post_link and forward_post_link != raw:
+                channels.extend(extract_channel_targets(str(detail.get("text") or "")))
+                for hl in detail.get("hidden_links") or []:
+                    channels.extend(extract_channel_targets(str(hl)))
+                detail = await client.get_message_detail(forward_post_link)
+                raw = forward_post_link
+
             text = str(detail.get("text") or "")
-            channels.extend(extract_channels(text))
+            channels.extend(extract_channel_targets(text))
+            for hl in detail.get("hidden_links") or []:
+                channels.extend(extract_channel_targets(str(hl)))
+                if not start_param:
+                    start_param = _extract_start(str(hl))
             if not start_param:
                 for btn in detail.get("buttons") or []:
                     for field_name in ("web_app_url", "url"):
@@ -169,240 +216,294 @@ class FastGiveawayService:
         return FastGiveawayTarget(
             source=raw,
             start_param=start_param,
-            channels=list(dict.fromkeys(channels)),
+            channels=unique_channels(channels),
             post_link=raw,
         )
 
-    async def _participate_one(self, acc: AccountRecord, target: FastGiveawayTarget) -> _Outcome:
+    async def _participate_one(
+        self,
+        acc: AccountRecord,
+        target: FastGiveawayTarget,
+        *,
+        stop_event: asyncio.Event | None = None,
+    ) -> _Outcome:
         async with create_client(self.config, acc) as client:
             configure_raffle_client(client)
-            c = client.client
-            await self._ensure_lang(c)
+            await self._ensure_lang(client, stop_event=stop_event)
 
             for ch in target.channels:
+                if stop_event is not None and stop_event.is_set():
+                    raise asyncio.CancelledError("Giveaway stopped")
                 try:
                     await client.join_chat(ch)
                     try:
                         from utils.rate_limit import mute_and_archive
-                        await mute_and_archive(c, ch)
+                        await mute_and_archive(client.client, ch)
                     except Exception:
                         pass
                 except Exception as exc:
                     if is_long_raffle_flood_wait(exc):
                         raise
                     err = short_error(exc)
-                    if "already" not in err.lower():
+                    if "already" not in err.lower() and "participant" not in err.lower():
                         log.warning("%s join %s: %s", acc.id, ch, err)
-                await human_delay(0.3, 1.0)
+                if await stop_aware_delay(0.3, 1.0, stop_event):
+                    raise asyncio.CancelledError("Giveaway stopped")
 
             await client.send_message(BOT, f"/start {target.start_param}")
-            await asyncio.sleep(2)
+            if await stop_aware_sleep(2.0, stop_event):
+                raise asyncio.CancelledError("Giveaway stopped")
 
-            last_id = await self._last_outgoing_id(c)
+            last_id = await self._last_outgoing_id(client)
             seen_buttons: set[str] = set()
             subscription_retries = 0
+            captcha_msg_id: int | None = None
 
             for attempt in range(10):
-                # check result first
-                bot_message = await self._last_bot_message(c, after_id=last_id)
+                if stop_event is not None and stop_event.is_set():
+                    raise asyncio.CancelledError("Giveaway stopped")
+                bot_message = await self._last_bot_message(client, after_id=last_id)
                 text = self._message_text(bot_message)
-                if any(w in text.lower() for w in ("успешно", "приняли участие", "участвуете", "приглашайте", "invite", "скопировать")):
-                    ref_link = None
-                    ref_count = None
-                    import re as re_mod
-                    
-                    fraction_match = re_mod.search(r'\d+\s*/\s*(\d+)', text)
-                    if fraction_match:
-                        ref_count = int(fraction_match.group(1))
-                    else:
-                        cnt_match = re_mod.search(r'(?:invite|пригласи(?:ть|те)?)\D*?(\d+)', text.lower())
-                        if cnt_match:
-                            ref_count = int(cnt_match.group(1))
-                            
-                    if hasattr(bot_message, "reply_markup") and bot_message.reply_markup:
-                        for row in getattr(bot_message.reply_markup, "inline_keyboard", []) or []:
-                            for btn in row:
-                                val = str(getattr(btn, "url", ""))
-                                copy_text = getattr(btn, "copy_text", None)
-                                if copy_text:
-                                    val += " " + str(getattr(copy_text, "text", copy_text))
-                                switch_inline_query = getattr(btn, "switch_inline_query", None)
-                                if switch_inline_query:
-                                    val += " " + str(switch_inline_query)
-                                
-                                match = re_mod.search(r'https?://(?:t\.me|telegram\.me)/[a-zA-Z0-9_]+bot\?(?:start|startapp)=[a-zA-Z0-9_-]+', val)
-                                if match:
-                                    ref_link = match.group(0)
-                                    break
-                            if ref_link:
-                                break
-                    return _Outcome("ok", text[:200], ref_link, ref_count)
-                if "уже" in text.lower() and any(w in text.lower() for w in ("приняли", "участ")):
-                    return _Outcome("already", text[:200])
-                if "подписк" in text.lower():
-                    joined = await self._join_required_channels(client, acc, bot_message)
+                outcome = self._classify_outcome(bot_message, text, target.start_param)
+                if outcome is not None:
+                    return outcome
+
+                lowered = text.lower()
+                if "подписк" in lowered:
+                    joined = await self._join_required_channels(client, acc, bot_message, stop_event=stop_event)
                     if joined and subscription_retries < 2:
                         subscription_retries += 1
-                        await self._check_subscription(c, bot_message)
-                        await human_delay(1.0, 2.0)
+                        await self._check_subscription(client, bot_message)
+                        if await stop_aware_delay(1.0, 2.0, stop_event):
+                            raise asyncio.CancelledError("Giveaway stopped")
                         await client.send_message(BOT, f"/start {target.start_param}")
                         log.info("%s: retrying after joining %s bot-required channel(s)", acc.id, len(joined))
-                        await asyncio.sleep(2)
-                        last_id = await self._last_outgoing_id(c)
+                        if await stop_aware_sleep(2.0, stop_event):
+                            raise asyncio.CancelledError("Giveaway stopped")
+                        last_id = await self._last_outgoing_id(client)
                         continue
                     return _Outcome("error", text[:150])
-                if "отказано" in text.lower():
+                if "отказано" in lowered:
                     return _Outcome("error", text[:150])
 
-                captcha = await self._find_captcha_msg(c, after_id=last_id, timeout=5)
+                captcha = await self._find_captcha_msg(
+                    client, after_id=last_id, known_captcha_id=captcha_msg_id, timeout=5, stop_event=stop_event,
+                )
                 if captcha is None:
                     if attempt == 0 and not text.strip():
                         return _Outcome("error", "no bot response")
-                    await asyncio.sleep(2)
+                    if await stop_aware_sleep(2.0, stop_event):
+                        raise asyncio.CancelledError("Giveaway stopped")
                     continue
 
-                question = (captcha.text or captcha.caption or "").strip()
+                captcha_msg_id = int(captcha["id"])
+                question = self._message_text(captcha).strip()
                 log.info("%s: captcha attempt %d: %s", acc.id, attempt + 1, question[:100])
+
+                if getattr(getattr(self, "config", None), "data_dir", None):
+                    try:
+                        CaptchaSupportStore(self.config.data_dir).reserve_attempt(acc.id, "fastgiveaway")
+                    except ManualRequired:
+                        manual_notice(self.config, acc.id, "fastgiveaway", question.encode("utf-8")[:256] or b"emoji-captcha", reason="budget_exhausted", kind="unknown")
+                        raise
 
                 emoji_ids, cb_map = self._parse_buttons(captcha)
                 target_name = _extract_target_emoji(question)
-                alt_map = await self._resolve_emoji_alts(c, emoji_ids)
+                alt_map = await client.get_custom_emoji_documents(emoji_ids) if emoji_ids else {}
                 log.info("%s: target=%s alts=%s", acc.id, target_name, {
                     eid: alt_map.get(eid, "?") for eid in emoji_ids
                 })
-                chosen_cb = _pick_callback(cb_map, alt_map, target_name, question)
-
-                if chosen_cb in seen_buttons:
-                    log.info("%s: already tried this captcha, skipping", acc.id)
-                    await asyncio.sleep(1)
-                    last_id = captcha.id
-                    continue
-                seen_buttons.add(chosen_cb)
-
-                if chosen_cb is None and cb_map:
-                    chosen_cb = next(iter(cb_map.values()))
+                chosen_cb = _pick_callback(cb_map, alt_map, target_name, question, exclude=seen_buttons)
                 if chosen_cb is None:
-                    return _Outcome("error", "no captcha buttons")
+                    chosen_cb = next((cb for cb in cb_map.values() if cb not in seen_buttons), None)
+                if chosen_cb is None:
+                    if getattr(getattr(self, "config", None), "data_dir", None):
+                        manual_notice(self.config, acc.id, "fastgiveaway", question.encode("utf-8")[:256] or b"emoji-captcha", reason="unreadable", kind="unknown")
+                    return _Outcome("error", "no unseen captcha buttons")
 
-                await human_delay(0.5, 1.5)
+                seen_buttons.add(chosen_cb)
+                if await stop_aware_delay(0.5, 1.5, stop_event):
+                    raise asyncio.CancelledError("Giveaway stopped")
                 try:
-                    await c.request_callback_answer(BOT, captcha.id, chosen_cb, timeout=10)
+                    await client.request_callback_answer(BOT, captcha_msg_id, chosen_cb, timeout=10)
                 except Exception as exc:
                     if is_long_raffle_flood_wait(exc):
                         raise
                     log.warning("%s: btn err %s", acc.id, short_error(exc))
 
-                await asyncio.sleep(2)
-                last_id = captcha.id
+                if await stop_aware_sleep(2.0, stop_event):
+                    raise asyncio.CancelledError("Giveaway stopped")
+                last_id = captcha_msg_id
 
-            text = await self._last_bot_text(c, after_id=last_id)
-            if any(w in text.lower() for w in ("успешно", "приняли", "участвуете")):
-                return _Outcome("ok", text[:200])
-            if "уже" in text.lower() and any(w in text.lower() for w in ("приняли", "участ")):
-                return _Outcome("already", text[:200])
+            final_msg = await self._last_bot_message(client, after_id=last_id)
+            final_text = self._message_text(final_msg)
+            final_outcome = self._classify_outcome(final_msg, final_text, target.start_param)
+            if final_outcome is not None:
+                return final_outcome
+            if getattr(getattr(self, "config", None), "data_dir", None):
+                manual_notice(self.config, acc.id, "fastgiveaway", final_text.encode("utf-8")[:256] or b"emoji-captcha", reason="unreadable", kind="unknown")
             return _Outcome("error", "captcha attempts exhausted")
 
-    async def _ensure_lang(self, c) -> None:
-        async for m in c.get_chat_history(BOT, limit=8):
-            if m.text and "выберите язык" in m.text.lower() and m.reply_markup and m.reply_markup.inline_keyboard:
-                ru_btn = m.reply_markup.inline_keyboard[0][0]
-                try:
-                    await c.request_callback_answer(BOT, m.id, ru_btn.callback_data, timeout=8)
-                except Exception:
-                    pass
+    def _classify_outcome(self, bot_message: Any, text: str, used_start_param: str) -> _Outcome | None:
+        lowered = text.lower()
+        if any(w in lowered for w in ("успешно", "приняли участие", "участвуете", "приглашайте", "invite", "скопировать")):
+            links = self._message_links(bot_message)
+            ref_link, ref_count = extract_ref_link_and_count(
+                text, links, ignore_start_params={used_start_param},
+            )
+            return _Outcome("ok", text[:200], ref_link, ref_count)
+        if "уже" in lowered and any(w in lowered for w in ("приняли", "участ")):
+            return _Outcome("already", text[:200])
+        return None
+
+    async def _ensure_lang(self, client, *, stop_event: asyncio.Event | None = None) -> None:
+        history = await client.get_chat_history(BOT, limit=8)
+        for m in history:
+            text = self._message_text(m).lower()
+            buttons = m.get("buttons") or []
+            if "выберите язык" in text and buttons:
+                cb = buttons[0].get("callback_data")
+                if cb:
+                    try:
+                        await client.request_callback_answer(BOT, int(m["id"]), cb, timeout=8)
+                    except Exception:
+                        pass
                 return
-        # No language menu in history — this is a new user, send /start to trigger it
+        if history:
+            # Existing chat already configured; do not pollute history with bare /start.
+            return
         try:
-            await c.send_message(BOT, "/start")
-            await asyncio.sleep(2)
-            async for m in c.get_chat_history(BOT, limit=5):
-                if m.text and "выберите язык" in m.text.lower() and m.reply_markup and m.reply_markup.inline_keyboard:
-                    ru_btn = m.reply_markup.inline_keyboard[0][0]
-                    await c.request_callback_answer(BOT, m.id, ru_btn.callback_data, timeout=8)
-                    await asyncio.sleep(1)
+            await client.send_message(BOT, "/start")
+            if await stop_aware_sleep(2.0, stop_event):
+                raise asyncio.CancelledError("Giveaway stopped")
+            for m in await client.get_chat_history(BOT, limit=5):
+                text = self._message_text(m).lower()
+                buttons = m.get("buttons") or []
+                if "выберите язык" in text and buttons:
+                    cb = buttons[0].get("callback_data")
+                    if cb:
+                        await client.request_callback_answer(BOT, int(m["id"]), cb, timeout=8)
+                        await stop_aware_sleep(1.0, stop_event)
                     return
+        except asyncio.CancelledError:
+            raise
         except Exception:
             pass
 
-    async def _find_captcha_msg(self, c, *, after_id, timeout: float):
+    async def _find_captcha_msg(
+        self,
+        client,
+        *,
+        after_id: int,
+        known_captcha_id: int | None,
+        timeout: float,
+        stop_event: asyncio.Event | None = None,
+    ) -> dict[str, Any] | None:
         for _ in range(int(timeout)):
-            await asyncio.sleep(1)
-            async for m in c.get_chat_history(BOT, limit=8):
-                if not m.outgoing and m.reply_markup and m.reply_markup.inline_keyboard:
-                    if m.id > int(after_id) or m.edit_date is not None:
-                        for row in m.reply_markup.inline_keyboard:
-                            for btn in row:
-                                if "captcha" in (btn.callback_data or ""):
-                                    return m
+            if await stop_aware_sleep(1.0, stop_event):
+                raise asyncio.CancelledError("Giveaway stopped")
+            for m in await client.get_chat_history(BOT, limit=8):
+                if m.get("outgoing"):
+                    continue
+                msg_id = int(m["id"])
+                is_newer = msg_id > int(after_id)
+                is_edited_current = (
+                    known_captcha_id is not None
+                    and msg_id == int(known_captcha_id)
+                    and m.get("edit_date") is not None
+                )
+                if not (is_newer or is_edited_current):
+                    continue
+                for btn in m.get("buttons") or []:
+                    if "captcha" in str(btn.get("callback_data") or ""):
+                        return m
         return None
 
-    def _parse_buttons(self, msg) -> tuple[list[int], dict[int, str]]:
+    @staticmethod
+    def _iter_buttons(message: Any) -> list[dict[str, Any]]:
+        if isinstance(message, dict):
+            return [btn for btn in (message.get("buttons") or []) if isinstance(btn, dict)]
+        markup = getattr(message, "reply_markup", None)
+        rows = getattr(markup, "inline_keyboard", None) or []
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            for btn in row:
+                copy_text = getattr(btn, "copy_text", None)
+                web_app = getattr(btn, "web_app", None)
+                out.append({
+                    "text": getattr(btn, "text", None),
+                    "url": getattr(btn, "url", None),
+                    "callback_data": getattr(btn, "callback_data", None),
+                    "web_app_url": getattr(web_app, "url", None) if web_app else None,
+                    "copy_text": getattr(copy_text, "text", copy_text) if copy_text else None,
+                    "switch_inline_query": getattr(btn, "switch_inline_query", None),
+                })
+        return out
+
+    @classmethod
+    def _message_links(cls, message: Any) -> list[str]:
+        links: list[str] = []
+        for btn in cls._iter_buttons(message):
+            for key in ("url", "web_app_url", "copy_text", "switch_inline_query"):
+                val = btn.get(key)
+                if val:
+                    links.append(str(val))
+        return links
+
+    def _parse_buttons(self, msg: Any) -> tuple[list[int], dict[int, str]]:
         emoji_ids: list[int] = []
         cb_map: dict[int, str] = {}
-        for row in msg.reply_markup.inline_keyboard:
-            for btn in row:
-                cb = btn.callback_data or ""
-                m = CAPTCHA_CB_RE.search(cb)
-                if m:
-                    eid = int(m.group(1))
-                    emoji_ids.append(eid)
-                    cb_map[eid] = cb
+        for btn in self._iter_buttons(msg):
+            cb = str(btn.get("callback_data") or "")
+            m = CAPTCHA_CB_RE.search(cb)
+            if m:
+                eid = int(m.group(1))
+                emoji_ids.append(eid)
+                cb_map[eid] = cb
         return emoji_ids, cb_map
 
-    async def _resolve_emoji_alts(self, c, emoji_ids: list[int]) -> dict[int, str]:
-        try:
-            from pyrogram import raw
-            r = await c.invoke(raw.functions.messages.GetCustomEmojiDocuments(document_id=emoji_ids))
-            alt_map: dict[int, str] = {}
-            for doc in r:
-                for attr in getattr(doc, "attributes", []) or []:
-                    alt = getattr(attr, "alt", None)
-                    if alt:
-                        alt_map[doc.id] = alt
-                        break
-            return alt_map
-        except Exception as exc:
-            if is_long_raffle_flood_wait(exc):
-                raise
-            log.warning("GetCustomEmojiDocuments failed: %s", short_error(exc))
-            return {}
-
-    async def _last_outgoing_id(self, c) -> int:
-        async for m in c.get_chat_history(BOT, limit=3):
-            if m.outgoing:
-                return m.id
+    async def _last_outgoing_id(self, client) -> int:
+        for m in await client.get_chat_history(BOT, limit=3):
+            if m.get("outgoing"):
+                return int(m["id"])
         return 0
 
-    async def _last_bot_text(self, c, *, after_id: int) -> str:
-        return self._message_text(await self._last_bot_message(c, after_id=after_id))
-
-    async def _last_bot_message(self, c, *, after_id: int):
-        async for m in c.get_chat_history(BOT, limit=5):
-            if m.id > int(after_id) and not m.outgoing:
+    async def _last_bot_message(self, client, *, after_id: int) -> dict[str, Any] | None:
+        for m in await client.get_chat_history(BOT, limit=5):
+            if int(m["id"]) > int(after_id) and not m.get("outgoing"):
                 return m
         return None
 
     @staticmethod
-    def _message_text(message) -> str:
+    def _message_text(message: Any) -> str:
+        if isinstance(message, dict):
+            return str(message.get("text") or message.get("caption") or "")
         return str(getattr(message, "text", None) or getattr(message, "caption", None) or "")
 
-    @staticmethod
-    def _required_channels(message) -> list[str]:
+    @classmethod
+    def _required_channels(cls, message: Any) -> list[str]:
         channels: list[str] = []
-        markup = getattr(message, "reply_markup", None)
-        for row in getattr(markup, "inline_keyboard", None) or []:
-            for button in row:
-                url = str(getattr(button, "url", None) or "")
-                if not url:
-                    continue
-                channels.extend(extract_channels(url))
-                if "t.me/+" in url.lower() or "joinchat/" in url.lower():
-                    channels.append(url)
-        return list(dict.fromkeys(channels))
+        for button in cls._iter_buttons(message):
+            url = str(button.get("url") or button.get("web_app_url") or "")
+            if not url:
+                continue
+            channels.extend(extract_channels(url))
+            if "t.me/+" in url.lower() or "joinchat/" in url.lower():
+                channels.append(url)
+        return unique_channels(channels)
 
-    async def _join_required_channels(self, client, acc: AccountRecord, message) -> list[str]:
+    async def _join_required_channels(
+        self,
+        client,
+        acc: AccountRecord,
+        message: Any,
+        *,
+        stop_event: asyncio.Event | None = None,
+    ) -> list[str]:
         joined: list[str] = []
         for channel in self._required_channels(message):
+            if stop_event is not None and stop_event.is_set():
+                raise asyncio.CancelledError("Giveaway stopped")
             try:
                 await client.join_chat(channel)
                 joined.append(channel)
@@ -415,36 +516,24 @@ class FastGiveawayService:
                     joined.append(channel)
                 else:
                     log.warning("%s: could not join required %s: %s", acc.id, channel, error)
-            await human_delay(0.4, 1.0)
+            if await stop_aware_delay(0.4, 1.0, stop_event):
+                raise asyncio.CancelledError("Giveaway stopped")
         return joined
 
-    async def _check_subscription(self, c, message) -> None:
-        markup = getattr(message, "reply_markup", None)
-        for row in getattr(markup, "inline_keyboard", None) or []:
-            for button in row:
-                label = str(getattr(button, "text", None) or "").lower()
-                callback_data = getattr(button, "callback_data", None)
-                if not callback_data or not any(word in label for word in ("провер", "check", "готов")):
-                    continue
-                try:
-                    await c.request_callback_answer(BOT, message.id, callback_data, timeout=10)
-                except Exception as exc:
-                    if is_long_raffle_flood_wait(exc):
-                        raise
-                    log.debug("subscription check callback: %s", short_error(exc))
-                return
-
-    async def _wait_captcha_msg_after(self, c, *, after_id, timeout: float):
-        for _ in range(int(timeout)):
-            await asyncio.sleep(1)
-            async for m in c.get_chat_history(BOT, limit=3):
-                if m.id > int(after_id) and not m.outgoing:
-                    if m.reply_markup and m.reply_markup.inline_keyboard:
-                        for row in m.reply_markup.inline_keyboard:
-                            for btn in row:
-                                if "captcha" in (btn.callback_data or ""):
-                                    return m
-        return None
+    async def _check_subscription(self, client, message: Any) -> None:
+        msg_id = int(message["id"]) if isinstance(message, dict) else int(message.id)
+        for button in self._iter_buttons(message):
+            label = str(button.get("text") or "").lower()
+            callback_data = button.get("callback_data")
+            if not callback_data or not any(word in label for word in ("провер", "check", "готов")):
+                continue
+            try:
+                await client.request_callback_answer(BOT, msg_id, callback_data, timeout=10)
+            except Exception as exc:
+                if is_long_raffle_flood_wait(exc):
+                    raise
+                log.debug("subscription check callback: %s", short_error(exc))
+            return
 
     def _first_account(self) -> AccountRecord | None:
         for a in self.accounts.list_accounts(enabled_only=True):
@@ -533,7 +622,6 @@ _RU_EMOJI: dict[str, str] = {
     "жук": "🐞",
     "муравей": "🐜",
     "гусеница": "🐛",
-    "осьминог": "🐙",
     "медуза": "🪼",
     "пингвин": "🐧",
     "тюлень": "🦭",
@@ -588,7 +676,6 @@ _RU_EMOJI: dict[str, str] = {
 
 def _extract_target_emoji(text: str) -> str | None:
     t = text.lower().strip()
-    # "Выберите ПЧЕЛУ:" → пчелу
     m = re.search(r"выберит[ее]\s+([а-яё]+)", t)
     if not m:
         return None
@@ -601,15 +688,18 @@ def _pick_callback(
     alt_map: dict[int, str],
     target_name: str | None,
     question: str,
+    *,
+    exclude: set[str] | None = None,
 ) -> str | None:
-    """Pick the callback_data for the emoji matching target_name."""
-    if target_name and target_name in alt_map.values():
+    """Pick an unseen callback_data for the emoji matching target_name."""
+    seen = exclude or set()
+    if target_name:
         for emoji_id, alt in alt_map.items():
-            if alt == target_name:
-                return cb_map.get(emoji_id)
-    # fallback: try partial match
-    for emoji_id, alt in alt_map.items():
-        if target_name and alt and target_name in alt:
-            return cb_map.get(emoji_id)
-    # brute: pick first unseen
-    return next(iter(cb_map.values()), None)
+            cb = cb_map.get(emoji_id)
+            if cb and cb not in seen and alt == target_name:
+                return cb
+        for emoji_id, alt in alt_map.items():
+            cb = cb_map.get(emoji_id)
+            if cb and cb not in seen and alt and target_name in alt:
+                return cb
+    return next((cb for cb in cb_map.values() if cb not in seen), None)

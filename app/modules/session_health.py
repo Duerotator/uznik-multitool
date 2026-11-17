@@ -15,7 +15,7 @@ from core.results import ActionResult
 from core.telegram_client import create_client, resolve_session_path, session_lock
 from core.storage import write_json_atomic
 from modules.accounts import AccountService
-from utils.telegram_errors import is_invalid_auth_error, short_error
+from utils.telegram_errors import is_frozen_error, is_invalid_auth_error, short_error
 
 
 class SessionHealthService:
@@ -39,8 +39,11 @@ class SessionHealthService:
 
         async with session_lock(account):
             try:
-                with open(key_file, "r", encoding="utf-8") as f:
-                    pk_data = json.load(f)
+                from core.passkey_service import PasskeyService
+                from modules.account_secrets import get_account_password
+
+                service = PasskeyService(self.config.api_id, self.config.api_hash, passkeys_dir=passkeys_dir)
+                pk_data = service.load_passkey(account.id)
                 expected_id = int(account.user_id or pk_data.get("user_id") or 0)
                 if not expected_id or int(pk_data.get("user_id") or 0) != expected_id:
                     raise ValueError("Saved Passkey identity does not match the account")
@@ -57,11 +60,9 @@ class SessionHealthService:
                         raise RuntimeError("No working proxy for Passkey restore; direct connection is forbidden")
                     await transport._replace_proxy()
 
-                from core.passkey_service import PasskeyService
-                service = PasskeyService(self.config.api_id, self.config.api_hash, passkeys_dir=passkeys_dir)
                 original = resolve_session_path(self.config, account.session_ref).resolve()
                 original.parent.mkdir(parents=True, exist_ok=True)
-                two_fa = account.metadata.get("cloud_password_val") or getattr(self.config, "two_fa_password", None)
+                two_fa = get_account_password(self.config, account)
                 with tempfile.TemporaryDirectory(prefix=".passkey-restore-", dir=original.parent) as temp_dir:
                     client = None
                     try:
@@ -131,6 +132,7 @@ class SessionHealthService:
 
         async def worker(account: AccountRecord) -> None:
             async with semaphore:
+                freeze_meta: dict[str, object] = {}
                 try:
                     async with create_client(self.config, account) as client:
                         identity = await client.get_me()
@@ -145,31 +147,42 @@ class SessionHealthService:
                         try:
                             await client.probe_frozen()
                         except Exception as probe_err:
-                            if "FROZEN" in str(probe_err).upper():
+                            if is_frozen_error(probe_err):
+                                try:
+                                    app_cfg = await asyncio.wait_for(client.get_app_config(), timeout=10)
+                                    for key in ("freeze_since_date", "freeze_until_date", "freeze_appeal_url"):
+                                        if app_cfg.get(key):
+                                            freeze_meta[key] = app_cfg[key]
+                                except Exception:
+                                    pass
                                 raise
                         security = await client.get_security_state()
-                        self.accounts.update_profile_metadata(
-                            account.id,
-                            {
-                                "health_status": "valid",
-                                "health_checked_at": utc_now_iso(),
-                                "cloud_password": security.get("cloud_password"),
-                                "recovery_email_hint": security.get("recovery_email_hint"),
-                                "language_code": identity.get("language_code"),
-                            },
-                        )
+                        profile_meta = {
+                            "health_status": "valid",
+                            "health_checked_at": utc_now_iso(),
+                            "cloud_password": security.get("cloud_password"),
+                            "recovery_email_hint": security.get("recovery_email_hint"),
+                            "language_code": identity.get("language_code"),
+                        }
+                        if "login_email_pattern" in security:
+                            profile_meta["login_email_pattern"] = security.get("login_email_pattern")
+                        if "has_recovery" in security:
+                            profile_meta["has_recovery"] = security.get("has_recovery")
+                        self.accounts.update_profile_metadata(account.id, profile_meta)
                         self.accounts.clear_error(account.id)
                     result.add_ok(account.id)
                     if progress: progress.mark_ok(account.id)
                 except Exception as exc:
                     error = short_error(exc)
                     msg = str(exc).upper()
-                    if "FROZEN" in msg:
+                    if is_frozen_error(exc):
                         self.frozen_session_ids.add(account.id)
-                        self.accounts.update_profile_metadata(
-                            account.id,
-                            {"health_status": "frozen", "health_checked_at": utc_now_iso()},
-                        )
+                        frozen_update: dict[str, object] = {
+                            "health_status": "frozen",
+                            "health_checked_at": utc_now_iso(),
+                            **freeze_meta,
+                        }
+                        self.accounts.update_profile_metadata(account.id, frozen_update)
                         self.accounts.mark_error(account.id, error, disable=True)
                         self.log.warning("Frozen session %s: %s", account.id, error)
                         result.add_error(account.id, error)

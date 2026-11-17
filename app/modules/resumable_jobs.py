@@ -15,6 +15,8 @@ from modules.accounts import AccountService
 OPERATIONS = {"check-sessions", "check-spamblock", "apply-saved-profiles"}
 PROFILE_OPTIONS = {"copy_name", "copy_bio", "copy_username", "copy_avatars", "copy_music",
                    "copy_stories", "copy_birthday", "accept_legacy_stories", "max_stories_per_account"}
+_TERMINAL_STATUSES = {"done", "skipped"}
+_MAX_JOBS = 100
 
 
 def validate_options(operation: str, options: dict) -> None:
@@ -61,18 +63,40 @@ class ResumableJobs:
                   "created_at": utc_now_iso(), "status": "pending",
                   "accounts": {a.id: {"status": "pending", "detail": ""} for a in accounts}}
         def mutate(data):
-            data.setdefault("jobs", {})[job_id] = record
+            jobs = data.setdefault("jobs", {})
+            if len(jobs) >= _MAX_JOBS:
+                completed = sorted(
+                    (
+                        (item.get("updated_at") or item.get("created_at") or "", jid)
+                        for jid, item in jobs.items()
+                        if isinstance(item, dict)
+                        and all(
+                            isinstance(acc, dict) and acc.get("status") in _TERMINAL_STATUSES
+                            for acc in (item.get("accounts") or {}).values()
+                        )
+                    ),
+                )
+                for _, old_id in completed[: max(0, len(jobs) - _MAX_JOBS + 1)]:
+                    jobs.pop(old_id, None)
+            jobs[job_id] = record
             return data
         update_json(self.path, {"jobs": {}}, mutate)
         return job_id
 
     def pending_ids(self, job_id: str) -> list[str]:
-        return [key for key, item in self.get(job_id)["accounts"].items() if item["status"] != "done"]
+        return [
+            key
+            for key, item in self.get(job_id)["accounts"].items()
+            if item["status"] not in _TERMINAL_STATUSES
+        ]
 
     def incomplete(self) -> list[dict]:
         jobs = read_json(self.path, {"jobs": {}}).get("jobs", {}).values()
-        return sorted((job for job in jobs if any(a["status"] != "done" for a in job["accounts"].values())),
-                      key=lambda job: job["created_at"], reverse=True)
+        return sorted(
+            (job for job in jobs if any(a["status"] not in _TERMINAL_STATUSES for a in job["accounts"].values())),
+            key=lambda job: job["created_at"],
+            reverse=True,
+        )
 
     async def _execute(self, operation: str, account, options: dict) -> ActionResult:
         if operation == "check-sessions":
@@ -93,25 +117,32 @@ class ResumableJobs:
         # Validate persisted options too, without creating a second job.
         validate_options(job["operation"], job["options"])
         account_service = AccountService(self.config)
+        accounts_by_id = {a.id: a for a in account_service.list_accounts()}
         pending = self.pending_ids(job_id)
         if progress:
             progress.set_total(len(pending))
         result = ActionResult()
         self.update(job_id, status="running")
+        remaining = set(pending)
         try:
             for account_id in pending:
                 if stop.is_set():
                     self.update(job_id, status="stopped")
                     return result
-                account = next((a for a in account_service.list_accounts() if a.id == account_id), None)
-                self.mark(job_id, account_id, "running")
+                account = accounts_by_id.get(account_id)
+                if account is None or not account.enabled:
+                    self.mark(job_id, account_id, "skipped", "Account missing or disabled")
+                    remaining.discard(account_id)
+                    result.add_error(account_id, "Account is missing or disabled; not replaced by another account")
+                    if progress:
+                        progress.mark_error(account_id)
+                    continue
                 try:
-                    if account is None or not account.enabled:
-                        raise RuntimeError("Account is missing or disabled; not replaced by another account")
                     outcome = await (execute or self._execute)(job["operation"], account, job["options"])
                     if outcome.errors or outcome.ok != 1:
                         raise RuntimeError(outcome.details.get(account_id) or "Operation did not confirm success")
                     self.mark(job_id, account_id, "done")
+                    remaining.discard(account_id)
                     result.add_ok(account_id)
                     if progress:
                         progress.mark_ok(account_id)
@@ -123,7 +154,7 @@ class ResumableJobs:
                     result.add_error(account_id, str(exc))
                     if progress:
                         progress.mark_error(account_id)
-            self.update(job_id, status="partial" if self.pending_ids(job_id) else "done")
+            self.update(job_id, status="partial" if remaining else "done")
             return result
         except BaseException:
             self.update(job_id, status="interrupted")

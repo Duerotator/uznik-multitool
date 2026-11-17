@@ -1,34 +1,34 @@
 # CPython 3.12-3.14 x64. Native programs/browser are installed by setup.bat.
-# Do NOT add Pyrogram or kurigram[fast]: both conflict with these providers.
---only-binary=TgCrypto-pyrofork
+# Do NOT add Pyrogram, Pyrofork, TgCrypto, TgCrypto-pyrofork or kurigram[fast].
 
 # Telegram: maintained fork (imports as pyrogram) + wheel-based crypto.
-Kurigram==2.2.26
-TgCrypto-pyrofork==1.2.8
-telethon>=1.36.0
+Kurigram==2.2.27
+kuricrypt>=0.1.2
+telethon>=1.45.0
+cryptg>=0.6.1
 
 # Desktop, configuration, networking, downloads and diagnostics.
-PySide6>=6.7.0
+PySide6>=6.12.0
 python-dotenv>=1.0.1
-tzdata>=2024.1
+tzdata>=2026.6
 httpx>=0.27.2
 pysocks>=1.7.1
-socksio>=1.0.0
-gdown>=5.2.0
+python-socks[asyncio]>=3.2.1
+gdown>=6.5.1
 psutil>=5.9.0
 
 # Telegram Web / browser-based actions. Chromium is a separate download.
-playwright>=1.45.0
+playwright>=1.65.2
 
 # Images, QR decoding and CPU OCR. No GPU/CUDA or web API extra required.
-Pillow>=10.0.0
-numpy>=1.26.0,<3
+Pillow>=13.0.0
+numpy>=2.5.5,<3
 zxing-cpp>=3.1.1
 ddddocr>=1.6.1,<2
-onnxruntime>=1.23.0,<2
+onnxruntime>=1.32.0,<2
 opencv-python>=4.10.0,<5; sys_platform == "win32" or sys_platform == "darwin"
 opencv-python-headless>=4.10.0,<5; sys_platform == "linux"
 
 # Passkey (CBOR, cryptographic keys).
-cbor2>=5.6.0
+cbor2>=6.3.0
 cryptography>=43.0.0

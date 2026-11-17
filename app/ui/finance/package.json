@@ -1,0 +1,8 @@
+{
+  "name": "accmanager-money-ui",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {"build": "esbuild index.js --bundle --inject:buffer-shim.js --format=iife --global-name=AccMoney --outfile=dist/money.js --minify --legal-comments=eof"},
+  "dependencies": {"@tonconnect/ui": "5.0.3", "@tonconnect/sdk": "5.0.1", "@ton/core": "0.63.1", "buffer": "6.0.3"},
+  "devDependencies": {"esbuild": "0.28.2"}
+}

@@ -1,4 +1,9 @@
 from __future__ import annotations
+import sys as _sys
+from pathlib import Path as _Path
+for _p in (_Path(__file__).resolve().parents[2] / 'app', _Path(__file__).resolve().parent):
+    if str(_p) not in _sys.path:
+        _sys.path.insert(0, str(_p))
 
 import asyncio
 import sys

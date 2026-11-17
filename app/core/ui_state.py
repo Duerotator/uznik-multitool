@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+import threading
 from typing import Any
 
 from core.models import utc_now_iso
@@ -29,17 +30,30 @@ class UiStateSnapshot:
 class UiStateStore:
     def __init__(self, config) -> None:
         self.path = config.data_dir / "ui_state.json"
+        self._lock = threading.Lock()
+        self._cached: UiStateSnapshot | None = None
 
     def get(self) -> UiStateSnapshot:
         raw = read_json(self.path, {})
         allowed = {key: raw[key] for key in UiStateSnapshot.__dataclass_fields__ if key in raw}
-        return UiStateSnapshot(**allowed)
+        snapshot = UiStateSnapshot(**allowed)
+        with self._lock:
+            self._cached = snapshot
+        return snapshot
 
     def update(self, **changes: Any) -> UiStateSnapshot:
         allowed = set(UiStateSnapshot.__dataclass_fields__)
         invalid = set(changes) - allowed
         if invalid:
             raise ValueError(f"Unsupported UI state fields: {sorted(invalid)}")
+
+        with self._lock:
+            if (
+                self._cached is not None
+                and self.path.exists()
+                and all(getattr(self._cached, key) == value for key, value in changes.items())
+            ):
+                return self._cached
 
         def mutate(raw: dict[str, Any]) -> dict[str, Any]:
             next_state = UiStateSnapshot(**{key: raw[key] for key in allowed if key in raw}).to_dict()
@@ -49,4 +63,7 @@ class UiStateStore:
             next_state["updated_at"] = utc_now_iso()
             return next_state
 
-        return UiStateSnapshot(**update_json(self.path, {}, mutate, skip_unchanged=True))
+        snapshot = UiStateSnapshot(**update_json(self.path, {}, mutate, skip_unchanged=True))
+        with self._lock:
+            self._cached = snapshot
+        return snapshot

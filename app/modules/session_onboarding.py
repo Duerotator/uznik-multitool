@@ -7,6 +7,7 @@ possible, the Telegram login code from 777000.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import re
 import shutil
@@ -62,16 +63,33 @@ def queue_external_sessions(config: AppConfig, paths: Iterable[Path]) -> list[Pa
     queue = config.import_dir / "auth_input"
     queue.mkdir(parents=True, exist_ok=True)
     queued: list[Path] = []
+    by_digest: dict[str, Path] = {}
+    for existing in sorted(queue.iterdir()):
+        if existing.is_file() and existing.suffix.lower() == ".session":
+            try:
+                digest = hashlib.sha256(existing.read_bytes()).hexdigest()
+                by_digest.setdefault(digest, existing)
+            except OSError:
+                pass
     for source in session_sources(paths):
         if source.suffix.lower() != ".session":
             continue
         if (queue / "processed").resolve() in source.parents:
             continue
+        try:
+            source_bytes = source.read_bytes()
+            digest = hashlib.sha256(source_bytes).hexdigest()
+        except OSError:
+            continue
+        if digest in by_digest and by_digest[digest].exists():
+            queued.append(by_digest[digest])
+            continue
         target = queue / source.name
-        if target.exists() and target.read_bytes() != source.read_bytes():
+        if target.exists() and target.read_bytes() != source_bytes:
             target = queue / f"{source.stem}_{time.time_ns()}{source.suffix}"
         if not target.exists():
             shutil.copy2(source, target)
+        by_digest[digest] = target
         queued.append(target)
     return queued
 
@@ -125,8 +143,10 @@ class ForeignSessionOnboarding:
             try:
                 log.info("external session: opening supplied session")
                 legacy = await self._open_legacy_copy(source, backend)
-                me = await legacy["get_me"]()
-                result.phone = str(getattr(me, "phone_number", "") or result.phone)
+                me = await asyncio.wait_for(legacy["get_me"](), timeout=20)
+                if me is None:
+                    raise RuntimeError("Supplied session is not authorized")
+                result.phone = str(getattr(me, "phone_number", "") or getattr(me, "phone", "") or result.phone)
             except Exception as exc:
                 # A filename phone can still be used. Keep processing the queue,
                 # but the code cannot be read automatically without this session.
@@ -140,9 +160,16 @@ class ForeignSessionOnboarding:
 
             known_message_ids = await self._recent_service_message_ids(legacy)
             log.info("external session: requesting login code")
-            sent = await self.auth.send_code(result.phone)
+            send_kwargs = {"proxy_url": legacy["proxy_url"]} if legacy and legacy.get("proxy_url") else {}
+            sent = await self.auth.send_code(result.phone, **send_kwargs)
             if not sent.get("ok"):
                 result.error = str(sent.get("error", "Could not send login code."))
+                return result
+
+            sent_type = str(sent.get("sent_code_type") or "")
+            if sent_type in {"SentCodeTypeSetUpEmailRequired", "SentCodeTypePaymentRequired"}:
+                result.status = "needs_manual"
+                result.error = f"Telegram requires manual verification step: {sent_type}"
                 return result
 
             log.info("external session: waiting for a fresh 777000 code")
@@ -164,15 +191,12 @@ class ForeignSessionOnboarding:
                 else:
                     result.status = "needs_2fa"
                     result.error = "Cloud password is required."
-            elif signed.get("ok"):
+                    return result
+            if signed.get("ok"):
                 result.status = "authorized"
                 result.imported = bool(signed.get("imported"))
                 self._archive_source(source)
-            if signed.get("ok") and result.status != "authorized":
-                result.status = "authorized"
-                result.imported = bool(signed.get("imported"))
-                self._archive_source(source)
-            elif result.status != "needs_2fa" and not signed.get("ok"):
+            else:
                 result.error = str(signed.get("error", "Sign-in failed."))
             return result
         finally:
@@ -200,17 +224,50 @@ class ForeignSessionOnboarding:
             shutil.copy2(source, copy)
             proxy_url = await self.auth.verified_proxy_url()
             proxy = ProxyConfig.from_url(proxy_url)
+            from modules.fingerprint_generator import FingerprintGenerator
+
+            fp_key = phone_hint_from_name(source) or f"legacy_{source.stem}"
+            fp = FingerprintGenerator(str(self.config.data_dir / "fingerprints.json")).get_params(
+                fp_key, backend=backend,
+            )
             if backend == "telethon":
                 from telethon import TelegramClient
-                client = TelegramClient(str(copy.with_suffix("")), self.config.api_id, self.config.api_hash, proxy=proxy.to_telethon() if proxy else None)
+                client = TelegramClient(
+                    str(copy.with_suffix("")),
+                    self.config.api_id,
+                    self.config.api_hash,
+                    proxy=proxy.to_telethon() if proxy else None,
+                    device_model=fp["device_model"],
+                    system_version=fp["system_version"],
+                    app_version=fp["app_version"],
+                    lang_code=fp["lang_code"],
+                    system_lang_code=fp.get("system_lang_code", fp["lang_code"]),
+                )
                 read_messages = lambda: self._telethon_service_messages(client)
             else:
                 from pyrogram import Client
-                client = Client(name=copy.stem, api_id=self.config.api_id, api_hash=self.config.api_hash, workdir=str(copy.parent), no_updates=True, proxy=proxy.to_pyrogram() if proxy else None)
+                client = Client(
+                    name=copy.stem,
+                    api_id=self.config.api_id,
+                    api_hash=self.config.api_hash,
+                    workdir=str(copy.parent),
+                    no_updates=True,
+                    proxy=proxy.to_pyrogram() if proxy else None,
+                    device_model=fp["device_model"],
+                    system_version=fp["system_version"],
+                    app_version=fp["app_version"],
+                    lang_code=fp["lang_code"],
+                    system_lang_code=fp.get("system_lang_code", fp["lang_code"]),
+                    lang_pack=fp.get("lang_pack", "android"),
+                )
                 read_messages = lambda: self._pyrogram_service_messages(client)
             from core.telegram_connection import CONNECT_TIMEOUT, connection_error, is_connection_error
             try:
                 await asyncio.wait_for(client.connect(), CONNECT_TIMEOUT)
+                if hasattr(client, "is_user_authorized"):
+                    authorized = await asyncio.wait_for(client.is_user_authorized(), CONNECT_TIMEOUT)
+                    if not authorized:
+                        raise RuntimeError("Supplied session is not authorized")
             except Exception as exc:
                 if is_connection_error(exc):
                     raise connection_error(proxy) from exc
@@ -220,6 +277,7 @@ class ForeignSessionOnboarding:
                 "get_service_messages": read_messages,
                 "close": client.disconnect,
                 "tmp": tmp_dir,
+                "proxy_url": proxy_url,
             }
         except BaseException:
             if client is not None:
@@ -252,9 +310,10 @@ class ForeignSessionOnboarding:
         if not legacy:
             return None
         try:
+            messages = await asyncio.wait_for(legacy["get_service_messages"](), timeout=15)
             return {
                 int(message.get("id") or 0)
-                for message in await legacy["get_service_messages"]()
+                for message in messages
                 if int(message.get("id") or 0)
             }
         except Exception as exc:
@@ -268,7 +327,7 @@ class ForeignSessionOnboarding:
         # accept a message created after the request, never an old code.
         for attempt in range(15):
             try:
-                messages = await legacy["get_service_messages"]()
+                messages = await asyncio.wait_for(legacy["get_service_messages"](), timeout=15)
                 for message in messages:
                     message_id = int(message.get("id") or 0)
                     if not message_id or message_id in known_message_ids:
@@ -281,7 +340,7 @@ class ForeignSessionOnboarding:
                     "external session 777000 read failed (attempt %d/%d): %s",
                     attempt + 1,
                     15,
-                    exc,
+                    type(exc).__name__,
                 )
             if attempt < 14:
                 await asyncio.sleep(2)
@@ -291,7 +350,7 @@ class ForeignSessionOnboarding:
         if not legacy:
             return
         try:
-            await legacy["close"]()
+            await asyncio.wait_for(legacy["close"](), timeout=10)
         except Exception:
             # Pyrogram can terminate its temporary client while handling an
             # authorization transition.  It is already closed in that case.

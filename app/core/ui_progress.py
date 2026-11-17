@@ -48,10 +48,43 @@ class OperationProgress:
     def mark_error(self, account_id: str, error: str = "", *args: Any, **kwargs: Any) -> None:
         self._mark(account_id, success=False)
 
+    def reset(self, operation: str, total: int) -> None:
+        """Reuse this progress tracker for a subsequent phase under the same token."""
+        with self._lock:
+            self.operation = operation
+            self.total = max(0, int(total))
+            self.completed = 0
+            self.ok = 0
+            self.errors = 0
+            self.current_account = ""
+            self.started_monotonic = time.monotonic()
+            snapshot = self._snapshot()
+        if self.on_update:
+            self.on_update(snapshot)
+
+    def __call__(self, completed: int, total: int | None = None, account_id: str = "") -> None:
+        snapshot: dict[str, Any] | None = None
+        with self._lock:
+            if total is not None and int(total) != self.total:
+                self.total = max(self.completed, int(total), 0)
+            target = max(self.completed, int(completed))
+            if self.total > 0:
+                target = min(target, self.total)
+            if target > self.completed:
+                delta = target - self.completed
+                self.completed = target
+                self.ok += delta
+                self.current_account = str(account_id or target)
+                snapshot = self._snapshot()
+            elif total is not None:
+                snapshot = self._snapshot()
+        if self.on_update and snapshot is not None:
+            self.on_update(snapshot)
+
     def _mark(self, account_id: str, *, success: bool) -> None:
         snapshot: dict[str, Any] | None = None
         with self._lock:
-            if self.completed >= self.total:
+            if self.total > 0 and self.completed >= self.total:
                 return
             self.current_account = str(account_id)
             self.completed += 1

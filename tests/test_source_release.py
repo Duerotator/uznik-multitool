@@ -55,11 +55,14 @@ class SourceReleaseTests(unittest.TestCase):
         self.assertFalse((self.root / "release").exists())
 
     def test_scaffolding_and_template_are_allowed(self):
-        for name in ("data/.gitkeep", "imports/emails/README.md", "config/.env.example", "sessions/create_session.bat"):
+        for name in ("data/.gitkeep", "imports/emails/README.md", "config/.env.example",
+                     "sessions/create_session.bat", "app/ui/finance/dist/money.js"):
             validate_path(name)
 
     def test_private_paths_and_traversal_are_refused(self):
-        for name in (".env", "source.session", "source.session-journal", "private.key", "private.uzbk",
+        for name in (".env", ".env.local", ".vpn-gateway.env", "source.session", "source.session-journal",
+                     "private.key", "private.uzbk", "unknown_errors.txt", "_local/migrate.py",
+                     "app/ui/finance/node_modules/esbuild/bin/esbuild", "dist/release.zip",
                      "data/accounts.json", "sessions/batch_phones.txt", "templates/bios.txt",
                      "../outside.txt", "/outside.txt", "C:/outside.txt", "bad\\path"):
             with self.subTest(name=name), self.assertRaises(ValueError):

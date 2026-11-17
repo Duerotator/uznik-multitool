@@ -4,9 +4,10 @@ import asyncio
 import logging
 import time
 from pathlib import Path
+from dataclasses import dataclass, field
 
 from core.config import AppConfig
-from core.models import AccountRecord
+from core.models import AccountRecord, utc_now_iso
 from core.results import ActionResult
 from core.storage import update_json
 from core.telegram_client import AccountBusyError, create_client
@@ -15,7 +16,7 @@ from modules.accounts import AccountService
 from modules.email_inbox import create_email_inbox
 from modules.email_mailbox import MailboxError
 from utils.rate_limit import human_delay
-from utils.telegram_errors import is_invalid_auth_error, short_error
+from utils.telegram_errors import is_frozen_error, is_invalid_auth_error, short_error
 
 EMAIL_OPERATION_OVERHEAD = 90.0
 EMAIL_SESSION_WAIT_TIMEOUT = 30.0
@@ -92,7 +93,110 @@ async def _run_email_operation(operation, code_timeout: float):
         raise
 
 
+
+
+def security_scan_candidates(accounts: list[AccountRecord], selected_ids: list[str]) -> list[AccountRecord]:
+    wanted = set(selected_ids)
+    return [account for account in accounts if account.enabled and (not wanted or account.id in wanted)]
+
+
+@dataclass
+class SecurityScanResult(ActionResult):
+    observations: dict[str, dict] = field(default_factory=dict)
+
+
 class AccountSecurityService:
+    async def scan_security(
+        self, accounts: list[AccountRecord], *, progress: OperationProgress | None = None,
+        stop_event: asyncio.Event | None = None,
+    ) -> ActionResult:
+        """Manual read-only Guard foundation, never an account recovery guarantee."""
+        result = SecurityScanResult()
+        # Preserve caller scope and order, ignore duplicate/disabled entries.
+        scoped = {account.id: account for account in accounts if account.enabled}
+        for account in scoped.values():
+            if stop_event is not None and stop_event.is_set():
+                break
+            freeze_meta: dict[str, object] = {}
+            try:
+                async with asyncio.timeout(60):
+                    async with create_client(self.config, account) as client:
+                        try:
+                            snapshot = await client.inspect_security()
+                        except Exception as inspect_exc:
+                            if is_frozen_error(inspect_exc) and hasattr(client, "get_app_config"):
+                                try:
+                                    app_cfg = await asyncio.wait_for(client.get_app_config(), timeout=10)
+                                    for key in ("freeze_since_date", "freeze_until_date", "freeze_appeal_url"):
+                                        if app_cfg.get(key):
+                                            freeze_meta[key] = app_cfg[key]
+                                except Exception:
+                                    pass
+                            raise
+                        if account.backend == "pyrogram" and hasattr(client, "client") and getattr(client, "client", None) is not None:
+                            try:
+                                from core.passkey_service import PasskeyService
+                                pk_dir = str(self.config.data_dir / "passkeys")
+                                pk_svc = PasskeyService(self.config.api_id, self.config.api_hash, passkeys_dir=pk_dir)
+                                remote_pks = await pk_svc.get_remote_passkeys(client.client)
+                                remote_ids = [str(getattr(pk, "id", "")) for pk in remote_pks if getattr(pk, "id", None)]
+                                local_id = None
+                                try:
+                                    local_id = str(pk_svc.load_passkey(account.id).get("passkey_id") or "")
+                                except FileNotFoundError:
+                                    local_id = None
+                                unknown_pks = [pid for pid in remote_ids if pid != local_id]
+                                snapshot["passkeys_count"] = len(remote_ids)
+                                snapshot["passkey_ids"] = remote_ids
+                                snapshot["unknown_passkeys"] = unknown_pks
+                            except Exception:
+                                pass
+                review = (
+                    snapshot["password_reset_pending"]
+                    or snapshot["other_sessions"] > 0
+                    or not snapshot["twofa_enabled"]
+                    or not snapshot["recovery_email_set"]
+                    or bool(snapshot.get("unknown_passkeys"))
+                )
+                snapshot.update(checked_at=utc_now_iso(), status="needs_review" if review else "observed")
+                self.accounts.update_profile_metadata(account.id, {"security_scan": snapshot, "security_scan_error": None})
+                result.add_ok(account.id)
+                result.observations[account.id] = snapshot
+                result.details[account.id] = (
+                    f"2FA={'on' if snapshot['twofa_enabled'] else 'off'}, "
+                    f"other sessions={snapshot['other_sessions']}, "
+                    f"unconfirmed={snapshot['unconfirmed_sessions']}, "
+                    f"passkeys={snapshot.get('passkeys_count', 0)}"
+                    f"{' (UNKNOWN!)' if snapshot.get('unknown_passkeys') else ''}, "
+                    f"2FA reset={'PENDING' if snapshot['password_reset_pending'] else 'not observed'}. "
+                    "Read-only; SIM ownership and account deletion protection are not verified."
+                )
+                self.log.info("%s: %s", account.id, result.details[account.id])
+                if progress:
+                    progress.mark_ok(account.id)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # Do not mark old observations fresh, disable, restore or delete
+                # accounts because a read-only scan timed out or was rate-limited.
+                err = short_error(exc)
+                result.add_error(account.id, err)
+                if is_frozen_error(exc):
+                    self.accounts.update_profile_metadata(account.id, {
+                        "health_status": "frozen",
+                        "health_checked_at": utc_now_iso(),
+                        "security_scan_error": {"at": utc_now_iso(), "kind": type(exc).__name__},
+                        **freeze_meta,
+                    })
+                    self.accounts.mark_error(account.id, err, disable=True)
+                else:
+                    self.accounts.update_profile_metadata(account.id, {
+                        "security_scan_error": {"at": utc_now_iso(), "kind": type(exc).__name__},
+                    })
+                if progress:
+                    progress.mark_error(account.id)
+        return result
+
     def __init__(self, config: AppConfig):
         self.config = config
         self.accounts = AccountService(config)
@@ -169,7 +273,11 @@ class AccountSecurityService:
                     await _with_network_retries(operation)
                     self.accounts.update_profile_metadata(
                         account.id,
-                        {"cloud_password": True, "cloud_password_checked_at": str(int(time.time()))},
+                        {
+                            "cloud_password": True,
+                            "cloud_password_val": None,
+                            "cloud_password_checked_at": str(int(time.time())),
+                        },
                     )
                     result.add_ok(account.id)
                     if progress:
@@ -180,7 +288,11 @@ class AccountSecurityService:
                     result.add_error(account.id, error)
                     if progress:
                         progress.mark_error(account.id)
-                    disable = is_invalid_auth_error(exc)
+                    disable = is_invalid_auth_error(exc) or is_frozen_error(exc)
+                    if is_frozen_error(exc):
+                        self.accounts.update_profile_metadata(
+                            account.id, {"health_status": "frozen", "health_checked_at": utc_now_iso()}
+                        )
                     self.accounts.mark_error(account.id, error, disable=disable)
                     self.log.error("Cloud password failed for %s: %s", account.id, error)
 
@@ -210,7 +322,11 @@ class AccountSecurityService:
                     await _with_network_retries(operation)
                     self.accounts.update_profile_metadata(
                         account.id,
-                        {"cloud_password": False, "cloud_password_checked_at": str(int(time.time()))},
+                        {
+                            "cloud_password": False,
+                            "cloud_password_val": None,
+                            "cloud_password_checked_at": str(int(time.time())),
+                        },
                     )
                     result.add_ok(account.id)
                     if progress:
@@ -221,7 +337,11 @@ class AccountSecurityService:
                     result.add_error(account.id, error)
                     if progress:
                         progress.mark_error(account.id)
-                    disable = is_invalid_auth_error(exc)
+                    disable = is_invalid_auth_error(exc) or is_frozen_error(exc)
+                    if is_frozen_error(exc):
+                        self.accounts.update_profile_metadata(
+                            account.id, {"health_status": "frozen", "health_checked_at": utc_now_iso()}
+                        )
                     self.accounts.mark_error(account.id, error, disable=disable)
                     self.log.error("Remove cloud password failed for %s: %s", account.id, error)
 
@@ -329,13 +449,17 @@ class AccountSecurityService:
                     if progress:
                         progress.mark_ok(account.id)
                     result.details[account.id] = f"passkey_id={res['passkey_id']}"
-                    self.log.info("Registered passkey for %s (ID: %s)", account.id, res["passkey_id"][:16])
+                    self.log.info("Registered passkey for %s", account.id)
                 except Exception as exc:
                     error = _security_error(exc)
                     result.add_error(account.id, error)
                     if progress:
                         progress.mark_error(account.id)
-                    disable = is_invalid_auth_error(exc)
+                    disable = is_invalid_auth_error(exc) or is_frozen_error(exc)
+                    if is_frozen_error(exc):
+                        self.accounts.update_profile_metadata(
+                            account.id, {"health_status": "frozen", "health_checked_at": utc_now_iso()}
+                        )
                     self.accounts.mark_error(account.id, error, disable=disable)
                     self.log.error("Add passkeys failed for %s: %s", account.id, error)
 
@@ -407,11 +531,11 @@ class AccountSecurityService:
 
                 try:
                     email = inbox.address_for(account.id)
-                    self.log.info("Binding recovery email for %s: %s", account.id, email)
+                    self.log.info("Binding recovery email for %s", account.id)
+                    await inbox.prepare(email)
+                    self.log.info("%s: mailbox ready; connecting to Telegram for recovery email", account.id)
 
                     async def operation() -> None:
-                        await inbox.prepare(email)
-                        self.log.info("%s: mailbox ready; connecting to Telegram for recovery email", account.id)
                         async with create_client(self.config, account, lock_wait_timeout=EMAIL_SESSION_WAIT_TIMEOUT) as client:
                             await client.set_recovery_email(
                                 email=email,
@@ -430,13 +554,17 @@ class AccountSecurityService:
                     if progress:
                         progress.mark_ok(account.id)
                     result.details[account.id] = email
-                    self.log.info("Recovery email bound for %s: %s", account.id, email)
+                    self.log.info("Recovery email bound for %s", account.id)
                 except Exception as exc:
                     error = _security_error(exc)
                     result.add_error(account.id, f"{email}: {error}")
                     if progress:
                         progress.mark_error(account.id)
-                    disable = is_invalid_auth_error(exc)
+                    disable = is_invalid_auth_error(exc) or is_frozen_error(exc)
+                    if is_frozen_error(exc):
+                        self.accounts.update_profile_metadata(
+                            account.id, {"health_status": "frozen", "health_checked_at": utc_now_iso()}
+                        )
                     if not isinstance(exc, AccountBusyError):
                         self.accounts.mark_error(account.id, error, disable=disable)
                     self.log.error("Recovery email failed for %s: %s", account.id, error)
@@ -475,11 +603,11 @@ class AccountSecurityService:
 
                 try:
                     email = inbox.address_for(account.id)
-                    self.log.info("Changing login email for %s: %s", account.id, email)
+                    self.log.info("Changing login email for %s", account.id)
+                    await inbox.prepare(email)
+                    self.log.info("%s: mailbox ready; connecting to Telegram for login email", account.id)
 
                     async def operation() -> None:
-                        await inbox.prepare(email)
-                        self.log.info("%s: mailbox ready; connecting to Telegram for login email", account.id)
                         async with create_client(self.config, account, lock_wait_timeout=EMAIL_SESSION_WAIT_TIMEOUT) as client:
                             await client.set_login_email(email=email, code_provider=code_provider)
 
@@ -496,7 +624,7 @@ class AccountSecurityService:
                     if progress:
                         progress.mark_ok(account.id)
                     result.details[account.id] = email
-                    self.log.info("Login email changed for %s: %s", account.id, email)
+                    self.log.info("Login email changed for %s", account.id)
                 except Exception as exc:
                     error = _security_error(exc)
                     if "EMAIL_NOT_SETUP" in f"{exc} {error}":
@@ -507,7 +635,11 @@ class AccountSecurityService:
                     result.add_error(account.id, f"{email}: {error}")
                     if progress:
                         progress.mark_error(account.id)
-                    disable = is_invalid_auth_error(exc)
+                    disable = is_invalid_auth_error(exc) or is_frozen_error(exc)
+                    if is_frozen_error(exc):
+                        self.accounts.update_profile_metadata(
+                            account.id, {"health_status": "frozen", "health_checked_at": utc_now_iso()}
+                        )
                     if not isinstance(exc, AccountBusyError):
                         self.accounts.mark_error(account.id, error, disable=disable)
                     self.log.error("Login email failed for %s: %s", account.id, error)

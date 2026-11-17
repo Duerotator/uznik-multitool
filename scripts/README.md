@@ -6,7 +6,7 @@
 там есть меню, запуск одиночного/пакетного входа и `batch_phones.txt`.
 Диагностика и пересоздание ярлыка — `windows/start_debug.bat` и
 `windows/create_shortcut.bat`. Код backend расположен в `app/`, зависимости —
-`config/requirements.txt`.
+`config/requirements.txt` (и `app/ui/finance/package.json` для WalletTg/TON).
 Для команд ниже используется `.venv\Scripts\python.exe`.
 
 | Папка / утилита | Назначение |
@@ -18,6 +18,8 @@
 | accounts/cleanup.py | Предпросмотр или очистка чатов/контактов с явным выбором аккаунтов |
 | accounts/dedupe.py | Предпросмотр дубликатов, удаление записей только с --execute; сессии сохраняются, база резервируется |
 | accounts/security.py | Регистрация / восстановление Passkey для явно перечисленных аккаунтов |
+| manage_financial_vault.py | Локальное создание, проверка статуса и шифрованное резервное копирование `financial_vault` без раскрытия сид-фраз |
+| marketapp_catalog.py | Однократное чтение каталога `api.marketapp.org` по явному `--confirm-provider-read` с токеном из vault или `MARKETAPP_API_TOKEN` |
 | profiles/download_avatar_pack.py | Загрузка по своему URL либо сортировка своих изображений |
 | network/check_setup.py | Локальная диагностика без подключения к сети и показа секретов |
 | prepare_layout.py | Создание недостающих пустых папок и шаблонов без перезаписи существующих |
@@ -35,18 +37,23 @@
 .\.venv\Scripts\python.exe scripts/sessions/batch_create_sessions.py --phones sessions/batch_phones.txt
 .\.venv\Scripts\python.exe scripts/accounts/cleanup.py --accounts YOUR_ACCOUNT_ID
 .\.venv\Scripts\python.exe scripts/accounts/security.py register-passkey --accounts YOUR_ACCOUNT_ID
+.\.venv\Scripts\python.exe scripts/manage_financial_vault.py --data-dir data status
+.\.venv\Scripts\python.exe scripts/marketapp_catalog.py --confirm-provider-read --limit 5
 .\.venv\Scripts\python.exe scripts/profiles/download_avatar_pack.py --organize-only
 ```
 
 У cleanup и security без `--execute` изменения не выполняются.
 Cleanup даже в dry-run **читает Telegram**, поэтому нужны свои ключи и доступ
 к Telegram (прямой или через настроенный прокси);
+`marketapp_catalog.py` требует явного `--confirm-provider-read`;
 предпросмотр остальных утилит без `--execute` выполняется локально.
 `--group inbox` означает весь список приложения, а не только группу без имени.
 Не запускайте очистку, пока не убедились в выбранных аккаунтах.
 
-Коды и 2FA никогда не заданы в исходниках, пароль вводится скрыто.
-Сторонние исходные сессии не удаляются при ошибке авторизации.
+Коды, 2FA и пароли резервных копий никогда не заданы в исходниках, пароль
+вводится скрыто. Сторонние исходные сессии не удаляются при ошибке авторизации.
+Личные или одноразовые локальные скрипты/журналы допускается хранить только в
+игнорируемой Git папке `_local/`.
 Ручная установка и диагностика: [docs/INSTALLATION.md](../docs/INSTALLATION.md).
 
 `releases/build_source_release.py` — для сопровождающих: исходный ZIP из точного

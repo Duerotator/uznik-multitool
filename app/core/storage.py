@@ -6,6 +6,7 @@ import logging
 import os
 import threading
 import time
+import uuid
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -23,8 +24,8 @@ def read_json(path: Path, default: Any) -> Any:
         try:
             with path.open("r", encoding="utf-8-sig") as file:
                 return json.load(file)
-        except PermissionError:
-            if attempt < 2:
+        except OSError as exc:
+            if (isinstance(exc, PermissionError) or getattr(exc, "winerror", None) in {5, 32}) and attempt < 2:
                 time.sleep(0.3 * (attempt + 1))
                 continue
             raise
@@ -37,7 +38,7 @@ def read_json(path: Path, default: Any) -> Any:
 def write_json_atomic(path: Path, data: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     lock = _write_lock(path)
-    temp_path = path.with_name(f"{path.name}.{threading.get_ident()}.tmp")
+    temp_path = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex[:8]}.tmp")
     with lock:
         try:
             with temp_path.open("w", encoding="utf-8") as file:

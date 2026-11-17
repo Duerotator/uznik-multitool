@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass, field
 from typing import Any
@@ -10,7 +11,11 @@ from core.results import ActionResult
 from core.telegram_client import create_client
 from core.ui_progress import OperationProgress
 from modules.accounts import AccountService
-from modules.raffle_common import configure_raffle_client, is_long_raffle_flood_wait, raffle_flood_skip_message
+from modules.raffle_common import (
+    RAFFLE_MAX_FLOOD_WAIT_SECONDS,
+    configure_raffle_client,
+    is_long_raffle_flood_wait,
+)
 from modules.raffle_random import extract_channel_targets, looks_like_post_link, normalize_post_link, unique_channels
 
 PROVIDER_LABELS: dict[str, str] = {
@@ -104,6 +109,7 @@ class GiveawayService:
         extra_channels: list[str] | None = None,
         probe_account: AccountRecord | None = None,
         probe_accounts: list[AccountRecord] | None = None,
+        stop_event: asyncio.Event | None = None,
     ) -> GiveawayInspection:
         raw = str(target or "").strip()
         if not raw:
@@ -119,32 +125,37 @@ class GiveawayService:
             if not candidates:
                 raise RuntimeError("No enabled account is available to inspect the giveaway post")
             for account in candidates:
+                if stop_event is not None and stop_event.is_set():
+                    raise asyncio.CancelledError("Giveaway inspection stopped")
                 try:
                     async with create_client(self.config, account) as client:
                         configure_raffle_client(client)
                         detail = await client.get_message_detail(post_link)
-                        
+
                         # Extract aggregator channels before following forward
                         aggregator_channels = extract_channel_targets(str(detail.get("text") or ""))
+                        for hidden_link in detail.get("hidden_links") or []:
+                            aggregator_channels.extend(extract_channel_targets(str(hidden_link)))
                         aggregator_chat = str(detail.get("chat_username") or detail.get("chat") or "")
                         if aggregator_chat:
                             aggregator_channels.append(aggregator_chat)
-                            
+
                         forward_post_link = str(detail.get("forward_post_link") or "").strip()
                         if forward_post_link and forward_post_link != post_link:
                             forward_detail = await client.get_message_detail(forward_post_link)
-                            if detect_giveaway_provider(forward_post_link, forward_detail)[0]:
+                            if detect_giveaway_provider(forward_post_link, forward_detail)[0] or requested != "auto":
                                 detail = forward_detail
                                 post_link = forward_post_link
                     probe_account_id = account.id
                     break
                 except Exception as exc:
-                    if not is_long_raffle_flood_wait(exc) and "database is locked" not in str(exc):
+                    if not is_long_raffle_flood_wait(exc) and "database is locked" not in str(exc).lower():
                         raise
                     log.warning("%s skipped while inspecting %s: %s", account.id, post_link, str(exc))
             else:
                 raise RuntimeError(
-                    f"All {len(candidates)} available inspection account(s) were skipped for FloodWait over 30s"
+                    f"All {len(candidates)} available inspection account(s) were skipped "
+                    f"(FloodWait over {RAFFLE_MAX_FLOOD_WAIT_SECONDS}s or locked session DB)"
                 )
 
         detected, button_text = detect_giveaway_provider(raw, detail)
@@ -185,28 +196,35 @@ class GiveawayService:
         provider: str = "auto",
         extra_channels: list[str] | None = None,
         progress: OperationProgress | None = None,
+        stop_event: asyncio.Event | None = None,
     ) -> ActionResult:
         enabled = [account for account in accounts if account.enabled]
         if not enabled:
             raise ValueError("No enabled accounts selected")
+        if stop_event is not None and stop_event.is_set():
+            return ActionResult()
         inspection = await self.inspect(
             target,
             provider=provider,
             extra_channels=extra_channels,
             probe_account=enabled[0],
             probe_accounts=enabled,
+            stop_event=stop_event,
         )
         log.info("Resolved giveaway: %s", inspection.summary())
         probe_account = next(
             (account for account in enabled if account.id == inspection.probe_account_id),
             enabled[0],
         )
+        merged_channels = unique_channels([*(extra_channels or []), *inspection.channels])
+        effective_target = inspection.post_link or target
         return await self._service(inspection.provider).participate(
             enabled,
-            target,
-            extra_channels=list(extra_channels or []),
+            effective_target,
+            extra_channels=merged_channels,
             progress=progress,
             probe_account=probe_account,
+            stop_event=stop_event,
         )
 
     def _service(self, provider: str):

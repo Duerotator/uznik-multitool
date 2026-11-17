@@ -25,7 +25,7 @@ class ProxyConfig:
     def from_url(cls, url: str | None) -> "ProxyConfig | None":
         if not url:
             return None
-        from urllib.parse import urlparse
+        from urllib.parse import unquote, urlparse
 
         parsed = urlparse(url)
         if not parsed.scheme or not parsed.hostname or not parsed.port:
@@ -34,13 +34,18 @@ class ProxyConfig:
             scheme=parsed.scheme,
             hostname=parsed.hostname,
             port=parsed.port,
-            username=parsed.username,
-            password=parsed.password,
+            username=unquote(parsed.username) if parsed.username else None,
+            password=unquote(parsed.password) if parsed.password else None,
         )
 
     def to_pyrogram(self) -> dict[str, Any]:
+        scheme = self.scheme.lower()
+        if scheme == "socks5h":
+            scheme = "socks5"
+        elif scheme == "https":
+            scheme = "http"
         result: dict[str, Any] = {
-            "scheme": self.scheme.replace("socks5h", "socks5"),
+            "scheme": scheme,
             "hostname": self.hostname,
             "port": self.port,
         }
@@ -53,8 +58,17 @@ class ProxyConfig:
     def to_telethon(self) -> tuple[Any, ...]:
         import socks
 
-        proxy_type = socks.SOCKS5 if self.scheme.startswith("socks5") else socks.HTTP
-        return (proxy_type, self.hostname, self.port, True, self.username, self.password)
+        scheme = self.scheme.lower()
+        if scheme in {"socks5", "socks5h"}:
+            proxy_type = socks.SOCKS5
+            rdns = True
+        elif scheme in {"socks4", "socks4a"}:
+            proxy_type = socks.SOCKS4
+            rdns = scheme == "socks4a"
+        else:
+            proxy_type = socks.HTTP
+            rdns = True
+        return (proxy_type, self.hostname, self.port, rdns, self.username, self.password)
 
 
 @dataclass

@@ -1,19 +1,22 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import random
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 from core.config import AppConfig
-from core.models import AccountRecord
+from core.models import AccountRecord, utc_now_iso
 from core.storage import read_json, update_json
 from core.telegram_client import AccountBusyError, create_client
 from modules.accounts import AccountService
+from modules.warmup_policy import WarmupPolicy, WarmupState
 from modules.warmup_settings import WarmupHistory, WarmupOptions, normalize_channels
-from utils.telegram_errors import flood_wait_seconds, is_invalid_auth_error, short_error
+from utils.telegram_errors import flood_wait_seconds, is_frozen_error, is_invalid_auth_error, short_error
 
 PERSONAS_FILE = Path("data/personas.json")
 MAX_ACTIONS_PER_HOUR = 20
@@ -72,8 +75,10 @@ class WarmupRateLimiter:
         self.max_per_hour, self.max_per_day = max_per_hour, max_per_day
         self.storage_path = storage_path
         data = read_json(storage_path, {}) if storage_path else {}
-        self.accounts: dict[str, list[float]] = data.get("accounts", {})
-        self.cooldowns: dict[str, float] = data.get("cooldowns", {})
+        self.accounts: dict[str, list[float]] = dict(data.get("accounts", {}))
+        self.cooldowns: dict[str, float] = dict(data.get("cooldowns", {}))
+        self._pending_attempts: dict[str, list[float]] = {}
+        self._dirty_cooldowns: set[str] = set()
 
     def _cleanup(self, account_id: str) -> None:
         now = time.time()
@@ -86,16 +91,42 @@ class WarmupRateLimiter:
     def record(self, account_id: str) -> None:
         if self.remaining(account_id) <= 0:
             raise WarmupBudgetExhausted("Warmup hourly/daily budget exhausted or account cooling down")
-        self.accounts.setdefault(account_id, []).append(time.time())
+        now = time.time()
+        self.accounts.setdefault(account_id, []).append(now)
+        self._pending_attempts.setdefault(account_id, []).append(now)
         self._save()
 
     def cooldown(self, account_id: str, seconds: float) -> None:
         self.cooldowns[account_id] = max(self.cooldowns.get(account_id, 0), time.time() + seconds)
+        self._dirty_cooldowns.add(account_id)
         self._save()
 
     def _save(self) -> None:
-        if self.storage_path:
-            update_json(self.storage_path, {}, lambda _: {"accounts": self.accounts, "cooldowns": self.cooldowns})
+        if not self.storage_path or (not self._pending_attempts and not self._dirty_cooldowns):
+            return
+        pending = {aid: list(times) for aid, times in self._pending_attempts.items() if times}
+        dirty_cd = set(self._dirty_cooldowns)
+
+        def mutate(disk: dict) -> dict:
+            now = time.time()
+            accounts = dict(disk.get("accounts") or {}) if isinstance(disk, dict) else {}
+            cooldowns = dict(disk.get("cooldowns") or {}) if isinstance(disk, dict) else {}
+            for aid, extra in pending.items():
+                merged = list(accounts.get(aid) or []) + extra
+                accounts[aid] = sorted(t for t in merged if now - t < 86400)
+            for aid in dirty_cd:
+                prev = float(cooldowns.get(aid, 0) or 0)
+                cooldowns[aid] = max(prev, float(self.cooldowns.get(aid, 0) or 0))
+            return {"accounts": accounts, "cooldowns": cooldowns}
+
+        merged = update_json(self.storage_path, {}, mutate)
+        for aid in pending:
+            self.accounts[aid] = list(merged.get("accounts", {}).get(aid, []))
+        for aid in dirty_cd:
+            if aid in merged.get("cooldowns", {}):
+                self.cooldowns[aid] = merged["cooldowns"][aid]
+        self._pending_attempts.clear()
+        self._dirty_cooldowns.clear()
 
     def remaining(self, account_id: str) -> int:
         self._cleanup(account_id)
@@ -137,8 +168,25 @@ class WarmupEngine:
     def __init__(self, config: AppConfig, *, scheduler=None, options: WarmupOptions | None = None, on_status=None):
         self.config = config
         self.accounts = AccountService(config)
-        self.options = (options or WarmupOptions.load(config.data_dir / "warmup_settings.json")).validate()
+        self.policy = self._load_policy(config.data_dir)
+        settings_path = config.data_dir / "warmup_settings.json"
+        if options is not None:
+            self.options = options.validate()
+        elif not settings_path.exists() and (config.data_dir / "warmup_policy.json").exists():
+            self.options = WarmupOptions(
+                channels=list(self.policy.channels),
+                posts_per_cycle=min(self.policy.posts_per_cycle, 6),
+                cycles=self.policy.cycles,
+                hourly_budget=min(self.policy.hourly_budget, 100),
+                daily_budget=min(self.policy.daily_budget, 1000),
+                reactions=self.policy.reactions,
+                save_posts=self.policy.save_posts,
+                join_channels=self.policy.join_channels,
+            ).validate()
+        else:
+            self.options = WarmupOptions.load(settings_path).validate()
         self.personas = None if self.options.channels else PersonaStore(config.data_dir / "personas.json")
+        self.state = WarmupState(config.data_dir) if self.policy.channel_pool else None
         self.history = WarmupHistory(config.data_dir / "warmup_history.json")
         self.limiter = WarmupRateLimiter(self.options.hourly_budget, config.data_dir / "warmup_limits.json",
                                         max_per_day=self.options.daily_budget)
@@ -149,12 +197,30 @@ class WarmupEngine:
         self._statuses = {}
         self.log = logging.getLogger("warmup")
 
+    @staticmethod
+    def _load_policy(data_dir: Path) -> WarmupPolicy:
+        try:
+            return WarmupPolicy.load(data_dir)
+        except Exception:
+            return WarmupPolicy()
+
     def channels_for(self, account: AccountRecord) -> list[str]:
-        # Explicit UI list wins. Otherwise only the account's assigned template is used.
+        # Explicit UI list wins. Otherwise only the account's assigned template/policy is used.
         if self.options.channels:
             return list(self.options.channels)
-        persona = self.personas.get(account.persona)
-        return list(persona.channels) if persona else []
+        personas = getattr(self, "personas", None)
+        persona = personas.get(account.persona) if personas else None
+        if persona:
+            return list(persona.channels)
+        policy = getattr(self, "policy", None)
+        if policy and policy.channel_pool:
+            key = str(getattr(account, "persona", "") or "").strip().casefold()
+            if (key and key in policy.channel_topics) or (not key and policy.channels):
+                state = getattr(self, "state", None)
+                if state is not None:
+                    return state.channels_for(account.id, policy, getattr(account, "persona", None))
+                return list(policy.candidates_for(getattr(account, "persona", None)))
+        return []
 
     def validate_accounts(self, accounts: list[AccountRecord]) -> None:
         missing = sum(not self.channels_for(account) for account in accounts if account.enabled)
@@ -180,7 +246,9 @@ class WarmupEngine:
             raise ValueError("Warmup has no configured channels.")
         deadline = time.monotonic() + SESSION_MAX_MINUTES * 60
         active_slots = semaphore or asyncio.Semaphore(1)
-        failures, cursor = 0, 0
+        ordered_channels = list(channels)
+        random.shuffle(ordered_channels)
+        failures, cursor, prev_channel = 0, 0, None
         try:
             while not stop_event.is_set() and account.enabled and time.monotonic() < deadline:
                 if self.options.cycles and stats["cycles"] >= self.options.cycles:
@@ -200,12 +268,18 @@ class WarmupEngine:
                         break
                     await self._wait(stop_event, min(max(wait, 1), 600, deadline - time.monotonic()))
                     continue
-                available = [ch for ch in channels if self.history.available(account.id, ch)]
+                available = [ch for ch in ordered_channels if self.history.available(account.id, ch)]
                 if not available:
                     stats["skipped"] += 1
                     self._report(account.id, "All channels temporarily unavailable; deferred", stats)
                     break
+                if cursor > 0 and cursor % len(available) == 0 and len(available) > 1:
+                    random.shuffle(ordered_channels)
+                    available = [ch for ch in ordered_channels if self.history.available(account.id, ch)]
+                    if available[0] == prev_channel and len(available) > 1:
+                        available.append(available.pop(0))
                 channel = available[cursor % len(available)]
+                prev_channel = channel
                 cursor += 1
                 self._report(account.id, f"Queued: @{channel}", stats)
                 await self._wait(stop_event, min(random.uniform(BROWSE_DELAY_MIN, BROWSE_DELAY_MAX), deadline - time.monotonic()))
@@ -225,8 +299,12 @@ class WarmupEngine:
                                     setattr(native, attr, 0)
                             self._report(account.id, f"Reading @{channel}", stats)
                             errors_before = stats["errors"]
-                            await self._simulate_browser(_BudgetedClient(client, self.limiter, account.id, stop_event),
-                                                         account, channel, stats)
+                            await self._simulate_browser(
+                                _BudgetedClient(client, self.limiter, account.id, stop_event),
+                                account,
+                                channel,
+                                stats,
+                            )
                             failures = failures + 1 if stats["errors"] > errors_before else 0
                 except AccountBusyError:
                     self._report(account.id, "Session busy; deferred", stats)
@@ -235,7 +313,7 @@ class WarmupEngine:
                     self._report(account.id, "Budget exhausted; deferred", stats)
                     stats["skipped"] += 1
                 except Exception as exc:
-                    if is_invalid_auth_error(exc):
+                    if is_invalid_auth_error(exc) or is_frozen_error(exc):
                         raise
                     stats["errors"] += 1
                     failures += 1
@@ -262,11 +340,21 @@ class WarmupEngine:
         except asyncio.CancelledError:
             pass  # Return partial successful counts when Stop cancels active work.
         except Exception as exc:
-            if is_invalid_auth_error(exc):
-                self.accounts.mark_error(account.id, short_error(exc), disable=True)
+            err = short_error(exc)
+            if is_frozen_error(exc):
+                self.accounts.update_profile_metadata(
+                    account.id,
+                    {"health_status": "frozen", "health_checked_at": utc_now_iso()},
+                )
+                self.accounts.mark_error(account.id, err, disable=True)
+                account.enabled = False
+                self.log.warning("%s frozen during Warmup, disabled (session preserved): %s", account.id, err)
+            elif is_invalid_auth_error(exc):
+                self.accounts.mark_error(account.id, err, disable=True)
                 account.enabled = False
             stats["errors"] += 1
-            self.log.error("%s: Warmup failed: %s", account.id, short_error(exc))
+            if not is_frozen_error(exc):
+                self.log.error("%s: Warmup failed: %s", account.id, err)
         if not stop_event.is_set() and self.options.cycles and stats["cycles"] < self.options.cycles:
             stats["skipped"] += 1
         return stats
@@ -288,8 +376,23 @@ class WarmupEngine:
         return list(dict.fromkeys(f"https://t.me/{channel}/{message['id']}"
                                   for message in messages if message.get("id")))
 
-    async def _simulate_browser(self, client, account: AccountRecord, channel: str, stats: dict[str, int]) -> None:
+    @staticmethod
+    def _has_async_method(client, name: str) -> bool:
+        target = client.client if isinstance(client, _BudgetedClient) else client
+        method = getattr(target, name, None)
+        return inspect.iscoroutinefunction(method) or isinstance(method, AsyncMock)
+
+    async def _simulate_browser(
+        self,
+        client,
+        account: AccountRecord,
+        channel: str,
+        stats: dict[str, int],
+        *,
+        stop_event: asyncio.Event | None = None,
+    ) -> None:
         # Historical method name retained for compatibility; these are MTProto reads, not browser emulation.
+        wait_stop = stop_event or (client.stop_event if isinstance(client, _BudgetedClient) else None) or asyncio.Event()
         if self.options.join_channels and not self.history.joined(account.id, channel):
             await client.join_chat(channel)
             self.history.record_join(account.id, channel)
@@ -297,18 +400,36 @@ class WarmupEngine:
         links = await self._recent_post_links(client, channel, limit=20)
         fresh = [link for link in links if not self.history.done(account.id, link, "viewed")]
         viewed = []
-        for link in fresh[:self.options.posts_per_cycle]:
+        max_viewed_id = 0
+        for idx, link in enumerate(fresh[:self.options.posts_per_cycle]):
+            if wait_stop.is_set():
+                raise asyncio.CancelledError
+            if idx > 0:
+                await self._wait(wait_stop, random.uniform(1.8, 4.5))
+                if wait_stop.is_set():
+                    raise asyncio.CancelledError
             try:
                 await client.view_post(link)
                 self.history.record(account.id, link, "viewed")
                 viewed.append(link)
                 stats["viewed"] += 1
+                try:
+                    max_viewed_id = max(max_viewed_id, int(link.rstrip("/").rsplit("/", 1)[-1]))
+                except (TypeError, ValueError):
+                    pass
                 self._report(account.id, f"Viewed {link}", stats)
             except Exception as exc:
                 if self._must_stop_cycle(exc) or self._unavailable_channel(exc):
                     raise
                 stats["errors"] += 1
                 self.log.warning("%s: view failed: %s", account.id, short_error(exc))
+        if max_viewed_id > 0 and self._has_async_method(client, "read_history"):
+            try:
+                await client.read_history(channel, max_id=max_viewed_id)
+            except Exception as exc:
+                if self._must_stop_cycle(exc):
+                    raise
+                self.log.debug("%s: read_history @%s skipped: %s", account.id, channel, short_error(exc))
         if not fresh:
             stats["skipped"] += 1
             self.log.info("%s: @%s has no new readable posts", account.id, channel)
@@ -321,8 +442,14 @@ class WarmupEngine:
             if link is None:
                 continue
             try:
+                await self._wait(wait_stop, random.uniform(1.0, 2.5))
+                if wait_stop.is_set():
+                    raise asyncio.CancelledError
                 if action == "reacted":
                     await client.random_reaction(link, mark_viewed=False)
+                elif self._has_async_method(client, "forward_messages"):
+                    msg_id = int(link.rstrip("/").rsplit("/", 1)[-1])
+                    await client.forward_messages("me", channel, msg_id)
                 else:
                     await client.send_message("me", link)
                 self.history.record(account.id, link, action)
@@ -335,7 +462,12 @@ class WarmupEngine:
 
     @staticmethod
     def _must_stop_cycle(exc: Exception) -> bool:
-        return isinstance(exc, WarmupBudgetExhausted) or flood_wait_seconds(exc) is not None or is_invalid_auth_error(exc)
+        return (
+            isinstance(exc, WarmupBudgetExhausted)
+            or flood_wait_seconds(exc) is not None
+            or is_invalid_auth_error(exc)
+            or is_frozen_error(exc)
+        )
 
     async def run_for_group(self, group: str, stop_event: asyncio.Event, *, accounts=None) -> dict[str, dict[str, int]]:
         accounts = self.accounts.list_accounts(group=group, enabled_only=True) if accounts is None else [a for a in accounts if a.enabled]

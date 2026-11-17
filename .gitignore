@@ -3,6 +3,8 @@
 .env.*
 !config/.env.example
 .vpn-gateway.env
+_local/
+unknown_errors.txt
 data/**
 !data/**/
 !data/**/.gitkeep
@@ -14,6 +16,8 @@ imports/**
 sessions/batch_phones.txt
 .venv/
 venv/
+app/ui/finance/node_modules/
+node_modules/
 templates/*
 !templates/README.md
 assets/avatar_packs/**
@@ -42,5 +46,5 @@ __pycache__/
 .ruff_cache/
 .idea/
 .vscode/
-build/
-dist/
+/build/
+/dist/

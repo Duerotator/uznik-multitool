@@ -16,8 +16,8 @@ from pathlib import Path
 
 # Keep this in sync with the application imports and config/requirements.txt.
 REQUIRED_MODULES = (
-    "pyrogram", "tgcrypto", "telethon", "PySide6.QtWidgets", "dotenv",
-    "httpx", "socks", "socksio", "gdown", "psutil", "playwright.sync_api",
+    "pyrogram", "kuricrypt", "telethon", "cryptg", "PySide6.QtWidgets", "dotenv",
+    "httpx", "socks", "python_socks", "gdown", "psutil", "playwright.sync_api",
     "PIL", "numpy", "zxingcpp", "ddddocr", "onnxruntime", "cv2",
     "cbor2", "cryptography.hazmat.primitives.asymmetric.ec",
 )
@@ -38,10 +38,10 @@ def namespace_errors() -> list[str]:
         errors.append("Use standard (not free-threaded) CPython 3.12-3.14 x64 for this environment.")
     # Stale distribution metadata is unsafe: later uninstalls can delete the
     # active fork's files. Never silently uninstall user's packages.
-    for name in ("Pyrogram", "Pyrofork", "TgCrypto"):
+    for name in ("Pyrogram", "Pyrofork", "TgCrypto", "TgCrypto-pyrofork"):
         if installed_version(name):
             errors.append(f"Conflicting package {name}: remove it from this project's .venv, then rerun setup.bat. "
-                          "The supported providers are Kurigram and TgCrypto-pyrofork.")
+                          "The supported providers are Kurigram, kuricrypt, Telethon and cryptg.")
     return errors
 
 
@@ -69,13 +69,33 @@ def find_native_tool(name: str) -> str | None:
 
 
 def check_crypto() -> None:
-    import tgcrypto
-    from pyrogram.crypto import aes
+    import cryptg
+    import kuricrypt
+    from pyrogram.crypto import aes as pyro_aes
+    from telethon.crypto import aes as tele_aes
+
     data, key, iv = bytes(range(64)), bytes(range(32)), bytes(range(32))
-    if tgcrypto.ige256_decrypt(tgcrypto.ige256_encrypt(data, key, iv), key, iv) != data:
-        raise RuntimeError("TgCrypto AES round-trip failed")
-    if getattr(aes, "tgcrypto", None) is not tgcrypto:
-        raise RuntimeError("Kurigram is not using TgCrypto acceleration")
+    if kuricrypt.ige256_decrypt(kuricrypt.ige256_encrypt(data, key, iv), key, iv) != data:
+        raise RuntimeError("kuricrypt AES round-trip failed")
+    if getattr(pyro_aes, "_crypto_backend", None) is not kuricrypt:
+        raise RuntimeError("Kurigram is not using kuricrypt acceleration")
+    if cryptg.decrypt_ige(cryptg.encrypt_ige(data, key, iv), key, iv) != data:
+        raise RuntimeError("cryptg AES round-trip failed")
+    if getattr(tele_aes, "cryptg", None) is not cryptg:
+        raise RuntimeError("Telethon is not using cryptg acceleration")
+
+
+def check_node() -> None:
+    node = find_native_tool("node")
+    if not node:
+        raise RuntimeError("Node.js was not found on PATH")
+    subprocess.run([node, "--version"], check=True, timeout=10,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    finance_dir = Path(__file__).resolve().parents[1] / "app/ui/finance"
+    if not (finance_dir / "dist/money.js").is_file():
+        raise RuntimeError("Finance UI bundle app/ui/finance/dist/money.js is missing")
+    if not (finance_dir / "node_modules/@ton/core/package.json").is_file():
+        raise RuntimeError("Finance Node dependencies (app/ui/finance/node_modules) are not installed")
 
 
 def check_browser() -> None:
@@ -112,7 +132,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"ERROR: {error}")
         return int(bool(errors))
 
-    for name in ("Kurigram", "TgCrypto-pyrofork"):
+    for name in ("Kurigram", "kuricrypt", "Telethon", "cryptg"):
         version = installed_version(name)
         print(f"{name}: {version or 'MISSING'}")
         if not version:
@@ -122,7 +142,11 @@ def main(argv: list[str] | None = None) -> int:
             importlib.import_module(module)
         except Exception as exc:
             errors.append(f"Cannot import {module}: {type(exc).__name__}: {exc}")
-    for label, check in (("MTProto acceleration", check_crypto), ("Chromium", check_browser)):
+    for label, check in (
+        ("MTProto acceleration", check_crypto),
+        ("Chromium", check_browser),
+        ("Node.js / Finance UI", check_node),
+    ):
         try:
             check()
             print(f"{label}: OK")

@@ -83,7 +83,7 @@ def filter_accounts(
             account.first_name, account.last_name,
         )).casefold():
             continue
-        region = detect_phone_region(account.phone or account.label)
+        region = detect_phone_region(account.phone)
         country = region.country if region else "unknown"
         if spec.country != "any" and country != spec.country:
             continue
@@ -126,7 +126,7 @@ def effective_proxy(account: AccountRecord, global_proxy: str | None = None) -> 
 
 def country_options(accounts: Iterable[AccountRecord]) -> list[dict[str, Any]]:
     counts = Counter(
-        (region.country if (region := detect_phone_region(a.phone or a.label)) else "unknown")
+        (region.country if (region := detect_phone_region(a.phone)) else "unknown")
         for a in accounts
     )
     return [
@@ -148,6 +148,8 @@ def _matches_presence(expected: str, value: Any) -> bool:
 def _validity(account: AccountRecord) -> str:
     metadata = account.metadata or {}
     status = str(metadata.get("health_status") or "").lower()
+    if status == "frozen":
+        return "frozen"
     if status == "valid":
         return "valid"
     if status in {"invalid", "error"} or metadata.get("last_error"):

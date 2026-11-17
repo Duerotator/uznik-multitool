@@ -171,10 +171,15 @@ class _HTMLText(HTMLParser):
             self.parts.append(data)
 
 
+def _is_telegram_sender(address: str) -> bool:
+    domain = address.rsplit("@", 1)[-1].lower()
+    return domain == "telegram.org" or domain.endswith(".telegram.org")
+
+
 def telegram_code(raw: bytes, email: str, after: int, length: int | None) -> str | None:
     message = message_from_bytes(raw, policy=policy.default)
     senders = getaddresses(message.get_all("From", []))
-    if not any(address.rsplit("@", 1)[-1].lower() == "telegram.org" for _, address in senders):
+    if not any(_is_telegram_sender(address) for _, address in senders):
         return None
     recipients = getaddresses(message.get_all("To", []) + message.get_all("Delivered-To", []))
     if recipients and email.lower() not in {address.lower() for _, address in recipients}:
@@ -200,9 +205,22 @@ def telegram_code(raw: bytes, email: str, after: int, length: int | None) -> str
             text = "\n".join(parser.parts)
         texts.append(text)
     for text in texts:
-        codes = list(dict.fromkeys(code for code in CODE_RE.findall(text) if not length or len(code) == length))
-        if len(codes) == 1:
-            return codes[0]
+        if length:
+            codes = list(dict.fromkeys(code for code in CODE_RE.findall(text) if len(code) == length))
+            if len(codes) == 1:
+                return codes[0]
+            continue
+        raw_codes = list(dict.fromkeys(CODE_RE.findall(text)))
+        if len(raw_codes) == 1:
+            return raw_codes[0]
+        # Telegram verification emails use 5-6 digit codes and often include copyright years (e.g. 2026).
+        long_codes = [c for c in raw_codes if 5 <= len(c) <= 8]
+        if len(long_codes) == 1:
+            return long_codes[0]
+        if not long_codes:
+            non_years = [c for c in raw_codes if not (len(c) == 4 and 1990 <= int(c) <= 2099)]
+            if len(non_years) == 1:
+                return non_years[0]
     return None
 
 
@@ -276,7 +294,7 @@ class MailboxInboxClient:
         with self._connection(box, deadline) as connection:
             if self.protocol == "pop3":
                 _, lines, _ = self._call(connection, deadline, connection.uidl)
-                return frozenset(line.split()[1] for line in lines)
+                return frozenset(parts[1] for line in lines if len(parts := line.split()) >= 2)
             _, validity = connection.response("UIDVALIDITY")
             _, next_uid = connection.response("UIDNEXT")
             if not validity or not next_uid or not validity[0] or not next_uid[0]:
@@ -303,7 +321,11 @@ class MailboxInboxClient:
         with self._connection(box, deadline) as connection:
             if self.protocol == "pop3":
                 _, lines, _ = self._call(connection, deadline, connection.uidl)
-                fresh = [(int(line.split()[0]), line.split()[1]) for line in lines if line.split()[1] not in baseline]
+                fresh = [
+                    (int(parts[0]), parts[1])
+                    for line in lines
+                    if len(parts := line.split()) >= 2 and parts[1] not in baseline
+                ]
                 for number, _uid in sorted(fresh, reverse=True)[:25]:
                     size_response = self._call(connection, deadline, connection.list, number)
                     if int(size_response.split()[-1]) > 512_000:
@@ -317,7 +339,7 @@ class MailboxInboxClient:
                         return code
             else:
                 _, validity = connection.response("UIDVALIDITY")
-                if not validity or int(validity[0]) != baseline[0]:
+                if not validity or not validity[0] or int(validity[0]) != baseline[0]:
                     raise MailboxError("Mailbox UIDVALIDITY changed; restart the operation before requesting another code.")
                 status, data = self._call(connection, deadline, connection.uid, "search", None, f"UID {baseline[1] + 1}:*")
                 if status != "OK":

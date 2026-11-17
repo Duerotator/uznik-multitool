@@ -36,6 +36,19 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+  secret-scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: trufflesecurity/trufflehog@ea68ca03c865c5f324e86e849ced20ed3cf9dbbb # v3.99.8
+        with:
+          path: ./
+          extra_args: --results=verified,unknown
+
   dependencies-and-tests:
     runs-on: windows-latest
     timeout-minutes: 30
@@ -46,6 +59,17 @@ jobs:
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.14'
+      - uses: actions/setup-node@249970729cb0ef3589644e2896644e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: '24'
+          cache: 'npm'
+          cache-dependency-path: 'app/ui/finance/package-lock.json'
+      - name: Install and build Node wallet codec/UI assets
+        run: |
+          npm --prefix app/ui/finance ci
+          npm --prefix app/ui/finance run build
+      - name: Audit Node dependencies
+        run: npm --prefix app/ui/finance audit --audit-level=high
       - name: Install application dependencies in isolated environment
         run: |
           python -m venv .venv
@@ -53,6 +77,8 @@ jobs:
           .\.venv\Scripts\python.exe -m pip check
       - name: Offline regression tests (no account credentials)
         run: .\.venv\Scripts\python.exe tests/run_checks.py fast
+      - name: Offscreen Qt desktop smoke check
+        run: .\.venv\Scripts\python.exe tests/smoke_desktop.py
       - name: Install auditor separately
         if: always()
         run: python -m pip install pip-audit

@@ -124,7 +124,7 @@ def _download_until_limit(
         use_cookies=False,
         skip_download=True,
         resume=True,
-    )
+    ) or []
 
     failed = 0
     usable = _count_usable_images(raw_dir, include_terms)
@@ -133,7 +133,11 @@ def _download_until_limit(
         if usable >= max_files:
             return True
 
-        local_path = Path(item.local_path)
+        raw_local = getattr(item, "local_path", item)
+        item_id = getattr(item, "id", None)
+        if not raw_local or not item_id:
+            continue
+        local_path = Path(raw_local)
         if local_path.suffix.lower() not in IMAGE_EXTENSIONS:
             continue
         if local_path.exists() and local_path.stat().st_size > 0:
@@ -144,19 +148,20 @@ def _download_until_limit(
         local_path.parent.mkdir(parents=True, exist_ok=True)
         try:
             gdown.download(
-                url=f"https://drive.google.com/uc?id={item.id}",
+                url=f"https://drive.google.com/uc?id={item_id}",
                 output=str(local_path),
                 quiet=False,
                 use_cookies=False,
                 resume=True,
             )
+            if local_path.exists() and local_path.stat().st_size > 0:
+                usable += 1
         except Exception as exc:  # noqa: BLE001 - bad Drive files should not stop the pack
             failed += 1
             print(
-                f"Skipped Google Drive file {item.id} ({item.path}): {exc}",
+                f"Skipped Google Drive file {item_id} ({getattr(item, 'path', local_path)}): {exc}",
                 flush=True,
             )
-        usable = _count_usable_images(raw_dir, include_terms)
 
     print(f"Usable avatar images found: {usable}/{max_files}", flush=True)
     if failed:

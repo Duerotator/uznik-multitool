@@ -37,6 +37,18 @@ Invoke-Checked $venvPython @('-m', 'pip', 'install', '--upgrade', 'pip')
 Invoke-Checked $venvPython @('-m', 'pip', 'install', '-r', (Join-Path $projectRoot 'config\requirements.txt'))
 Invoke-Checked $venvPython @('-m', 'pip', 'check')
 Invoke-Checked $venvPython @('-m', 'playwright', 'install', 'chromium')
+$financeDir = Join-Path $projectRoot 'app\ui\finance'
+if (Test-Path -LiteralPath (Join-Path $financeDir 'package.json')) {
+    $npmCmd = Get-Command npm -CommandType Application -ErrorAction SilentlyContinue
+    if (-not $npmCmd) { throw 'Node.js / npm is required for app/ui/finance. Install Node.js 18+ and run setup.bat again.' }
+    $lockFile = Join-Path $financeDir 'package-lock.json'
+    if (Test-Path -LiteralPath $lockFile) {
+        Invoke-Checked $npmCmd.Source @('--prefix', $financeDir, 'ci')
+    } else {
+        Invoke-Checked $npmCmd.Source @('--prefix', $financeDir, 'install')
+    }
+    Invoke-Checked $npmCmd.Source @('--prefix', $financeDir, 'run', 'build')
+}
 if (-not $SkipNativeTools) {
     & (Join-Path $PSScriptRoot 'windows\install_native_tools.ps1')
 }

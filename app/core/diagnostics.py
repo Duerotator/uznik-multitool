@@ -14,38 +14,59 @@ from typing import Any
 
 logger = logging.getLogger("diagnostics")
 
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+_LOGS_DIR: Path | None = None
 _RESOURCE_SNAPSHOTS: deque[dict[str, Any]] = deque(maxlen=720)
 _monitor_task: asyncio.Task | None = None
 _monitor_stop: asyncio.Event | None = None
 _installed = False
 
 
+def set_diagnostics_logs_dir(logs_dir: Path | str) -> None:
+    global _LOGS_DIR
+    _LOGS_DIR = Path(logs_dir)
+
+
+def _redact(text: str) -> str:
+    try:
+        from core.logging_setup import redact_secrets
+        return redact_secrets(text)
+    except Exception:
+        return text
+
+
+def _asyncio_exception_handler(loop: asyncio.AbstractEventLoop, context: dict) -> None:
+    message = _redact(str(context.get("message", "Unknown async error")))
+    exception = context.get("exception")
+    task = context.get("task")
+    if exception is not None:
+        tb = _redact("".join(traceback.format_exception(type(exception), exception, exception.__traceback__)))
+        logger.critical(
+            "ASYNC LOOP ERROR | task=%s | %s\n%s",
+            getattr(task, "get_name", lambda: "?")(),
+            message,
+            tb,
+        )
+    else:
+        logger.critical("ASYNC LOOP ERROR | %s", message)
+
+
+def install_loop_exception_handler(loop: asyncio.AbstractEventLoop | None = None) -> bool:
+    """Attach the async loop exception handler if an event loop is available."""
+    try:
+        target = loop or asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    target.set_exception_handler(_asyncio_exception_handler)
+    return True
+
+
 def install_global_exception_handler() -> None:
     global _installed
+    install_loop_exception_handler()
     if _installed:
         return
     _installed = True
-
-    def _asyncio_handler(loop: asyncio.AbstractEventLoop, context: dict) -> None:
-        message = context.get("message", "Unknown async error")
-        exception = context.get("exception")
-        task = context.get("task")
-        if exception is not None:
-            tb = "".join(traceback.format_exception(type(exception), exception, exception.__traceback__))
-            logger.critical(
-                "ASYNC LOOP ERROR | task=%s | %s\n%s",
-                getattr(task, "get_name", lambda: "?")(),
-                message,
-                tb,
-            )
-        else:
-            logger.critical("ASYNC LOOP ERROR | %s", message)
-
-    try:
-        loop = asyncio.get_running_loop()
-        loop.set_exception_handler(_asyncio_handler)
-    except RuntimeError:
-        pass
 
     original_excepthook = sys.excepthook
 
@@ -53,7 +74,7 @@ def install_global_exception_handler() -> None:
         if issubclass(exc_type, KeyboardInterrupt):
             original_excepthook(exc_type, exc_value, exc_tb)
             return
-        tb_text = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+        tb_text = _redact("".join(traceback.format_exception(exc_type, exc_value, exc_tb)))
         logger.critical("UNCAUGHT EXCEPTION (sys.excepthook):\n%s", tb_text)
         _emergency_dump("sys_excepthook", exc_type, exc_value, exc_tb)
         original_excepthook(exc_type, exc_value, exc_tb)
@@ -64,7 +85,7 @@ def install_global_exception_handler() -> None:
         original_thread_hook = threading.excepthook
 
         def _thread_excepthook(args):  # type: ignore[no-untyped-def]
-            tb_text = "".join(traceback.format_exception(args.exc_type, args.exc_value, args.exc_traceback))
+            tb_text = _redact("".join(traceback.format_exception(args.exc_type, args.exc_value, args.exc_traceback)))
             logger.critical(
                 "UNCAUGHT THREAD EXCEPTION in %s:\n%s",
                 getattr(args, "thread", "?"),
@@ -84,8 +105,10 @@ def _emergency_dump(source: str, exc_type: type, exc_value: BaseException, exc_t
 
         proc = psutil.Process(os.getpid())
         mem_info = proc.memory_info()
-        dump_path = Path("data") / "logs" / "crash_dump.log"
+        logs_dir = _LOGS_DIR if _LOGS_DIR is not None else (_PROJECT_ROOT / "data" / "logs")
+        dump_path = logs_dir / "crash_dump.log"
         dump_path.parent.mkdir(parents=True, exist_ok=True)
+        tb_text = _redact("".join(traceback.format_exception(exc_type, exc_value, exc_tb)))
         with dump_path.open("a", encoding="utf-8") as f:
             f.write(f"\n{'=' * 60}\n")
             f.write(f"CRASH DUMP | {time.strftime('%Y-%m-%d %H:%M:%S')} | source={source}\n")
@@ -102,8 +125,10 @@ def _emergency_dump(source: str, exc_type: type, exc_value: BaseException, exc_t
             f.write(f"Threads: {threading.active_count()}\n")
             for t in threading.enumerate():
                 f.write(f"  thread: {t.name} daemon={t.daemon} alive={t.is_alive()}\n")
-            f.write(f"\nException:\n")
-            traceback.print_exception(exc_type, exc_value, exc_tb, file=f)
+            f.write("\nException:\n")
+            f.write(tb_text)
+            if not tb_text.endswith("\n"):
+                f.write("\n")
             f.write(f"{'=' * 60}\n")
         logger.error("Crash dump written to %s", dump_path)
     except Exception as dump_exc:
@@ -176,6 +201,8 @@ class ResourceMonitor:
 
                 logger.log(level, msg, *args)
 
+            except asyncio.CancelledError:
+                raise
             except Exception:
                 logger.debug("Resource monitor tick failed", exc_info=True)
 
@@ -209,18 +236,37 @@ class ResourceMonitor:
 
 
 class ProxyDiagnostics:
+    _MAX_CONNECTIONS = 512
+    _STALE_SECONDS = 300.0
+
     def __init__(self) -> None:
         self.log = logging.getLogger("proxy-diag")
         self._connections: dict[str, dict[str, Any]] = {}
+        self._lock = threading.Lock()
+
+    def _prune_locked(self, now: float) -> None:
+        if len(self._connections) < self._MAX_CONNECTIONS:
+            return
+        stale = [k for k, v in self._connections.items() if (now - v.get("start", now)) > self._STALE_SECONDS]
+        for k in stale:
+            self._connections.pop(k, None)
+        while len(self._connections) >= self._MAX_CONNECTIONS:
+            oldest = next(iter(self._connections))
+            self._connections.pop(oldest, None)
 
     def trace_connect(self, ip: str, port: int, protocol: str, tag: str = "") -> None:
         key = f"{ip}:{port}/{protocol}"
-        self._connections[key] = {"start": time.monotonic(), "tag": tag}
+        now = time.monotonic()
+        with self._lock:
+            self._prune_locked(now)
+            self._connections.pop(key, None)
+            self._connections[key] = {"start": now, "tag": tag}
         self.log.debug("[CONNECT] %s tag=%s", key, tag)
 
     def trace_handshake(self, ip: str, port: int, protocol: str, ok: bool, latency: float = 0.0) -> None:
         key = f"{ip}:{port}/{protocol}"
-        info = self._connections.pop(key, {})
+        with self._lock:
+            info = self._connections.pop(key, {})
         elapsed = time.monotonic() - info.get("start", time.monotonic())
         status = "OK" if ok else "FAIL"
         self.log.info(
@@ -230,22 +276,26 @@ class ProxyDiagnostics:
 
     def trace_timeout(self, ip: str, port: int, protocol: str, timeout: float) -> None:
         key = f"{ip}:{port}/{protocol}"
-        self._connections.pop(key, None)
+        with self._lock:
+            self._connections.pop(key, None)
         self.log.warning("[TIMEOUT] %s after %.1fs", key, timeout)
 
     def trace_error(self, ip: str, port: int, protocol: str, error: Exception) -> None:
         key = f"{ip}:{port}/{protocol}"
-        self._connections.pop(key, None)
-        self.log.warning("[ERROR] %s: %s: %s", key, type(error).__name__, error)
+        with self._lock:
+            self._connections.pop(key, None)
+        self.log.warning("[ERROR] %s: %s: %s", key, type(error).__name__, _redact(str(error)))
 
     def trace_replace_proxy(self, account_id: str, old_proxy: str | None, new_proxy: str | None) -> None:
         self.log.info(
             "[PROXY_SWAP] account=%s old=%s new=%s",
-            account_id, old_proxy or "(none)", new_proxy or "(none)",
+            account_id,
+            _redact(old_proxy) if old_proxy else "(none)",
+            _redact(new_proxy) if new_proxy else "(none)",
         )
 
     def trace_client_lifecycle(self, account_id: str, event: str, detail: str = "") -> None:
-        self.log.info("[CLIENT] account=%s event=%s %s", account_id, event, detail)
+        self.log.info("[CLIENT] account=%s event=%s %s", account_id, event, _redact(detail))
 
 
 _proxy_diag = ProxyDiagnostics()

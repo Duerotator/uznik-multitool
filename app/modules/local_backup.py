@@ -163,7 +163,11 @@ class LocalBackup:
                         target.write(decryptor.update(block))
                     target.write(decryptor.finalize())
             except InvalidTag:
+                archive.unlink(missing_ok=True)
                 raise ValueError("Wrong password or damaged backup; nothing restored") from None
+            except BaseException:
+                archive.unlink(missing_ok=True)
+                raise
 
     def _target(self, name: str) -> Path:
         path = PurePosixPath(name)
@@ -223,7 +227,8 @@ class LocalBackup:
                         old_sessions = manifest["roots"]["data"].replace("\\", "/").rstrip("/") + "/sessions/"
                         for account in data.get("accounts", []):
                             ref = account.get("session_ref", "").replace("\\", "/")
-                            if ref.startswith(old_sessions):
+                            matches = ref.casefold().startswith(old_sessions.casefold()) if os.name == "nt" else ref.startswith(old_sessions)
+                            if matches:
                                 suffix = ref[len(old_sessions):]
                                 destination = self._target("data/sessions/" + suffix)
                                 account["session_ref"] = str(destination)
@@ -240,6 +245,7 @@ class LocalBackup:
                             content = re.sub(pattern, lambda _: replacement, content) if re.search(pattern, content) else content + "\n" + replacement + "\n"
                         payload.write_text(content, encoding="utf-8")
                     files.append((target, payload))
+            archive.unlink(missing_ok=True)
             # Authenticate and stage EVERYTHING before touching existing data.
             recovery = Path(self.config.data_dir) / "backups" / ("before-restore-" + os.urandom(8).hex() + ".uzbk")
             self.create(recovery, password)

@@ -32,6 +32,7 @@ class ProfileUpdatePlan:
     usernames: list[str | None] | None = None
     clear_avatars: bool = False
     profile_plan: list[dict[str, Any]] | None = None
+    release_binding: bool = False
 
 
 class ProfileCustomizer:
@@ -57,6 +58,7 @@ class ProfileCustomizer:
                 last_names=[""],
                 bios=[""],
                 clear_avatars=True,
+                release_binding=True,
             ),
         )
 
@@ -221,6 +223,10 @@ class ProfileCustomizer:
                         self.accounts.update_profile_metadata(account.id, metadata)
                     if applied_avatar_key:
                         self._save_used_avatars(used_avatars)
+                    if plan.release_binding:
+                        from modules.profile_bindings import ProfileBindings
+                        self.accounts.update_profile_metadata(account.id, {"profiled": False})
+                        ProfileBindings(self.config).unbind(account.id)
                     self.log.info("Profile updated for %s", account.id)
                     result.add_ok(account.id)
                     if progress:

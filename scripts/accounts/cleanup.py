@@ -71,7 +71,7 @@ def normalize_whitelist_title(value: str) -> str:
     return " ".join("".join(pieces).split())
 
 
-async def build_whitelist_snapshot(client) -> tuple[set[int], set[str], set[str]]:
+async def build_whitelist_snapshot(client) -> tuple[set[int], set[str], set[str], list[str]]:
     """Fetch whitelist identities once before cleanup; never query per dialog."""
     user_ids: set[int] = set()
     usernames = set(SKIP_USERNAMES)

@@ -1,43 +1,38 @@
 from __future__ import annotations
 
 import random
+import secrets
 from dataclasses import dataclass
-from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any
 
 from core.storage import read_json, update_json
-from modules.device_catalog import DEVICES, DEVICE_TYPES, PLATFORM_LANG_PACKS
+from modules.device_catalog import (
+    DEVICES,
+    DEVICE_TYPES,
+    PLATFORM_APP_VERSIONS,
+    PLATFORM_LANG_PACKS,
+)
 
 
-def _app_version(backend: str) -> str:
-    # A device label does not turn the library into an official mobile client.
-    # Report the actual implementation, rather than inventing Android builds
-    # for iOS/macOS/desktop connections. Existing stored values stay untouched.
-    package = "Telethon" if backend == "telethon" else "Kurigram"
-    try:
-        installed = version(package)
-    except PackageNotFoundError:
-        installed = "unknown"
-    return f"Uznik MultiTool ({package} {installed})"
+def _app_version(platform: str, backend: str = "pyrogram") -> str:
+    versions = PLATFORM_APP_VERSIONS.get(platform) or PLATFORM_APP_VERSIONS["android"]
+    return secrets.choice(versions)
 
 
 LANGUAGES = [
     ("en", "en"),
     ("ru", "ru"),
-    ("en", "ru"),
-    ("en", "en"),
+    ("uk", "uk"),
     ("de", "de"),
     ("fr", "fr"),
     ("es", "es"),
-    ("en", "en"),
-    ("ar", "ar"),
+    ("it", "it"),
     ("pt", "pt"),
     ("tr", "tr"),
-    ("en", "en"),
-    ("ru", "en"),
-    ("en", "ru"),
-    ("en", "en"),
+    ("ar", "ar"),
+    ("pl", "pl"),
+    ("id", "id"),
 ]
 
 DEFAULT_FINGERPRINT_FILE = "data/fingerprints.json"
@@ -135,7 +130,7 @@ class FingerprintGenerator:
         return SessionFingerprint(
             device_model=device.model,
             system_version=random.choice(device.systems),
-            app_version=_app_version(backend),
+            app_version=_app_version(device.platform, backend),
             lang_code=lang_code,
             system_lang_code=system_lang_code,
             lang_pack=PLATFORM_LANG_PACKS[device.platform],
@@ -150,8 +145,8 @@ class FingerprintGenerator:
             return self._store(account_id, self.generate_random(backend=backend))
         return self._cache[account_id].to_dict()
 
-    def regenerate(self, account_id: str) -> dict[str, Any]:
-        return self._store(str(account_id), self.generate_random(), replace=True)
+    def regenerate(self, account_id: str, *, backend: str = "pyrogram") -> dict[str, Any]:
+        return self._store(str(account_id), self.generate_random(backend=backend), replace=True)
 
     def params_for_account(self, account: Any) -> dict[str, Any]:
         key = str(account.id)

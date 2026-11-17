@@ -7,6 +7,7 @@ import os
 import time
 from collections import defaultdict
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Awaitable, Callable, TypeVar
 
 from modules.proxy_manager import (
@@ -59,6 +60,7 @@ class AsyncProxyManager:
 
         self._active: dict[str, ActiveProxy] = {}
         self._account_assignments: dict[str, str] = {}
+        self._leased_accounts: set[str] = set()
         self._lock = asyncio.Lock()
         self._task: asyncio.Task | None = None
         self._stop_event = asyncio.Event()
@@ -175,43 +177,66 @@ class AsyncProxyManager:
     async def get_proxy_for_account(
         self, account_id: str, *, exclude_url: str | None = None
     ) -> ActiveProxy | None:
-        async with self._lock:
+        def _pick_locked() -> ActiveProxy | None:
             existing_key = self._account_assignments.get(account_id)
             if existing_key and existing_key in self._active:
                 ap = self._active[existing_key]
                 if not exclude_url or ap.url != exclude_url:
                     ap.last_used = time.monotonic()
+                    if account_id not in self._leased_accounts:
+                        ap.active_connections += 1
+                        self._leased_accounts.add(account_id)
                     return ap
+                if account_id in self._leased_accounts:
+                    ap.active_connections = max(0, ap.active_connections - 1)
+                    self._leased_accounts.discard(account_id)
 
-        candidates = sorted(
-            (ap for ap in self._active.values() if not exclude_url or ap.url != exclude_url),
-            key=lambda ap: (ap.active_connections, ap.last_used),
-        )
-        if not candidates:
-            await self._populate_active_pool()
-            async with self._lock:
-                candidates = sorted(
-                    (ap for ap in self._active.values() if not exclude_url or ap.url != exclude_url),
-                    key=lambda ap: (ap.active_connections, ap.last_used),
-                )
-        if not candidates:
-            return None
-
-        best = candidates[0]
-        async with self._lock:
+            candidates = sorted(
+                (ap for ap in self._active.values() if not exclude_url or ap.url != exclude_url),
+                key=lambda ap: (ap.active_connections, ap.last_used),
+            )
+            if not candidates:
+                return None
+            best = candidates[0]
             self._account_assignments[account_id] = best.key
-        best.last_used = time.monotonic()
-        return best
+            best.last_used = time.monotonic()
+            best.active_connections += 1
+            self._leased_accounts.add(account_id)
+            return best
+
+        async with self._lock:
+            picked = _pick_locked()
+            if picked is not None:
+                return picked
+
+        await self._populate_active_pool()
+        async with self._lock:
+            return _pick_locked()
 
     def release_proxy(self, account_id: str) -> None:
-        pass
+        if account_id not in self._leased_accounts:
+            return
+        self._leased_accounts.discard(account_id)
+        key = self._account_assignments.get(account_id)
+        if key:
+            ap = self._active.get(key)
+            if ap is not None:
+                ap.active_connections = max(0, ap.active_connections - 1)
 
     async def mark_proxy_failed(self, account_id: str) -> None:
         failed: ActiveProxy | None = None
         async with self._lock:
+            was_leased = account_id in self._leased_accounts
+            self._leased_accounts.discard(account_id)
             key = self._account_assignments.pop(account_id, None)
             if key:
                 failed = self._active.pop(key, None)
+                if failed is not None and was_leased:
+                    failed.active_connections = max(0, failed.active_connections - 1)
+                for other_acc in list(self._account_assignments):
+                    if self._account_assignments[other_acc] == key:
+                        self._account_assignments.pop(other_acc, None)
+                        self._leased_accounts.discard(other_acc)
         if failed:
             if os.getenv("PROXY_MODE", "").strip().lower() == "vpn_gateway":
                 await self.pool.record_gateway_failure(
@@ -242,11 +267,12 @@ class AsyncProxyManager:
         return len(self._active)
 
     def stats(self) -> dict[str, Any]:
+        snapshot = list(self._active.values())
         return {
-            "active_count": len(self._active),
+            "active_count": len(snapshot),
             "assigned_accounts": len(self._account_assignments),
             "avg_connections": (
-                sum(ap.active_connections for ap in self._active.values()) / max(1, len(self._active))
+                sum(ap.active_connections for ap in snapshot) / max(1, len(snapshot))
             ),
         }
 
@@ -258,18 +284,26 @@ class AsyncProxyManager:
         return len(self._active) - before
 
 
-_manager_instance: AsyncProxyManager | None = None
+_managers: dict[str, AsyncProxyManager] = {}
 
 
-def get_async_proxy_manager(pool: ProxyPool | None = None, sources: list[str] | None = None) -> AsyncProxyManager:
-    global _manager_instance
-    if _manager_instance is None:
-        if pool is None:
+def get_async_proxy_manager(
+    pool: ProxyPool | None = None,
+    sources: list[str] | None = None,
+    *,
+    config: Any | None = None,
+) -> AsyncProxyManager:
+    if pool is None:
+        if config is None:
             from core.config import AppConfig
             config = AppConfig.load()
-            pool = ProxyPool(config.proxy_pool_db)
-        _manager_instance = AsyncProxyManager(pool, sources)
-    return _manager_instance
+        pool = ProxyPool(config.proxy_pool_db)
+    db_key = os.path.normcase(str(Path(pool.db_path).resolve()))
+    manager = _managers.get(db_key)
+    if manager is None or (sources is not None and manager.sources != sources):
+        manager = AsyncProxyManager(pool, sources)
+        _managers[db_key] = manager
+    return manager
 
 
 def retry_with_proxy_swap(max_retries: int = 3):

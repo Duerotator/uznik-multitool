@@ -10,7 +10,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "app"))
 
-from scripts.check_install import find_native_tool, installed_version
+from scripts.check_install import check_crypto, find_native_tool, installed_version
 
 
 def main() -> int:
@@ -23,8 +23,19 @@ def main() -> int:
     print(f"Proxy mode: {os.getenv('PROXY_MODE', 'manual')}")
     print(f"auth_input folder: {(config.import_dir / 'auth_input').is_dir()}")
     print(f"Window icon: {(ROOT / 'assets/branding/uznik-multitool.ico').is_file()}")
-    print(f"Telegram client: Kurigram {installed_version('Kurigram') or 'not installed'} (module: pyrogram)")
-    print(f"MTProto acceleration: TgCrypto-pyrofork {installed_version('TgCrypto-pyrofork') or 'not installed'}")
+    print(
+        f"Telegram clients: Kurigram {installed_version('Kurigram') or 'not installed'} (module: pyrogram), "
+        f"Telethon {installed_version('Telethon') or 'not installed'} (module: telethon)"
+    )
+    try:
+        check_crypto()
+        accel_status = "OK"
+    except Exception as exc:
+        accel_status = f"not active ({type(exc).__name__}: {exc})"
+    print(
+        f"MTProto acceleration: kuricrypt {installed_version('kuricrypt') or 'not installed'}, "
+        f"cryptg {installed_version('cryptg') or 'not installed'} ({accel_status})"
+    )
     for name in ("ffmpeg", "tesseract", "xray"):
         print(f"{name}: {'found' if find_native_tool(name) else 'not found; run setup.bat'}")
     print("Full installation check: .venv\\Scripts\\python.exe scripts/check_install.py --require-native")

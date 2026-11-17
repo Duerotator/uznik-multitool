@@ -9,10 +9,11 @@ from pathlib import Path
 def main() -> int:
     parser = argparse.ArgumentParser(description="Offline desktop checks")
     parser.add_argument("command", choices=("fast", "unit"))
-    parser.parse_args()
+    args = parser.parse_args()
     root = Path(__file__).resolve().parent.parent
+    start_dir = "tests/unit" if args.command == "unit" else "tests"
     return subprocess.run(
-        [sys.executable, "-m", "unittest", "discover", "-s", "tests", "-p", "test_*.py", "-v"],
+        [sys.executable, "-m", "unittest", "discover", "-s", start_dir, "-p", "test_*.py", "-v"],
         cwd=root,
         check=False,
     ).returncode

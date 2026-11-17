@@ -12,7 +12,7 @@ from typing import Iterable
 
 from core.config import AppConfig
 from core.models import AccountRecord, Backend, SessionKind, utc_now_iso
-from core.storage import read_json, write_json_atomic
+from core.storage import read_json, update_json, write_json_atomic
 from modules.accounts import AccountService
 
 
@@ -71,6 +71,12 @@ class SessionManager:
                     backend_hint=backend_hint,
                     known_fingerprint=fingerprint,
                 )
+            except UnsupportedSessionError as exc:
+                if item.suffix.lower() == ".json" and self._has_sibling_session(item):
+                    known_sources.add(resolved)
+                    continue
+                errors[resolved] = str(exc)
+                continue
             except Exception as exc:
                 errors[resolved] = str(exc)
                 continue
@@ -118,7 +124,7 @@ class SessionManager:
             shutil.copy2(path, target)
         elif kind == "session_string":
             target = target_dir / f"{account_id}.json"
-            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload = json.loads(path.read_text(encoding="utf-8-sig"))
             write_json_atomic(target, payload)
         else:
             target = target_dir / f"{account_id}.session"
@@ -252,16 +258,21 @@ class SessionManager:
             return False
         return time.time() - stat.st_mtime > 1.5 and stat.st_size > 0
 
+    @staticmethod
+    def _has_sibling_session(path: Path) -> bool:
+        return any(path.with_suffix(ext).is_file() for ext in (".session", ".SESSION"))
+
     def _detect_sqlite_session(self, path: Path) -> Backend | None:
         try:
-            with closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True)) as conn:
+            uri = f"{path.resolve().as_uri()}?mode=ro"
+            with closing(sqlite3.connect(uri, uri=True)) as conn:
                 tables = {
                     row[0]
                     for row in conn.execute(
                         "SELECT name FROM sqlite_master WHERE type='table'"
                     ).fetchall()
                 }
-        except sqlite3.DatabaseError:
+        except (sqlite3.DatabaseError, OSError, ValueError):
             return None
 
         if {"sessions", "peers", "version"}.issubset(tables):
@@ -271,16 +282,24 @@ class SessionManager:
         return None
 
     def _detect_json_session(self, path: Path, backend_hint: str) -> tuple[Backend, SessionKind]:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8-sig"))
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise UnsupportedSessionError(f"Invalid JSON session file {path}: {exc}") from exc
+        if not isinstance(payload, dict):
+            raise UnsupportedSessionError(f"Unsupported JSON session structure: {path}")
+        if not self._contains_session_string(payload):
+            raise UnsupportedSessionError(
+                f"JSON file does not contain a valid session string: {path}"
+            )
         backend = str(payload.get("backend") or payload.get("library") or "").lower()
         if backend not in {"pyrogram", "telethon"}:
             backend = self._backend_from_hint(backend_hint)
-        kind: SessionKind = "session_string" if self._contains_session_string(payload) else "json_dump"
-        return (backend, kind)
+        return (backend, "session_string")
 
     def _contains_session_string(self, payload: dict) -> bool:
         return any(
-            isinstance(payload.get(key), str) and len(payload[key]) > 64
+            isinstance(payload.get(key), str) and len(payload[key].strip()) > 64
             for key in ("session_string", "pyrogram_session", "telethon_session", "string_session")
         )
 
@@ -298,24 +317,28 @@ class SessionManager:
         return f"{safe_name or 'account'}_{digest}"
 
     def _upsert_account(self, record: AccountRecord) -> None:
-        raw = read_json(self.config.accounts_file, {"accounts": []})
-        accounts = [AccountRecord.from_dict(item) for item in raw.get("accounts", [])]
-        replaced = False
-        for index, existing in enumerate(accounts):
-            if existing.id == record.id:
-                record.created_at = existing.created_at
-                record.groups = existing.groups
-                if record.group not in {"", "inbox", "default"} and record.group not in record.groups:
-                    record.groups.append(record.group)
-                record.group = record.groups[0] if record.groups else "inbox"
-                record.updated_at = utc_now_iso()
-                accounts[index] = record
-                replaced = True
-                break
-        if not replaced:
-            accounts.append(record)
-        write_json_atomic(
-            self.config.accounts_file,
-            {"accounts": [account.to_dict() for account in accounts]},
-        )
-        AccountService(self.config)._sync_group_folders(accounts)
+        saved_accounts: list[AccountRecord] = []
+
+        def mutate(raw: Any) -> dict[str, Any]:
+            if not isinstance(raw, dict):
+                raw = {"accounts": []}
+            accounts = [AccountRecord.from_dict(item) for item in raw.get("accounts", [])]
+            replaced = False
+            for index, existing in enumerate(accounts):
+                if existing.id == record.id:
+                    record.created_at = existing.created_at
+                    record.groups = existing.groups
+                    if record.group not in {"", "inbox", "default"} and record.group not in record.groups:
+                        record.groups.append(record.group)
+                    record.group = record.groups[0] if record.groups else "inbox"
+                    record.updated_at = utc_now_iso()
+                    accounts[index] = record
+                    replaced = True
+                    break
+            if not replaced:
+                accounts.append(record)
+            saved_accounts[:] = accounts
+            return {"accounts": [account.to_dict() for account in accounts]}
+
+        update_json(self.config.accounts_file, {"accounts": []}, mutate)
+        AccountService(self.config)._sync_group_folders(saved_accounts)

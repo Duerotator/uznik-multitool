@@ -5,7 +5,7 @@ from typing import Any
 
 from core.config import AppConfig
 from core.models import AccountRecord, utc_now_iso
-from core.storage import read_json, write_json_atomic
+from core.storage import read_json, update_json
 
 
 class ProfileSnapshotService:
@@ -17,22 +17,33 @@ class ProfileSnapshotService:
         return self.config.data_dir / "profile_snapshots" / "latest.json"
 
     def save_latest(self, accounts: list[AccountRecord], reason: str) -> Path:
-        payload = {
-            "created_at": utc_now_iso(),
-            "reason": reason,
-            "profiles": [
-                {
-                    "account_id": account.id,
-                    "username": account.username,
-                    "first_name": account.first_name,
-                    "last_name": account.last_name,
-                    "bio": account.metadata.get("last_known_bio"),
-                    "avatar": account.metadata.get("last_applied_avatar"),
-                }
-                for account in accounts
-            ],
+        now = utc_now_iso()
+        updates = {
+            account.id: {
+                "account_id": account.id,
+                "username": account.username,
+                "first_name": account.first_name,
+                "last_name": account.last_name,
+                "bio": account.metadata.get("last_known_bio"),
+                "avatar": account.metadata.get("last_applied_avatar"),
+                "saved_at": now,
+            }
+            for account in accounts
         }
-        write_json_atomic(self.latest_file, payload)
+
+        def mutate(data: dict[str, Any]) -> dict[str, Any]:
+            by_id: dict[str, dict[str, Any]] = {}
+            for entry in data.get("profiles", []) if isinstance(data, dict) else []:
+                if isinstance(entry, dict) and entry.get("account_id"):
+                    by_id[str(entry["account_id"])] = dict(entry)
+            by_id.update(updates)
+            return {
+                "created_at": now,
+                "reason": reason,
+                "profiles": list(by_id.values()),
+            }
+
+        update_json(self.latest_file, {"profiles": []}, mutate)
         return self.latest_file
 
     def load_latest_profiles(self, account_ids: set[str] | None = None) -> list[dict[str, Any]]:

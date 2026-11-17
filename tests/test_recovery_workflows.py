@@ -187,6 +187,8 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
         archive = ProfileArchive(self.root)
         archive.save("one", {"user_id": 1, "stories": self.stories})
         archive.save("two", {"user_id": 2, "stories": [{"bytes": b"other"}]})
+        class RPCError(Exception):
+            pass
         seen, failed = [], False
         async def upload(story):
             nonlocal failed
@@ -194,9 +196,14 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
             seen.append(label)
             if label == "B" and not failed:
                 failed = True
-                raise RuntimeError("fixture Telegram failure")
+                raise RPCError("fixture Telegram failure")
             return len(seen)
-        client = SimpleNamespace(supports_stories=AsyncMock(return_value=True), clear_profile_photos=AsyncMock(), upload_story=upload)
+        client = SimpleNamespace(
+            profile_capabilities={"stories"},
+            supports_stories=AsyncMock(return_value=True),
+            clear_profile_photos=AsyncMock(),
+            upload_story=upload,
+        )
         @asynccontextmanager
         async def fake_client(*args):
             yield client
@@ -204,6 +211,7 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
                        copy_music=False, copy_birthday=False, max_stories_per_account=None)
         with patch("modules.profile_scraper.create_client", fake_client), \
              patch("modules.profile_scraper.human_delay", new=AsyncMock()), \
+             patch("modules.profile_apply.human_delay", new=AsyncMock()), \
              patch("modules.story_publication.human_delay", new=AsyncMock()):
             service = ProfileScraperService(self.config)
             first = await service.apply_saved_profiles([self.account], **options)
