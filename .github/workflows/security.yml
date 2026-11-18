@@ -76,8 +76,14 @@ jobs:
           .\.venv\Scripts\python.exe -m pip install -r config/requirements.txt
           .\.venv\Scripts\python.exe -m pip check
       - name: Offline regression tests (no account credentials)
+        env:
+          QT_QPA_PLATFORM: offscreen
+          PYTHONUNBUFFERED: "1"
         run: .\.venv\Scripts\python.exe tests/run_checks.py fast
       - name: Offscreen Qt desktop smoke check
+        env:
+          QT_QPA_PLATFORM: offscreen
+          PYTHONUNBUFFERED: "1"
         run: .\.venv\Scripts\python.exe tests/smoke_desktop.py
       - name: Install auditor separately
         if: always()

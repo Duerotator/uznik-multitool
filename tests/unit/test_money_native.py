@@ -84,6 +84,7 @@ class WireTests(unittest.TestCase):
 
     def test_reject_unknown_flags_truncation_oversize_and_bad_vectors(self):
         from pyrogram.raw.core.tl_object import objects as pyrogram_objects
+        from telethon.tl.alltlobjects import tlobjects as telethon_objects
         fallback_ids = (tl.STATE_EMPTY, tl.STATE, tl.USER_ADDRESS, tl.USER_ADDRESSES, tl.UPDATE_STATE, tl.UPDATE_GASLESS)
         vectors = (integer(tl.STATE_EMPTY) + integer(2), state_bytes()[:-1],
                    integer(tl.USER_ADDRESSES) + integer(tl.VECTOR) + integer(101),
@@ -94,9 +95,12 @@ class WireTests(unittest.TestCase):
             for raw in vectors:
                 with self.assertRaises((tl.WalletWireError, BufferError, ValueError, EOFError)):
                     decode(raw, 'pyrogram')
-        for raw in vectors:
-            with self.assertRaises((tl.WalletWireError, BufferError, ValueError, EOFError)):
-                decode(raw, 'telethon')
+        with patch.dict(telethon_objects, clear=False):
+            for ident in fallback_ids:
+                telethon_objects.pop(ident, None)
+            for raw in vectors:
+                with self.assertRaises((tl.WalletWireError, BufferError, ValueError, EOFError)):
+                    decode(raw, 'telethon')
 
     def test_additive_registry_does_not_replace_existing_constructor(self):
         from pyrogram.raw.core.tl_object import objects
