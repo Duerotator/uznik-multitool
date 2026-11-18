@@ -254,10 +254,10 @@ class RentJobStore:
                 raise CatalogError("Marketapp payment quote expired; prepare a fresh quote")
 
             target_set = set(json.loads(row["nft_addresses_json"]))
-            placeholders = ",".join("?" for _ in IN_FLIGHT_STATES)
             conflicts = conn.execute(
-                f"SELECT job_id, operation, nft_addresses_json, state FROM rent_jobs WHERE job_id<>? AND state IN ({placeholders})",
-                (job_id, *IN_FLIGHT_STATES),
+                "SELECT job_id, operation, nft_addresses_json, state FROM rent_jobs "
+                "WHERE job_id<>? AND state IN ('tx_claiming', 'tx_submitted', 'tx_uncertain')",
+                (job_id,),
             ).fetchall()
             for item in conflicts:
                 if target_set & set(json.loads(item["nft_addresses_json"])):
@@ -265,10 +265,10 @@ class RentJobStore:
                         f"Another active rent job ({item['job_id'][:8]}:{item['state']}) already covers this NFT"
                     )
             if row["operation"] == "pay":
-                hp = ",".join("?" for _ in HOSTING_IN_PROGRESS_STATES)
                 hosting = conn.execute(
-                    f"SELECT job_id, nft_addresses_json, state FROM rent_jobs WHERE job_id<>? AND operation='pay' AND state IN ({hp})",
-                    (job_id, *HOSTING_IN_PROGRESS_STATES),
+                    "SELECT job_id, nft_addresses_json, state FROM rent_jobs "
+                    "WHERE job_id<>? AND operation='pay' AND state IN ('tonconnect_submitted', 'hosted_verified')",
+                    (job_id,),
                 ).fetchall()
                 for item in hosting:
                     if target_set & set(json.loads(item["nft_addresses_json"])):

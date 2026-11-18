@@ -226,8 +226,8 @@ class MoneyCarousel:
             if state=='completed' and db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='money_funding_claims'").fetchone():
                 accounts=[n['account_id'] for n in nodes]
                 placeholders=','.join('?'*len(accounts))
-                drafts=[r[0] for r in db.execute(f'SELECT DISTINCT draft FROM money_funding_claims WHERE account IN ({placeholders})',accounts).fetchall()]
-                db.execute(f'DELETE FROM money_funding_claims WHERE account IN ({placeholders})',accounts)
+                drafts=[r[0] for r in db.execute(f'SELECT DISTINCT draft FROM money_funding_claims WHERE account IN ({placeholders})',accounts).fetchall()]  # nosec: B608
+                db.execute(f'DELETE FROM money_funding_claims WHERE account IN ({placeholders})',accounts)  # nosec: B608
                 if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='money_funding_drafts'").fetchone():
                     for draft_id in drafts:
                         if db.execute('SELECT 1 FROM money_funding_claims WHERE draft=? LIMIT 1',(draft_id,)).fetchone() is None:

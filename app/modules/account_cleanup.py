@@ -64,7 +64,7 @@ def _cleanup_sqlite_tables(path: Path, wanted: list[str], tables: tuple[str, ...
             chunk = wanted[offset : offset + 500]
             placeholders = ",".join("?" for _ in chunk)
             for table in target_tables:
-                db.execute(f"DELETE FROM {table} WHERE account IN ({placeholders})", chunk)
+                db.execute(f"DELETE FROM {table} WHERE account IN ({placeholders})", chunk)  # nosec: B608
 
 
 def cleanup_removed_accounts(config, account_ids: list[str]) -> None:

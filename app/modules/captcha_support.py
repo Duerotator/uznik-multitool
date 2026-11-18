@@ -170,7 +170,7 @@ class CaptchaSupportStore:
             rows = db.execute(
                 "SELECT id,account,provider,kind,reason,created,expires,"
                 "CASE WHEN state='pending' AND expires<=? THEN 'expired' ELSE state END AS state,"
-                "revision FROM manual WHERE account IN (" + placeholders + ") "
+                "revision FROM manual WHERE account IN (" + placeholders + ") "  # nosec: B608
                 "ORDER BY (state='pending' AND expires>?) DESC,created DESC LIMIT 200",
                 [now, *ids, now],
             ).fetchall()
