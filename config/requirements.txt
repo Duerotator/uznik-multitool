@@ -4,7 +4,7 @@
 # Telegram: maintained fork (imports as pyrogram) + wheel-based crypto.
 Kurigram==2.2.27
 kuricrypt>=0.1.2
-telethon>=1.45.0
+telethon>=1.46.0
 cryptg>=0.6.1
 
 # Desktop, configuration, networking, downloads and diagnostics.
